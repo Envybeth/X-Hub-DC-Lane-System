@@ -749,7 +749,7 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
                                   <div className="text-lg md:text-2xl text-yellow-400 flex-shrink-0">⚠️</div>
                                 )}
                                 <div className="flex-1 min-w-0">
-                                  <div className="text-sm md:text-lg font-bold break-all">
+                                  <div className="text-lg md:text-lg font-bold break-all">
                                     PT #{pt.pt_number} | PO: {pt.po_number}
                                   </div>
                                   <div className="text-xs md:text-sm text-gray-300 break-all">

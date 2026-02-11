@@ -63,6 +63,12 @@ export default function Home() {
                 🔍 Search
               </button>
               <Link 
+                href="/printer"
+                className="flex-1 sm:flex-none bg-orange-600 hover:bg-orange-700 px-3 md:px-6 py-2 md:py-3 rounded-lg font-semibold text-center text-sm md:text-base"
+              >
+                🖨️ Label Printer
+              </Link>
+              <Link 
                 href="/shipments"
                 className="flex-1 sm:flex-none bg-purple-600 hover:bg-purple-700 px-3 md:px-6 py-2 md:py-3 rounded-lg font-semibold text-center text-sm md:text-base"
               >
