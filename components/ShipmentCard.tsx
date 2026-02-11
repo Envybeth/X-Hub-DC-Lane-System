@@ -189,7 +189,7 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
 
       if (shipmentError) throw shipmentError;
 
-      showToast(`Staging lane ${selectedLane} set for shipment`, 'success');
+      showToast(`Staging lane ${selectedLane} set`, 'success');
       setSelectingLane(false);
       onUpdate();
     } catch (error) {
@@ -205,7 +205,7 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
     const targetLane = lanes.find(l => l.lane_number.toString() === targetLaneNumber);
 
     if (!targetLane) {
-      setStagingLaneError('Invalid lane number');
+      setStagingLaneError('Invalid lane');
       setTimeout(() => setStagingLaneError(''), 3000);
       return;
     }
@@ -217,14 +217,14 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
     }
 
     if (targetLane.lane_number.toString() === shipment.staging_lane) {
-      setStagingLaneError('Already the staging lane');
+      setStagingLaneError('Already staging lane');
       setTimeout(() => setStagingLaneError(''), 3000);
       return;
     }
 
     showConfirm(
       'Change Staging Lane',
-      `Move all staged PTs from Lane ${shipment.staging_lane} to Lane ${targetLane.lane_number}?`,
+      `Move all PTs from Lane ${shipment.staging_lane} to Lane ${targetLane.lane_number}?`,
       async () => {
         try {
           const stagedPTs = shipment.pts.filter(pt => pt.moved_to_staging && !pt.removed_from_staging);
@@ -251,14 +251,14 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
               .eq('lane_number', shipment.staging_lane);
           }
 
-          showToast(`Staging lane changed to ${targetLane.lane_number}`, 'success');
+          showToast(`Moved to Lane ${targetLane.lane_number}`, 'success');
           setChangingStagingLane(false);
           setNewStagingLane('');
           setStagingLaneError('');
           onUpdate();
         } catch (error) {
           console.error('Error changing staging lane:', error);
-          showToast('Failed to change staging lane', 'error');
+          showToast('Failed to change lane', 'error');
         }
 
         setConfirmModal({ ...confirmModal, isOpen: false });
@@ -273,7 +273,6 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
     }
 
     try {
-      // Get shipment ID
       const { data: shipmentData } = await supabase
         .from('shipments')
         .select('id')
@@ -283,18 +282,15 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
 
       if (!shipmentData) throw new Error('Shipment not found');
 
-      // Get all PTs that were moved to staging
       const stagedPTs = shipment.pts.filter(pt => pt.moved_to_staging && !pt.removed_from_staging);
 
       for (const pt of stagedPTs) {
-        // Remove from lane_assignments (staging lane)
         await supabase
           .from('lane_assignments')
           .delete()
           .eq('pt_id', pt.id)
           .eq('lane_number', shipment.staging_lane);
 
-        // Update PT status back to labeled and remove staging lane
         await supabase
           .from('picktickets')
           .update({
@@ -304,13 +300,11 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
           .eq('id', pt.id);
       }
 
-      // Delete all shipment_pts records
       await supabase
         .from('shipment_pts')
         .delete()
         .eq('shipment_id', shipmentData.id);
 
-      // Update shipment to not_started and clear staging lane
       await supabase
         .from('shipments')
         .update({
@@ -321,13 +315,13 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
         .eq('pu_number', shipment.pu_number)
         .eq('pu_date', shipment.pu_date);
 
-      showToast('Staging data cleared successfully', 'success');
+      showToast('Staging data cleared', 'success');
       setDeletingShipment(false);
       setDeleteConfirmText('');
       onUpdate();
     } catch (error) {
       console.error('Error deleting staging data:', error);
-      showToast('Failed to clear staging data', 'error');
+      showToast('Failed to clear data', 'error');
     }
   }
 
@@ -342,18 +336,18 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
         .eq('pu_number', shipment.pu_number)
         .eq('pu_date', shipment.pu_date);
 
-      showToast('Shipment status updated', 'success');
+      showToast('Status updated', 'success');
       setEditingStatus(false);
       onUpdate();
     } catch (error) {
       console.error('Error updating status:', error);
-      showToast('Failed to update status', 'error');
+      showToast('Failed to update', 'error');
     }
   }
 
   async function handleMovePT(pt: ShipmentPT) {
     if (!shipment.staging_lane) {
-      showToast('Please select a staging lane first', 'error');
+      showToast('Select staging lane first', 'error');
       return;
     }
 
@@ -422,11 +416,11 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
           order_position: newPosition
         });
 
-      showToast(`PT ${pt.pt_number} moved to staging lane ${shipment.staging_lane}`, 'success');
+      showToast(`PT moved to staging`, 'success');
       onUpdate();
     } catch (error) {
       console.error('Error moving PT:', error);
-      showToast('Failed to move PT to staging', 'error');
+      showToast('Failed to move PT', 'error');
     }
   }
 
@@ -436,7 +430,7 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
     if (!allMoved) {
       showConfirm(
         'Finalize Shipment',
-        'Not all PTs have been moved to staging. Finalize anyway?',
+        'Not all PTs moved to staging. Finalize anyway?',
         async () => {
           await finalizeShipmentAction();
           setConfirmModal({ ...confirmModal, isOpen: false });
@@ -459,71 +453,76 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
       onUpdate();
     } catch (error) {
       console.error('Error finalizing shipment:', error);
-      showToast('Failed to finalize shipment', 'error');
+      showToast('Failed to finalize', 'error');
     }
   }
 
   return (
     <>
       <div className="bg-gray-800 rounded-lg border-2 border-gray-600">
+        {/* Header - mobile responsive */}
         <button
           onClick={() => setExpanded(!expanded)}
-          className="w-full p-5 flex items-center justify-between hover:bg-gray-750 transition-colors"
+          className="w-full p-3 md:p-5 flex flex-col sm:flex-row items-start sm:items-center justify-between hover:bg-gray-750 transition-colors gap-3"
         >
-          <div className="flex items-center gap-6">
-            <div className="text-2xl text-blue-400">
+          <div className="flex items-center gap-3 md:gap-6 w-full sm:w-auto">
+            <div className="text-xl md:text-2xl text-blue-400">
               {expanded ? '▼' : '▶'}
             </div>
-            <div className="text-left">
-              <div className="text-2xl font-bold">PU #{shipment.pu_number}</div>
-              <div className="text-sm text-gray-400 mt-1">
-                {shipment.carrier} | {shipment.pu_date} | {shipment.pts.length} PTs | {totalPallets} pallets
+            <div className="text-left flex-1">
+              <div className="text-lg md:text-2xl font-bold break-all">PU #{shipment.pu_number}</div>
+              <div className="text-xs md:text-sm text-gray-400 mt-1 break-all">
+                {shipment.carrier} | {shipment.pu_date} | {shipment.pts.length} PTs | {totalPallets}p
               </div>
             </div>
           </div>
-          <div className="flex items-center gap-4">
-            <div className={`px-4 py-2 rounded-lg font-bold ${statusConfig[shipment.status].color}`}>
+          <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
+            <div className={`px-2 md:px-4 py-1 md:py-2 rounded-lg font-bold text-xs md:text-base ${statusConfig[shipment.status].color}`}>
               {statusConfig[shipment.status].label}
             </div>
             {shipment.staging_lane && (
-              <div className="bg-purple-700 px-4 py-2 rounded-lg font-bold">
-                Staging: Lane {shipment.staging_lane}
+              <div className="bg-purple-700 px-2 md:px-4 py-1 md:py-2 rounded-lg font-bold text-xs md:text-base">
+                Staging: L{shipment.staging_lane}
               </div>
             )}
           </div>
         </button>
 
+        {/* Expanded content */}
         {expanded && (
-          <div className="p-6 border-t-2 border-gray-600 space-y-6">
-            <div className="flex gap-4 flex-wrap">
+          <div className="p-3 md:p-6 border-t-2 border-gray-600 space-y-4 md:space-y-6">
+            {/* Action buttons - wrap on mobile */}
+            <div className="flex gap-2 flex-wrap">
               {editingStatus ? (
-                <div className="flex-1 bg-gray-700 p-4 rounded-lg">
-                  <div className="flex items-center gap-3">
-                    <label className="font-semibold">Status:</label>
+                <div className="w-full bg-gray-700 p-3 md:p-4 rounded-lg">
+                  <div className="flex flex-col sm:flex-row items-start sm:items-center gap-2 md:gap-3">
+                    <label className="font-semibold text-sm md:text-base">Status:</label>
                     <select
                       value={newStatus}
                       onChange={(e) => setNewStatus(e.target.value as any)}
-                      className="bg-gray-900 text-white p-2 rounded flex-1"
+                      className="bg-gray-900 text-white p-2 rounded flex-1 w-full sm:w-auto text-sm md:text-base"
                     >
                       <option value="not_started">Not Started</option>
                       <option value="in_process">In Process</option>
                       <option value="finalized">Finalized</option>
                     </select>
-                    <button
-                      onClick={handleUpdateStatus}
-                      className="bg-green-600 hover:bg-green-700 px-4 py-2 rounded font-semibold"
-                    >
-                      Save
-                    </button>
-                    <button
-                      onClick={() => {
-                        setEditingStatus(false);
-                        setNewStatus(shipment.status);
-                      }}
-                      className="bg-gray-600 hover:bg-gray-700 px-4 py-2 rounded font-semibold"
-                    >
-                      Cancel
-                    </button>
+                    <div className="flex gap-2 w-full sm:w-auto">
+                      <button
+                        onClick={handleUpdateStatus}
+                        className="flex-1 sm:flex-none bg-green-600 hover:bg-green-700 px-3 md:px-4 py-2 rounded font-semibold text-sm md:text-base"
+                      >
+                        Save
+                      </button>
+                      <button
+                        onClick={() => {
+                          setEditingStatus(false);
+                          setNewStatus(shipment.status);
+                        }}
+                        className="flex-1 sm:flex-none bg-gray-600 hover:bg-gray-700 px-3 md:px-4 py-2 rounded font-semibold text-sm md:text-base"
+                      >
+                        Cancel
+                      </button>
+                    </div>
                   </div>
                 </div>
               ) : (
@@ -532,7 +531,7 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
                     setEditingStatus(true);
                     setNewStatus(shipment.status);
                   }}
-                  className="bg-orange-600 hover:bg-orange-700 px-6 py-3 rounded-lg font-bold"
+                  className="bg-orange-600 hover:bg-orange-700 px-3 md:px-6 py-2 md:py-3 rounded-lg font-bold text-sm md:text-base"
                 >
                   Edit Status
                 </button>
@@ -544,16 +543,16 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
                     setChangingStagingLane(true);
                     fetchAvailableLanes();
                   }}
-                  className="bg-purple-600 hover:bg-purple-700 px-6 py-3 rounded-lg font-bold"
+                  className="bg-purple-600 hover:bg-purple-700 px-3 md:px-6 py-2 md:py-3 rounded-lg font-bold text-sm md:text-base whitespace-nowrap"
                 >
-                  Change Staging Lane
+                  Change Lane
                 </button>
               )}
 
               {changingStagingLane && (
-                <div className="flex-1 bg-gray-700 p-4 rounded-lg relative">
-                  <div className="flex items-center gap-3">
-                    <label className="font-semibold">New Staging Lane:</label>
+                <div className="w-full bg-gray-700 p-3 md:p-4 rounded-lg relative">
+                  <div className="flex flex-col sm:flex-row items-start sm:items-center gap-2 md:gap-3">
+                    <label className="font-semibold text-sm md:text-base whitespace-nowrap">New Lane:</label>
                     <input
                       type="text"
                       value={newStagingLane}
@@ -561,28 +560,30 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
                         setNewStagingLane(e.target.value);
                         setStagingLaneError('');
                       }}
-                      placeholder="Enter lane number"
-                      className={`bg-gray-900 text-white p-2 rounded flex-1 ${stagingLaneError ? 'border-2 border-red-500' : ''}`}
+                      placeholder="Lane #"
+                      className={`bg-gray-900 text-white p-2 rounded flex-1 w-full text-sm md:text-base ${stagingLaneError ? 'border-2 border-red-500' : ''}`}
                     />
-                    <button
-                      onClick={handleChangeStagingLane}
-                      className="bg-green-600 hover:bg-green-700 px-4 py-2 rounded font-semibold"
-                    >
-                      Move
-                    </button>
-                    <button
-                      onClick={() => {
-                        setChangingStagingLane(false);
-                        setNewStagingLane('');
-                        setStagingLaneError('');
-                      }}
-                      className="bg-gray-600 hover:bg-gray-700 px-4 py-2 rounded font-semibold"
-                    >
-                      Cancel
-                    </button>
+                    <div className="flex gap-2 w-full sm:w-auto">
+                      <button
+                        onClick={handleChangeStagingLane}
+                        className="flex-1 sm:flex-none bg-green-600 hover:bg-green-700 px-3 md:px-4 py-2 rounded font-semibold text-sm md:text-base"
+                      >
+                        Move
+                      </button>
+                      <button
+                        onClick={() => {
+                          setChangingStagingLane(false);
+                          setNewStagingLane('');
+                          setStagingLaneError('');
+                        }}
+                        className="flex-1 sm:flex-none bg-gray-600 hover:bg-gray-700 px-3 md:px-4 py-2 rounded font-semibold text-sm md:text-base"
+                      >
+                        Cancel
+                      </button>
+                    </div>
                   </div>
                   {stagingLaneError && (
-                    <div className="absolute -bottom-6 left-0 text-red-500 text-sm animate-fade-in">
+                    <div className="mt-2 text-red-500 text-xs md:text-sm animate-fade-in">
                       {stagingLaneError}
                     </div>
                   )}
@@ -592,124 +593,130 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
               {shipment.staging_lane && movedCount > 0 && !deletingShipment && (
                 <button
                   onClick={() => setDeletingShipment(true)}
-                  className="bg-red-600 hover:bg-red-700 px-6 py-3 rounded-lg font-bold"
+                  className="bg-red-600 hover:bg-red-700 px-3 md:px-6 py-2 md:py-3 rounded-lg font-bold text-sm md:text-base whitespace-nowrap"
                 >
-                  Clear Staging Data
+                  Clear Data
                 </button>
               )}
 
               {deletingShipment && (
-                <div className="flex-1 bg-red-900 border-2 border-red-600 p-4 rounded-lg">
-                  <div className="flex items-center gap-3">
-                    <label className="font-semibold text-white">Type DELETE to confirm:</label>
+                <div className="w-full bg-red-900 border-2 border-red-600 p-3 md:p-4 rounded-lg">
+                  <div className="flex flex-col sm:flex-row items-start sm:items-center gap-2 md:gap-3">
+                    <label className="font-semibold text-white text-sm md:text-base whitespace-nowrap">Type DELETE:</label>
                     <input
                       type="text"
                       value={deleteConfirmText}
                       onChange={(e) => setDeleteConfirmText(e.target.value)}
                       placeholder="DELETE"
-                      className="bg-gray-900 text-white p-2 rounded flex-1 uppercase"
+                      className="bg-gray-900 text-white p-2 rounded flex-1 w-full uppercase text-sm md:text-base"
                     />
-                    <button
-                      onClick={handleDeleteStagingData}
-                      disabled={deleteConfirmText !== 'DELETE'}
-                      className="bg-red-700 hover:bg-red-800 disabled:bg-gray-600 px-4 py-2 rounded font-semibold"
-                    >
-                      Confirm Delete
-                    </button>
-                    <button
-                      onClick={() => {
-                        setDeletingShipment(false);
-                        setDeleteConfirmText('');
-                      }}
-                      className="bg-gray-600 hover:bg-gray-700 px-4 py-2 rounded font-semibold"
-                    >
-                      Cancel
-                    </button>
+                    <div className="flex gap-2 w-full sm:w-auto">
+                      <button
+                        onClick={handleDeleteStagingData}
+                        disabled={deleteConfirmText !== 'DELETE'}
+                        className="flex-1 sm:flex-none bg-red-700 hover:bg-red-800 disabled:bg-gray-600 px-3 md:px-4 py-2 rounded font-semibold text-sm md:text-base"
+                      >
+                        Delete
+                      </button>
+                      <button
+                        onClick={() => {
+                          setDeletingShipment(false);
+                          setDeleteConfirmText('');
+                        }}
+                        className="flex-1 sm:flex-none bg-gray-600 hover:bg-gray-700 px-3 md:px-4 py-2 rounded font-semibold text-sm md:text-base"
+                      >
+                        Cancel
+                      </button>
+                    </div>
                   </div>
                 </div>
               )}
             </div>
 
+            {/* Staging lane selection */}
             {!shipment.staging_lane ? (
-              <div className="bg-yellow-900 border-2 border-yellow-600 p-4 rounded-lg">
-                <div className="font-bold text-xl mb-3">⚠️ Select Staging Lane</div>
-                <p className="text-sm mb-4">Choose a single lane to consolidate all PTs for this shipment</p>
+              <div className="bg-yellow-900 border-2 border-yellow-600 p-3 md:p-4 rounded-lg">
+                <div className="font-bold text-base md:text-xl mb-2 md:mb-3">⚠️ Select Staging Lane</div>
+                <p className="text-xs md:text-sm mb-3 md:mb-4">Choose a lane to consolidate all PTs</p>
                 {!selectingLane ? (
                   <button
                     onClick={() => {
                       setSelectingLane(true);
                       fetchAvailableLanes();
                     }}
-                    className="bg-blue-600 hover:bg-blue-700 px-6 py-3 rounded-lg font-bold"
+                    className="bg-blue-600 hover:bg-blue-700 px-4 md:px-6 py-2 md:py-3 rounded-lg font-bold text-sm md:text-base"
                   >
-                    Select Staging Lane
+                    Select Lane
                   </button>
                 ) : (
-                  <div className="flex gap-3">
+                  <div className="flex flex-col sm:flex-row gap-2 md:gap-3">
                     <select
                       value={selectedLane}
                       onChange={(e) => setSelectedLane(e.target.value)}
-                      className="flex-1 bg-gray-700 text-white p-3 rounded-lg"
+                      className="flex-1 bg-gray-700 text-white p-2 md:p-3 rounded-lg text-sm md:text-base"
                     >
                       <option value="">-- Choose Lane --</option>
                       {lanes.map(lane => (
                         <option key={lane.lane_number} value={lane.lane_number}>
-                          Lane {lane.lane_number} (Capacity: {lane.max_capacity}, Current: {lane.current_pallets})
+                          L{lane.lane_number} (Cap: {lane.max_capacity}, Cur: {lane.current_pallets})
                         </option>
                       ))}
                     </select>
-                    <button
-                      onClick={handleSetStagingLane}
-                      disabled={!selectedLane}
-                      className="bg-green-600 hover:bg-green-700 disabled:bg-gray-600 px-6 py-2 rounded-lg font-bold"
-                    >
-                      Confirm
-                    </button>
-                    <button
-                      onClick={() => setSelectingLane(false)}
-                      className="bg-gray-600 hover:bg-gray-700 px-6 py-2 rounded-lg"
-                    >
-                      Cancel
-                    </button>
+                    <div className="flex gap-2">
+                      <button
+                        onClick={handleSetStagingLane}
+                        disabled={!selectedLane}
+                        className="flex-1 sm:flex-none bg-green-600 hover:bg-green-700 disabled:bg-gray-600 px-4 md:px-6 py-2 rounded-lg font-bold text-sm md:text-base"
+                      >
+                        Confirm
+                      </button>
+                      <button
+                        onClick={() => setSelectingLane(false)}
+                        className="flex-1 sm:flex-none bg-gray-600 hover:bg-gray-700 px-4 md:px-6 py-2 rounded-lg text-sm md:text-base"
+                      >
+                        Cancel
+                      </button>
+                    </div>
                   </div>
                 )}
               </div>
             ) : (
-              <div className="bg-gray-700 p-4 rounded-lg">
-                <div className="flex justify-between items-center">
+              <div className="bg-gray-700 p-3 md:p-4 rounded-lg">
+                <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
                   <div>
-                    <div className="font-bold text-lg">Staging Progress</div>
-                    <div className="text-sm text-gray-400 mt-1">
-                      {movedCount} of {shipment.pts.length} PTs moved to Lane {shipment.staging_lane}
+                    <div className="font-bold text-sm md:text-lg">Staging Progress</div>
+                    <div className="text-xs md:text-sm text-gray-400 mt-1">
+                      {movedCount} of {shipment.pts.length} PTs → Lane {shipment.staging_lane}
                     </div>
                   </div>
                   {shipment.status !== 'finalized' && (
                     <button
                       onClick={handleFinalizeShipment}
-                      className="bg-green-600 hover:bg-green-700 px-6 py-3 rounded-lg font-bold"
+                      className="w-full sm:w-auto bg-green-600 hover:bg-green-700 px-4 md:px-6 py-2 md:py-3 rounded-lg font-bold text-sm md:text-base"
                     >
-                      Finalize Shipment
+                      Finalize
                     </button>
                   )}
                 </div>
               </div>
             )}
 
-            <div className="space-y-6">
-              <h3 className="text-xl font-bold">Picktickets in Shipment</h3>
+            {/* PT List */}
+            <div className="space-y-4 md:space-y-6">
+              <h3 className="text-base md:text-xl font-bold">Picktickets</h3>
               {sortedLanes.map(laneKey => {
                 const isStaging = laneKey.startsWith('staging_');
                 const actualLaneNumber = isStaging ? laneKey.replace('staging_', '') : laneKey;
 
                 return (
-                  <div key={laneKey} className="space-y-3">
+                  <div key={laneKey} className="space-y-2 md:space-y-3">
                     {isStaging ? (
-                      <h4 className="text-2xl font-bold text-purple-400 border-b-2 border-purple-700 pb-2">
-                        📦 STAGING LANE (Lane {actualLaneNumber}) - {ptsByLane[laneKey].length} PTs
+                      <h4 className="text-lg md:text-2xl font-bold text-purple-400 border-b-2 border-purple-700 pb-2">
+                        📦 STAGING (L{actualLaneNumber}) - {ptsByLane[laneKey].length}
                       </h4>
                     ) : (
-                      <h4 className="text-lg font-semibold text-blue-400 border-b border-blue-700 pb-2">
-                        {laneKey === 'unassigned' ? '⚠️ Unassigned PTs' : `Lane ${laneKey} (${ptsByLane[laneKey].length} PTs)`}
+                      <h4 className="text-sm md:text-lg font-semibold text-blue-400 border-b border-blue-700 pb-2">
+                        {laneKey === 'unassigned' ? '⚠️ Unassigned' : `L${laneKey} (${ptsByLane[laneKey].length})`}
                       </h4>
                     )}
                     {ptsByLane[laneKey].map(pt => {
@@ -718,7 +725,6 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
                         ? getDepthColor(depthInfo.palletsInFront, depthInfo.maxCapacity)
                         : '';
 
-                      // FIX: Check if PT has a lane AND is not currently in staging
                       const hasLaneAssigned = pt.assigned_lane && pt.assigned_lane !== shipment.staging_lane;
                       const isCurrentlyStaged = pt.moved_to_staging && !pt.removed_from_staging;
                       const canMoveToStaging = hasLaneAssigned && !isCurrentlyStaged && shipment.staging_lane && shipment.status !== 'finalized';
@@ -726,70 +732,67 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
                       return (
                         <div
                           key={pt.id}
-                          className={`p-4 rounded-lg border-2 ${isCurrentlyStaged
-                              ? 'bg-green-900 border-green-600'
-                              : !pt.assigned_lane
-                                ? 'bg-gray-700 border-gray-600'
-                                : 'bg-gray-700 border-gray-600'
+                          className={`p-2 md:p-4 rounded-lg border-2 ${isCurrentlyStaged
+                            ? 'bg-green-900 border-green-600'
+                            : !pt.assigned_lane
+                              ? 'bg-gray-700 border-gray-600'
+                              : 'bg-gray-700 border-gray-600'
                             }`}
                         >
-                          <div className="flex items-center justify-between">
-                            <div className="flex-1">
-                              <div className="flex items-center gap-3">
+                          <div className="flex flex-col md:flex-row md:items-center justify-between gap-2 md:gap-4">
+                            <div className="flex-1 min-w-0">
+                              <div className="flex items-start gap-2">
                                 {isCurrentlyStaged && (
-                                  <div className="text-2xl text-green-400">✓</div>
+                                  <div className="text-lg md:text-2xl text-green-400 flex-shrink-0">✓</div>
                                 )}
                                 {!pt.assigned_lane && (
-                                  <div className="text-2xl text-yellow-400">⚠️</div>
+                                  <div className="text-lg md:text-2xl text-yellow-400 flex-shrink-0">⚠️</div>
                                 )}
-                                <div>
-                                  <div className="text-lg font-bold">
+                                <div className="flex-1 min-w-0">
+                                  <div className="text-sm md:text-lg font-bold break-all">
                                     PT #{pt.pt_number} | PO: {pt.po_number}
                                   </div>
-                                  <div className="text-sm text-gray-300">
-                                    {pt.customer} | {pt.actual_pallet_count} pallets
+                                  <div className="text-xs md:text-sm text-gray-300 break-all">
+                                    {pt.customer} | {pt.actual_pallet_count}p
                                   </div>
                                   {pt.assigned_lane && (
-                                    <div className="flex items-center gap-3 mt-2">
-                                      <div className="text-xl font-bold text-white">
-                                        Lane {pt.assigned_lane}
+                                    <div className="flex flex-wrap items-center gap-2 mt-1 md:mt-2">
+                                      <div className="text-base md:text-xl font-bold text-white">
+                                        L{pt.assigned_lane}
                                       </div>
                                       {depthInfo && (
-                                        <span className={`px-3 py-1 rounded-full text-xs font-bold ${depthColor}`}>
-                                          {depthInfo.palletsInFront} pallets in front ({Math.round((depthInfo.palletsInFront / depthInfo.maxCapacity) * 100)}% deep)
+                                        <span className={`px-2 py-0.5 md:px-3 md:py-1 rounded-full text-[10px] md:text-xs font-bold ${depthColor}`}>
+                                          {depthInfo.palletsInFront}p ({Math.round((depthInfo.palletsInFront / depthInfo.maxCapacity) * 100)}%)
                                         </span>
                                       )}
-                                      <div className="text-xs text-gray-400">
-                                        Current Location: Lane {pt.assigned_lane}
-                                      </div>
                                     </div>
                                   )}
                                   {!pt.assigned_lane && (
-                                    <div className="text-sm text-gray-400 mt-1">
-                                      NOT ASSIGNED TO LANE YET
+                                    <div className="text-xs md:text-sm text-gray-400 mt-1">
+                                      NOT ASSIGNED
                                     </div>
                                   )}
                                 </div>
                               </div>
                             </div>
-                            <div className="flex gap-3">
+                            <div className="flex gap-2 justify-end">
                               <button
                                 onClick={() => setSelectedPTDetails(pt)}
-                                className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg font-semibold"
+                                className="bg-blue-600 hover:bg-blue-700 px-2 md:px-4 py-1.5 md:py-2 rounded-lg font-semibold text-xs md:text-base"
                               >
                                 Details
                               </button>
                               {canMoveToStaging && (
                                 <button
                                   onClick={() => handleMovePT(pt)}
-                                  className="bg-green-600 hover:bg-green-700 px-4 py-2 rounded-lg font-semibold"
+                                  className="bg-green-600 hover:bg-green-700 px-2 md:px-4 py-1.5 md:py-2 rounded-lg font-semibold text-xs md:text-base whitespace-nowrap"
                                 >
-                                  ✓ Move to Staging
+                                  ✓ Stage
                                 </button>
                               )}
                               {!pt.assigned_lane && (
-                                <div className="bg-yellow-700 px-4 py-2 rounded-lg text-sm font-semibold">
-                                  Assign to lane first
+                                <div className="bg-yellow-700 px-2 md:px-4 py-1.5 md:py-2 rounded-lg text-xs md:text-sm font-semibold whitespace-nowrap">
+                                  Assign first
                                 </div>
                               )}
                             </div>
@@ -804,71 +807,70 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
           </div>
         )}
 
+        {/* PT Details Modal */}
         {selectedPTDetails && (
           <div className="fixed inset-0 bg-black bg-opacity-90 flex items-center justify-center z-50 p-4">
-            <div className="bg-gray-800 rounded-lg p-8 max-w-2xl w-full">
-              <div className="flex justify-between items-center mb-6">
-                <h3 className="text-2xl font-bold">Pickticket Details</h3>
+            <div className="bg-gray-800 rounded-lg p-4 md:p-8 max-w-2xl w-full max-h-[90vh] overflow-y-auto">
+              <div className="flex justify-between items-center mb-4 md:mb-6">
+                <h3 className="text-lg md:text-2xl font-bold">PT Details</h3>
                 <button
                   onClick={() => setSelectedPTDetails(null)}
-                  className="text-4xl hover:text-red-500"
+                  className="text-3xl md:text-4xl hover:text-red-500"
                 >
                   &times;
                 </button>
               </div>
 
-              <div className="grid grid-cols-2 gap-4">
+              <div className="grid grid-cols-2 gap-3 md:gap-4 text-sm md:text-base">
                 <div>
-                  <div className="text-sm text-gray-400">Pickticket #</div>
-                  <div className="text-xl font-bold">{selectedPTDetails.pt_number}</div>
+                  <div className="text-xs md:text-sm text-gray-400">PT #</div>
+                  <div className="font-bold break-all">{selectedPTDetails.pt_number}</div>
                 </div>
                 <div>
-                  <div className="text-sm text-gray-400">PO #</div>
-                  <div className="text-xl font-bold">{selectedPTDetails.po_number}</div>
+                  <div className="text-xs md:text-sm text-gray-400">PO #</div>
+                  <div className="font-bold break-all">{selectedPTDetails.po_number}</div>
+                </div>
+                <div className="col-span-2">
+                  <div className="text-xs md:text-sm text-gray-400">Customer</div>
+                  <div className="break-all">{selectedPTDetails.customer}</div>
                 </div>
                 <div>
-                  <div className="text-sm text-gray-400">Customer</div>
-                  <div className="text-lg">{selectedPTDetails.customer}</div>
+                  <div className="text-xs md:text-sm text-gray-400">DC #</div>
+                  <div className="break-all">{selectedPTDetails.store_dc || 'N/A'}</div>
                 </div>
                 <div>
-                  <div className="text-sm text-gray-400">DC # (Store/DC)</div>
-                  <div className="text-lg">{selectedPTDetails.store_dc || 'N/A'}</div>
+                  <div className="text-xs md:text-sm text-gray-400">Pallets</div>
+                  <div className="font-bold text-blue-400">{selectedPTDetails.actual_pallet_count}</div>
                 </div>
                 <div>
-                  <div className="text-sm text-gray-400">Container #</div>
-                  <div className="text-lg">{selectedPTDetails.container_number}</div>
+                  <div className="text-xs md:text-sm text-gray-400">Start Date</div>
+                  <div>{selectedPTDetails.start_date || 'N/A'}</div>
                 </div>
                 <div>
-                  <div className="text-sm text-gray-400">Pallet Count</div>
-                  <div className="text-lg font-bold text-blue-400">
-                    {selectedPTDetails.actual_pallet_count} pallets
-                  </div>
+                  <div className="text-xs md:text-sm text-gray-400">Cancel Date</div>
+                  <div>{selectedPTDetails.cancel_date || 'N/A'}</div>
                 </div>
-                <div>
-                  <div className="text-sm text-gray-400">Start Date</div>
-                  <div className="text-lg">{selectedPTDetails.start_date || 'N/A'}</div>
+                <div className="col-span-2">
+                  <div className="text-xs md:text-sm text-gray-400">Container</div>
+                  <div className="break-all">{selectedPTDetails.container_number}</div>
                 </div>
-                <div>
-                  <div className="text-sm text-gray-400">Cancel Date</div>
-                  <div className="text-lg">{selectedPTDetails.cancel_date || 'N/A'}</div>
-                </div>
-                <div>
-                  <div className="text-sm text-gray-400">Current Location</div>
-                  <div className="text-lg font-bold text-blue-400">
+                <div className="col-span-2">
+                  <div className="text-xs md:text-sm text-gray-400">Location</div>
+                  <div className="font-bold text-blue-400">
                     {selectedPTDetails.assigned_lane ? `Lane ${selectedPTDetails.assigned_lane}` : 'Unassigned'}
                   </div>
                 </div>
                 <div className="col-span-2">
-                  <div className="text-sm text-gray-400">Status</div>
-                  <div className={`text-lg font-bold ${selectedPTDetails.moved_to_staging && !selectedPTDetails.removed_from_staging ? 'text-green-400' : 'text-yellow-400'}`}>
-                    {selectedPTDetails.moved_to_staging && !selectedPTDetails.removed_from_staging ? 'Ready to Ship (In Staging)' : 'Awaiting Move'}
+                  <div className="text-xs md:text-sm text-gray-400">Status</div>
+                  <div className={`font-bold ${selectedPTDetails.moved_to_staging && !selectedPTDetails.removed_from_staging ? 'text-green-400' : 'text-yellow-400'}`}>
+                    {selectedPTDetails.moved_to_staging && !selectedPTDetails.removed_from_staging ? 'Ready (Staging)' : 'Awaiting Move'}
                   </div>
                 </div>
               </div>
 
               <button
                 onClick={() => setSelectedPTDetails(null)}
-                className="w-full mt-6 bg-blue-600 hover:bg-blue-700 py-3 rounded-lg font-bold text-lg"
+                className="w-full mt-4 md:mt-6 bg-blue-600 hover:bg-blue-700 py-2 md:py-3 rounded-lg font-bold text-sm md:text-lg"
               >
                 Close
               </button>
@@ -877,13 +879,15 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
         )}
       </div>
 
+      {/* Toast */}
       {toast && (
-        <div className={`fixed top-4 right-4 z-[110] px-6 py-3 rounded-lg font-semibold shadow-lg animate-fade-in ${toast.type === 'success' ? 'bg-green-600' : 'bg-red-600'
+        <div className={`fixed top-4 right-4 z-[110] px-4 md:px-6 py-2 md:py-3 rounded-lg font-semibold shadow-lg animate-fade-in text-sm md:text-base ${toast.type === 'success' ? 'bg-green-600' : 'bg-red-600'
           }`}>
           {toast.message}
         </div>
       )}
 
+      {/* Confirm Modal */}
       <ConfirmModal
         isOpen={confirmModal.isOpen}
         title={confirmModal.title}

@@ -66,7 +66,6 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
   const [loading, setLoading] = useState(false);
   const [allLanes, setAllLanes] = useState<Lane[]>([]);
 
-  // Confirmation modal state
   const [confirmModal, setConfirmModal] = useState<{
     isOpen: boolean;
     title: string;
@@ -79,7 +78,6 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
     onConfirm: () => { }
   });
 
-  // Success/Error toast
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
 
   useEffect(() => {
@@ -227,10 +225,10 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
     const searchTerm = ptSearchQuery.trim().toLowerCase();
 
     const filtered = allPicktickets.filter(pt =>
-      pt.pt_number.toLowerCase().includes(ptSearchQuery.toLowerCase()) ||
-      pt.po_number.toLowerCase().includes(ptSearchQuery.toLowerCase()) ||
-      pt.customer.toLowerCase().includes(ptSearchQuery.toLowerCase()) ||
-      pt.container_number.toLowerCase().includes(ptSearchQuery.toLowerCase())
+      pt.pt_number.toLowerCase().includes(searchTerm) ||
+      pt.po_number.toLowerCase().includes(searchTerm) ||
+      pt.customer.toLowerCase().includes(searchTerm) ||
+      pt.container_number.toLowerCase().includes(searchTerm)
     );
 
     setPicktickets(filtered);
@@ -257,7 +255,7 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
 
   async function handleAssign() {
     if (isStaging) {
-      showToast('Cannot add new PTs to a staging lane. Only moved shipments can go here.', 'error');
+      showToast('Cannot add new PTs to a staging lane', 'error');
       return;
     }
 
@@ -295,7 +293,7 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
         position++;
       }
 
-      showToast(`✅ Assigned ${Object.keys(selectedPTs).length} PTs to Lane ${lane.lane_number}`, 'success');
+      showToast(`✅ Assigned ${Object.keys(selectedPTs).length} PTs`, 'success');
 
       setSelectedPTs({});
       setSelectedContainer('');
@@ -315,11 +313,10 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
 
   async function handleRemovePT(assignmentId: number, ptId: number) {
     showConfirm(
-      'Remove PT from Lane',
-      'Are you sure you want to remove this PT from the lane?',
+      'Remove PT',
+      'Remove this PT from the lane?',
       async () => {
         try {
-          // DELETE the shipment_pts record entirely (don't just mark as removed)
           await supabase
             .from('shipment_pts')
             .delete()
@@ -339,7 +336,7 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
             })
             .eq('id', ptId);
 
-          showToast('PT removed from lane', 'success');
+          showToast('PT removed', 'success');
           await fetchExistingPTs();
           await checkIfStagingLane();
 
@@ -375,91 +372,81 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
 
     } catch (error) {
       console.error('Error updating pallet count:', error);
-      showToast('Failed to update pallet count', 'error');
+      showToast('Failed to update', 'error');
     }
   }
 
   async function handleMoveLane() {
-  if (!movingPT || !moveLaneInput.trim()) return;
+    if (!movingPT || !moveLaneInput.trim()) return;
 
-  const newLaneNumber = moveLaneInput.trim();
+    const newLaneNumber = moveLaneInput.trim();
 
-  // Safety check: Fetch lanes if we don't have them yet
-  if (allLanes.length === 0) {
-    console.log('⚠️ allLanes is empty, fetching now...');
-    await fetchAllLanes();
-    // Give state a moment to update, then retry
-    setTimeout(() => handleMoveLane(), 100);
-    return;
-  }
+    if (allLanes.length === 0) {
+      await fetchAllLanes();
+      setTimeout(() => handleMoveLane(), 100);
+      return;
+    }
 
-  console.log('=== DEBUG MOVE LANE ===');
-  console.log('Input lane number:', newLaneNumber, typeof newLaneNumber);
-  console.log('Current lane number:', lane.lane_number, typeof lane.lane_number);
-  console.log('All lanes count:', allLanes.length);
-  
-  const targetLane = allLanes.find(l => String(l.lane_number).trim() === String(newLaneNumber).trim());
-  
-  console.log('Found target lane:', targetLane);
-  
-  if (!targetLane) {
-    setMoveLaneError('Invalid lane number');
-    setTimeout(() => setMoveLaneError(''), 3000);
-    return;
-  }
+    const targetLane = allLanes.find(l => String(l.lane_number).trim() === String(newLaneNumber).trim());
 
-  if (String(newLaneNumber).trim() === String(lane.lane_number).trim()) {
-    setMoveLaneError('PT is already in this lane');
-    setTimeout(() => setMoveLaneError(''), 3000);
-    return;
-  }
-
-  try {
-    const ptToMove = existingPTs.find(pt => pt.id === movingPT.assignmentId);
-    if (!ptToMove) return;
-
-    if ((targetLane.current_pallets || 0) + ptToMove.pallet_count > targetLane.max_capacity) {
-      setMoveLaneError('Target lane does not have enough capacity');
+    if (!targetLane) {
+      setMoveLaneError('Invalid lane number');
       setTimeout(() => setMoveLaneError(''), 3000);
       return;
     }
 
-    const { data: targetAssignments } = await supabase
-      .from('lane_assignments')
-      .select('order_position')
-      .eq('lane_number', String(newLaneNumber))
-      .order('order_position', { ascending: false })
-      .limit(1);
+    if (String(newLaneNumber).trim() === String(lane.lane_number).trim()) {
+      setMoveLaneError('Already in this lane');
+      setTimeout(() => setMoveLaneError(''), 3000);
+      return;
+    }
 
-    const newPosition = targetAssignments && targetAssignments.length > 0 
-      ? targetAssignments[0].order_position + 1 
-      : 1;
+    try {
+      const ptToMove = existingPTs.find(pt => pt.id === movingPT.assignmentId);
+      if (!ptToMove) return;
 
-    await supabase
-      .from('lane_assignments')
-      .update({ 
-        lane_number: String(newLaneNumber),
-        order_position: newPosition
-      })
-      .eq('id', movingPT.assignmentId);
+      if ((targetLane.current_pallets || 0) + ptToMove.pallet_count > targetLane.max_capacity) {
+        setMoveLaneError('Target lane full');
+        setTimeout(() => setMoveLaneError(''), 3000);
+        return;
+      }
 
-    await supabase
-      .from('picktickets')
-      .update({ assigned_lane: String(newLaneNumber) })
-      .eq('id', movingPT.ptId);
+      const { data: targetAssignments } = await supabase
+        .from('lane_assignments')
+        .select('order_position')
+        .eq('lane_number', String(newLaneNumber))
+        .order('order_position', { ascending: false })
+        .limit(1);
 
-    showToast(`PT moved to Lane ${newLaneNumber}`, 'success');
-    setMovingPT(null);
-    setMoveLaneInput('');
-    setMoveLaneError('');
-    await fetchExistingPTs();
-    await checkIfStagingLane();
-    
-  } catch (error) {
-    console.error('Error moving PT to new lane:', error);
-    showToast('Failed to move PT', 'error');
+      const newPosition = targetAssignments && targetAssignments.length > 0
+        ? targetAssignments[0].order_position + 1
+        : 1;
+
+      await supabase
+        .from('lane_assignments')
+        .update({
+          lane_number: String(newLaneNumber),
+          order_position: newPosition
+        })
+        .eq('id', movingPT.assignmentId);
+
+      await supabase
+        .from('picktickets')
+        .update({ assigned_lane: String(newLaneNumber) })
+        .eq('id', movingPT.ptId);
+
+      showToast(`PT moved to Lane ${newLaneNumber}`, 'success');
+      setMovingPT(null);
+      setMoveLaneInput('');
+      setMoveLaneError('');
+      await fetchExistingPTs();
+      await checkIfStagingLane();
+
+    } catch (error) {
+      console.error('Error moving PT:', error);
+      showToast('Failed to move PT', 'error');
+    }
   }
-}
 
   function handleDragStart(index: number) {
     setDraggedItem(index);
@@ -516,7 +503,7 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
   }
 
   const filteredContainers = containers.filter(c => {
-    const searchTerm = containerSearch.trim().toLowerCase(); // TRIM HERE
+    const searchTerm = containerSearch.trim().toLowerCase();
     return c.container_number.toLowerCase().includes(searchTerm) ||
       c.container_number.slice(-4).includes(searchTerm);
   });
@@ -539,32 +526,34 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
 
   return (
     <>
-      <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50 p-4">
-        <div className="bg-gray-800 rounded-lg p-8 max-w-7xl w-full max-h-[90vh] overflow-y-auto">
-          <div className="flex justify-between items-center mb-6">
-            <div className="flex items-center gap-4">
-              <h2 className="text-3xl font-bold">Lane {lane.lane_number}</h2>
+      <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50 p-2 md:p-4">
+        <div className="bg-gray-800 rounded-lg p-3 md:p-6 max-w-7xl w-full max-h-[90vh] overflow-y-auto">
+          {/* Header - mobile optimized */}
+          <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 mb-4 md:mb-6">
+            <div className="flex flex-wrap items-center gap-2">
+              <h2 className="text-xl md:text-3xl font-bold">Lane {lane.lane_number}</h2>
               {isStaging && (
-                <div className="flex items-center gap-2">
-                  <span className="bg-purple-700 px-4 py-2 rounded-lg font-bold text-xl">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="bg-purple-700 px-2 md:px-4 py-1 md:py-2 rounded-lg font-bold text-sm md:text-xl">
                     📦 STAGING
                   </span>
                   {stagingPUs.length > 0 && (
-                    <span className="bg-blue-700 px-4 py-2 rounded-lg font-bold">
+                    <span className="bg-blue-700 px-2 md:px-4 py-1 md:py-2 rounded-lg font-bold text-xs md:text-base">
                       PU: {stagingPUs.join(', ')}
                     </span>
                   )}
                 </div>
               )}
             </div>
-            <button onClick={onClose} className="text-4xl hover:text-red-500">&times;</button>
+            <button onClick={onClose} className="text-3xl md:text-4xl hover:text-red-500 self-end sm:self-auto">&times;</button>
           </div>
 
+          {/* Tab switcher */}
           {existingPTs.length > 0 && !isStaging && (
-            <div className="flex gap-4 mb-6">
+            <div className="grid grid-cols-2 gap-2 md:gap-4 mb-4 md:mb-6">
               <button
                 onClick={() => setView('existing')}
-                className={`flex-1 py-3 rounded-lg font-bold text-lg ${view === 'existing'
+                className={`py-2 md:py-3 rounded-lg font-bold text-sm md:text-lg ${view === 'existing'
                   ? 'bg-blue-600'
                   : 'bg-gray-700 hover:bg-gray-600'
                   }`}
@@ -573,7 +562,7 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
               </button>
               <button
                 onClick={() => setView('add')}
-                className={`flex-1 py-3 rounded-lg font-bold text-lg ${view === 'add'
+                className={`py-2 md:py-3 rounded-lg font-bold text-sm md:text-lg ${view === 'add'
                   ? 'bg-green-600'
                   : 'bg-gray-700 hover:bg-gray-600'
                   }`}
@@ -583,15 +572,16 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
             </div>
           )}
 
+          {/* EXISTING PTs VIEW */}
           {(view === 'existing' || isStaging) && (
             <div>
-              <div className="bg-gray-700 p-4 rounded-lg mb-4">
-                <div className="text-lg">
+              <div className="bg-gray-700 p-3 md:p-4 rounded-lg mb-3 md:mb-4">
+                <div className="text-sm md:text-lg">
                   <span className="font-bold">Capacity:</span> {lane.current_pallets} / {lane.max_capacity} pallets
                 </div>
               </div>
 
-              <div className="space-y-3">
+              <div className="space-y-2 md:space-y-3">
                 {existingPTs.map((assignment, index) => {
                   const palletsInFront = calculatePalletsInFront(index);
                   const depthColor = getDepthColor(palletsInFront, lane.max_capacity);
@@ -603,23 +593,31 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                       onDragStart={() => handleDragStart(index)}
                       onDragOver={(e) => handleDragOver(e, index)}
                       onDragEnd={handleDragEnd}
-                      className="bg-gray-700 p-4 rounded-lg border-2 border-gray-600 cursor-move hover:border-blue-500 transition-all"
+                      className="bg-gray-700 p-2 md:p-4 rounded-lg border-2 border-gray-600 cursor-move hover:border-blue-500 transition-all"
                     >
-                      <div className="flex items-center gap-4">
-                        <div className="flex-shrink-0 w-12 h-12 bg-blue-900 rounded-full flex items-center justify-center font-bold text-xl">
+                      <div className="flex flex-col md:flex-row md:items-center gap-2 md:gap-4">
+                        {/* Position number */}
+                        <div className="hidden md:flex flex-shrink-0 w-12 h-12 bg-blue-900 rounded-full items-center justify-center font-bold text-xl">
                           {index + 1}
                         </div>
 
-                        <div className="flex-1">
-                          <div className="flex items-center gap-3 mb-2 flex-wrap">
-                            <div className="text-xl font-bold">PT #{assignment.pickticket.pt_number}</div>
-                            <span className={`px-3 py-1 rounded-full text-xs font-bold ${depthColor}`}>
-                              {palletsInFront} pallets in front ({Math.round((palletsInFront / lane.max_capacity) * 100)}% deep)
+                        {/* PT Info */}
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2 mb-1 flex-wrap">
+                            <span className="md:hidden text-blue-400 font-bold">#{index + 1}</span>
+                            <div className="text-base md:text-xl font-bold break-all">PT #{assignment.pickticket.pt_number}</div>
+                            <span className={`px-2 py-0.5 md:px-3 md:py-1 rounded-full text-[10px] md:text-xs font-bold ${depthColor}`}>
+                              {palletsInFront} in front ({Math.round((palletsInFront / lane.max_capacity) * 100)}%)
                             </span>
                           </div>
-                          <div className="text-sm text-gray-300">
-                            {assignment.pickticket.customer} | PO: {assignment.pickticket.po_number} | Container: {assignment.pickticket.container_number}
+                          <div className="text-xs md:text-sm text-gray-300 break-all">
+                            {assignment.pickticket.customer} | PO: {assignment.pickticket.po_number}
                           </div>
+                          <div className="text-xs text-gray-400 break-all">
+                            Container: {assignment.pickticket.container_number}
+                          </div>
+
+                          {/* Edit/Move inputs */}
                           {editingPT && editingPT.id === assignment.id ? (
                             <div className="flex items-center gap-2 mt-2">
                               <input
@@ -627,21 +625,19 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                                 value={editingPT.count}
                                 onChange={(e) => setEditingPT({ ...editingPT, count: e.target.value })}
                                 onBlur={(e) => {
-                                  if (!e.target.value) {
-                                    setEditingPT({ ...editingPT, count: '1' });
-                                  }
+                                  if (!e.target.value) setEditingPT({ ...editingPT, count: '1' });
                                 }}
-                                className="bg-gray-900 text-white p-2 rounded w-20 text-center"
+                                className="bg-gray-900 text-white p-1 md:p-2 rounded w-16 md:w-20 text-center text-sm"
                               />
                               <button
                                 onClick={handleEditPalletCount}
-                                className="bg-green-600 hover:bg-green-700 px-3 py-1 rounded text-sm"
+                                className="bg-green-600 hover:bg-green-700 px-2 md:px-3 py-1 rounded text-xs md:text-sm"
                               >
                                 Save
                               </button>
                               <button
                                 onClick={() => setEditingPT(null)}
-                                className="bg-gray-600 hover:bg-gray-700 px-3 py-1 rounded text-sm"
+                                className="bg-gray-600 hover:bg-gray-700 px-2 md:px-3 py-1 rounded text-xs md:text-sm"
                               >
                                 Cancel
                               </button>
@@ -655,12 +651,12 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                                   setMoveLaneInput(e.target.value);
                                   setMoveLaneError('');
                                 }}
-                                placeholder="Enter lane number"
-                                className={`bg-gray-900 text-white p-2 rounded flex-1 ${moveLaneError ? 'border-2 border-red-500' : ''}`}
+                                placeholder="Lane #"
+                                className={`bg-gray-900 text-white p-1 md:p-2 rounded flex-1 text-sm ${moveLaneError ? 'border-2 border-red-500' : ''}`}
                               />
                               <button
                                 onClick={handleMoveLane}
-                                className="bg-green-600 hover:bg-green-700 px-4 py-2 rounded text-sm font-semibold"
+                                className="bg-green-600 hover:bg-green-700 px-2 md:px-4 py-1 md:py-2 rounded text-xs md:text-sm font-semibold"
                               >
                                 Move
                               </button>
@@ -670,28 +666,28 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                                   setMoveLaneInput('');
                                   setMoveLaneError('');
                                 }}
-                                className="bg-gray-600 hover:bg-gray-700 px-3 py-2 rounded text-sm"
+                                className="bg-gray-600 hover:bg-gray-700 px-2 md:px-3 py-1 md:py-2 rounded text-xs md:text-sm"
                               >
-                                Cancel
+                                ✕
                               </button>
                               {moveLaneError && (
-                                <div className="absolute -bottom-6 left-0 text-red-500 text-sm animate-fade-in">
+                                <div className="absolute -bottom-6 left-0 text-red-500 text-xs md:text-sm animate-fade-in">
                                   {moveLaneError}
                                 </div>
                               )}
                             </div>
                           ) : (
                             <>
-                              <div className="text-lg text-blue-400 mt-1">
+                              <div className="text-sm md:text-lg text-blue-400 mt-1">
                                 {assignment.pallet_count} pallets
                               </div>
                               {assignment.pickticket.status === 'ready_to_ship' && (
-                                <div className="mt-2 flex items-center gap-2">
-                                  <span className="bg-purple-700 text-purple-200 px-3 py-1 rounded-full text-sm font-semibold">
-                                    📦 Preparing for Shipment
+                                <div className="mt-2 flex flex-wrap items-center gap-2">
+                                  <span className="bg-purple-700 text-purple-200 px-2 py-0.5 md:px-3 md:py-1 rounded-full text-[10px] md:text-sm font-semibold">
+                                    📦 Preparing
                                   </span>
                                   {assignment.pickticket.pu_number && (
-                                    <span className="bg-blue-700 text-blue-200 px-3 py-1 rounded-full text-sm font-semibold">
+                                    <span className="bg-blue-700 text-blue-200 px-2 py-0.5 md:px-3 md:py-1 rounded-full text-[10px] md:text-sm font-semibold">
                                       PU: {assignment.pickticket.pu_number}
                                     </span>
                                   )}
@@ -701,38 +697,39 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                           )}
                         </div>
 
-                        <div className="flex gap-3">
+                        {/* Action buttons - 2x2 grid on mobile, row on desktop */}
+                        <div className="grid grid-cols-2 md:flex gap-1 md:gap-2">
                           <button
                             onClick={() => setEditingPT({ id: assignment.id, count: assignment.pallet_count.toString(), assignmentId: assignment.id })}
-                            className="bg-orange-600 hover:bg-orange-700 px-4 py-2 rounded-lg font-semibold"
+                            className="bg-orange-600 hover:bg-orange-700 px-2 md:px-4 py-1.5 md:py-2 rounded-lg font-semibold text-xs md:text-base whitespace-nowrap"
                           >
-                            Edit Pallets
+                            Edit
                           </button>
                           <button
                             onClick={() => {
                               setMovingPT({ id: assignment.id, assignmentId: assignment.id, ptId: assignment.pickticket.id, ptNumber: assignment.pickticket.pt_number });
-                              fetchAllLanes(); // ADD THIS LINE
+                              fetchAllLanes();
                             }}
-
-                            className="bg-yellow-600 hover:bg-yellow-700 px-4 py-2 rounded-lg font-semibold"
+                            className="bg-yellow-600 hover:bg-yellow-700 px-2 md:px-4 py-1.5 md:py-2 rounded-lg font-semibold text-xs md:text-base whitespace-nowrap"
                           >
-                            Move Lane
+                            Move
                           </button>
                           <button
                             onClick={() => setSelectedPTDetails(assignment.pickticket)}
-                            className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg font-semibold"
+                            className="bg-blue-600 hover:bg-blue-700 px-2 md:px-4 py-1.5 md:py-2 rounded-lg font-semibold text-xs md:text-base whitespace-nowrap"
                           >
                             Details
                           </button>
                           <button
                             onClick={() => handleRemovePT(assignment.id, assignment.pickticket.id)}
-                            className="bg-red-600 hover:bg-red-700 px-4 py-2 rounded-lg font-semibold"
+                            className="bg-red-600 hover:bg-red-700 px-2 md:px-4 py-1.5 md:py-2 rounded-lg font-semibold text-xs md:text-base whitespace-nowrap"
                           >
                             Remove
                           </button>
                         </div>
 
-                        <div className="flex-shrink-0 text-gray-400 text-2xl cursor-move">
+                        {/* Drag handle */}
+                        <div className="hidden md:flex flex-shrink-0 text-gray-400 text-2xl cursor-move">
                           ⋮⋮
                         </div>
                       </div>
@@ -743,11 +740,13 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
             </div>
           )}
 
+          {/* ADD NEW PT VIEW */}
           {view === 'add' && !isStaging && (
             <div>
-              <div className="mb-6 bg-gray-700 p-4 rounded-lg">
-                <label className="block text-lg font-semibold mb-3">Search Method</label>
-                <div className="flex gap-6">
+              {/* Search mode selector */}
+              <div className="mb-4 md:mb-6 bg-gray-700 p-3 md:p-4 rounded-lg">
+                <label className="block text-sm md:text-lg font-semibold mb-2 md:mb-3">Search Method</label>
+                <div className="flex flex-col sm:flex-row gap-3 md:gap-6">
                   <label className="flex items-center gap-2 cursor-pointer">
                     <input
                       type="radio"
@@ -759,9 +758,9 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                         setSelectedPTs({});
                         setPtSearchQuery('');
                       }}
-                      className="w-5 h-5"
+                      className="w-4 h-4 md:w-5 md:h-5"
                     />
-                    <span className="text-lg">Search by Container</span>
+                    <span className="text-sm md:text-lg">By Container</span>
                   </label>
                   <label className="flex items-center gap-2 cursor-pointer">
                     <input
@@ -775,68 +774,68 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                         setSelectedContainer('');
                         setContainerSearch('');
                       }}
-                      className="w-5 h-5"
+                      className="w-4 h-4 md:w-5 md:h-5"
                     />
-                    <span className="text-lg">Search by PT/PO</span>
+                    <span className="text-sm md:text-lg">By PT/PO</span>
                   </label>
                 </div>
               </div>
 
+              {/* Container search */}
               {searchMode === 'container' && (
-                <div className="mb-6">
-                  <label className="block text-lg font-semibold mb-2">Search & Select Container</label>
+                <div className="mb-4 md:mb-6">
+                  <label className="block text-sm md:text-lg font-semibold mb-2">Search Container</label>
                   <input
                     type="text"
-                    placeholder="Search container (e.g., last 4 digits: 1234)"
+                    placeholder="Search (last 4 digits)"
                     value={containerSearch}
                     onChange={(e) => setContainerSearch(e.target.value)}
-                    className="w-full bg-gray-700 text-white p-3 rounded-lg text-lg mb-2"
+                    className="w-full bg-gray-700 text-white p-2 md:p-3 rounded-lg text-sm md:text-lg mb-2"
                   />
                   <select
                     value={selectedContainer}
                     onChange={(e) => setSelectedContainer(e.target.value)}
-                    className="w-full bg-gray-700 text-white p-3 rounded-lg text-lg"
-                    size={8}
+                    className="w-full bg-gray-700 text-white p-2 md:p-3 rounded-lg text-sm md:text-lg"
+                    size={6}
                   >
                     <option value="">-- Choose Container --</option>
                     {filteredContainers.map(c => (
                       <option key={c.container_number} value={c.container_number}>
-                        Container {c.container_number}
+                        {c.container_number}
                       </option>
                     ))}
                   </select>
                 </div>
               )}
 
+              {/* PT search */}
               {searchMode === 'pt' && (
-                <div className="mb-6">
-                  <label className="block text-lg font-semibold mb-2">Search Picktickets</label>
+                <div className="mb-4 md:mb-6">
+                  <label className="block text-sm md:text-lg font-semibold mb-2">Search Picktickets</label>
                   <input
                     type="text"
-                    placeholder="Search by PT#, PO#, Customer, or Container..."
+                    placeholder="PT#, PO#, Customer..."
                     value={ptSearchQuery}
                     onChange={(e) => setPtSearchQuery(e.target.value)}
-                    className="w-full bg-gray-700 text-white p-3 rounded-lg text-lg"
+                    className="w-full bg-gray-700 text-white p-2 md:p-3 rounded-lg text-sm md:text-lg"
                   />
-                  <p className="text-sm text-gray-400 mt-2">
-                    💡 Type to search across all unassigned picktickets
-                  </p>
                 </div>
               )}
 
+              {/* PT selection grid */}
               {picktickets.length > 0 && (
-                <div className="mb-6">
-                  <label className="block text-lg font-semibold mb-2">
-                    Select Picktickets ({picktickets.length} found)
+                <div className="mb-4 md:mb-6">
+                  <label className="block text-sm md:text-lg font-semibold mb-2">
+                    Select PTs ({picktickets.length} found)
                   </label>
 
-                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                  <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-3 md:gap-6">
                     {customers.map(customer => (
-                      <div key={customer} className="bg-gray-700 p-4 rounded-lg">
-                        <h3 className="text-xl font-bold mb-4 text-center border-b border-gray-500 pb-2">
+                      <div key={customer} className="bg-gray-700 p-3 md:p-4 rounded-lg">
+                        <h3 className="text-sm md:text-xl font-bold mb-2 md:mb-4 text-center border-b border-gray-500 pb-2">
                           {customer}
                         </h3>
-                        <div className="space-y-3">
+                        <div className="space-y-2 md:space-y-3">
                           {ptsByCustomer[customer].map(pt => {
                             const isSelected = selectedPTs[pt.id] !== undefined;
 
@@ -844,39 +843,37 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                               <div
                                 key={pt.id}
                                 onClick={() => handlePTSelect(pt.id)}
-                                className={`p-3 rounded-lg border-2 cursor-pointer transition-all ${isSelected
+                                className={`p-2 md:p-3 rounded-lg border-2 cursor-pointer transition-all ${isSelected
                                   ? 'bg-blue-900 border-blue-500'
                                   : 'bg-gray-800 border-gray-600 hover:border-gray-500'
                                   }`}
                               >
-                                <div className="flex items-start gap-3">
+                                <div className="flex items-start gap-2 md:gap-3">
                                   <input
                                     type="checkbox"
                                     checked={isSelected}
                                     onChange={() => { }}
-                                    className="w-5 h-5 cursor-pointer mt-1 pointer-events-none"
+                                    className="w-4 h-4 md:w-5 md:h-5 cursor-pointer mt-0.5 md:mt-1 pointer-events-none"
                                   />
-                                  <div className="flex-1">
-                                    <div className="font-bold">PT #{pt.pt_number}</div>
-                                    <div className="text-xs text-gray-300">
+                                  <div className="flex-1 min-w-0">
+                                    <div className="font-bold text-sm md:text-base break-all">PT #{pt.pt_number}</div>
+                                    <div className="text-[10px] md:text-xs text-gray-300 break-all">
                                       PO: {pt.po_number}
                                     </div>
-                                    <div className="text-xs text-gray-400">
-                                      Container: {pt.container_number}
+                                    <div className="text-[10px] md:text-xs text-gray-400 break-all">
+                                      Cont: {pt.container_number}
                                     </div>
                                     {isSelected && (
                                       <div className="flex items-center gap-2 mt-2" onClick={(e) => e.stopPropagation()}>
-                                        <label className="text-xs">Pallets:</label>
+                                        <label className="text-[10px] md:text-xs">Pallets:</label>
                                         <input
                                           type="text"
                                           value={selectedPTs[pt.id]}
                                           onChange={(e) => handlePalletCountChange(pt.id, e.target.value)}
                                           onBlur={(e) => {
-                                            if (!e.target.value) {
-                                              handlePalletCountChange(pt.id, '1');
-                                            }
+                                            if (!e.target.value) handlePalletCountChange(pt.id, '1');
                                           }}
-                                          className="bg-gray-900 text-white p-1 rounded w-16 text-center text-sm"
+                                          className="bg-gray-900 text-white p-1 rounded w-12 md:w-16 text-center text-xs md:text-sm"
                                         />
                                       </div>
                                     )}
@@ -892,26 +889,24 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                 </div>
               )}
 
+              {/* Selected summary */}
               {selectedPTDetails_summary.length > 0 && (
-                <div className="bg-gray-700 p-4 rounded-lg mb-6">
-                  <h3 className="text-xl font-bold mb-3">Selected PTs Summary</h3>
-                  <div className="space-y-2 max-h-48 overflow-y-auto">
+                <div className="bg-gray-700 p-3 md:p-4 rounded-lg mb-4 md:mb-6">
+                  <h3 className="text-sm md:text-xl font-bold mb-2 md:mb-3">Selected ({selectedPTDetails_summary.length})</h3>
+                  <div className="space-y-1 md:space-y-2 max-h-48 overflow-y-auto">
                     {selectedPTDetails_summary.map((item, idx) => (
                       item && (
-                        <div key={idx} className="bg-gray-800 p-2 rounded flex justify-between items-center">
-                          <div>
-                            <span className="font-bold">PT #{item.pt.pt_number}</span>
-                            <span className="text-sm text-gray-400 ml-2">
-                              ({item.pt.customer} | PO: {item.pt.po_number} | Cont: {item.pt.container_number})
-                            </span>
+                        <div key={idx} className="bg-gray-800 p-2 rounded flex justify-between items-center gap-2">
+                          <div className="text-xs md:text-base min-w-0 flex-1">
+                            <span className="font-bold break-all">PT #{item.pt.pt_number}</span>
                           </div>
-                          <div className="flex items-center gap-3">
-                            <div className="text-blue-400 font-bold">{item.pallets} pallets</div>
+                          <div className="flex items-center gap-2 flex-shrink-0">
+                            <div className="text-blue-400 font-bold text-xs md:text-base">{item.pallets}p</div>
                             <button
                               onClick={() => handlePTSelect(item.pt.id)}
-                              className="bg-red-600 hover:bg-red-700 px-3 py-1 rounded text-sm font-semibold"
+                              className="bg-red-600 hover:bg-red-700 px-2 py-1 rounded text-[10px] md:text-sm font-semibold"
                             >
-                              Remove
+                              ✕
                             </button>
                           </div>
                         </div>
@@ -921,97 +916,82 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                 </div>
               )}
 
+              {/* Capacity warning */}
               {Object.keys(selectedPTs).length > 0 && (
-                <div className="bg-gray-700 p-4 rounded-lg mb-6">
-                  <div className="flex justify-between text-lg">
-                    <span>Selected PTs: {Object.keys(selectedPTs).length}</span>
-                    <span>Total New Pallets: {totalNewPallets} / {availableCapacity} available</span>
+                <div className="bg-gray-700 p-3 md:p-4 rounded-lg mb-4 md:mb-6">
+                  <div className="flex flex-col sm:flex-row justify-between gap-2 text-sm md:text-lg">
+                    <span>Selected: {Object.keys(selectedPTs).length} PTs</span>
+                    <span>Pallets: {totalNewPallets} / {availableCapacity} available</span>
                   </div>
                   {totalNewPallets > availableCapacity && (
-                    <div className="text-red-500 mt-2">⚠️ Would exceed lane capacity!</div>
+                    <div className="text-red-500 mt-2 text-xs md:text-base">⚠️ Exceeds capacity!</div>
                   )}
                 </div>
               )}
 
+              {/* Assign button */}
               <button
                 onClick={handleAssign}
                 disabled={loading || Object.keys(selectedPTs).length === 0 || totalNewPallets > availableCapacity}
-                className="w-full bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed py-4 rounded-lg font-bold text-xl"
+                className="w-full bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed py-3 md:py-4 rounded-lg font-bold text-base md:text-xl"
               >
-                {loading ? 'Assigning...' : `Assign ${Object.keys(selectedPTs).length} PTs to Lane ${lane.lane_number}`}
+                {loading ? 'Assigning...' : `Assign ${Object.keys(selectedPTs).length} PTs`}
               </button>
             </div>
           )}
 
+          {/* PT Details Modal */}
           {selectedPTDetails && (
             <div className="fixed inset-0 bg-black bg-opacity-90 flex items-center justify-center z-50 p-4">
-              <div className="bg-gray-800 rounded-lg p-8 max-w-2xl w-full">
-                <div className="flex justify-between items-center mb-6">
-                  <h3 className="text-2xl font-bold">Pickticket Details</h3>
+              <div className="bg-gray-800 rounded-lg p-4 md:p-8 max-w-2xl w-full max-h-[90vh] overflow-y-auto">
+                <div className="flex justify-between items-center mb-4 md:mb-6">
+                  <h3 className="text-lg md:text-2xl font-bold">PT Details</h3>
                   <button
                     onClick={() => setSelectedPTDetails(null)}
-                    className="text-4xl hover:text-red-500"
+                    className="text-3xl md:text-4xl hover:text-red-500"
                   >
                     &times;
                   </button>
                 </div>
 
-                <div className="space-y-4">
-                  <div className="grid grid-cols-2 gap-4">
-                    <div>
-                      <div className="text-sm text-gray-400">Pickticket #</div>
-                      <div className="text-xl font-bold">{selectedPTDetails.pt_number}</div>
-                    </div>
-                    <div>
-                      <div className="text-sm text-gray-400">PO #</div>
-                      <div className="text-xl font-bold">{selectedPTDetails.po_number}</div>
-                    </div>
-                    <div>
-                      <div className="text-sm text-gray-400">Customer</div>
-                      <div className="text-lg">{selectedPTDetails.customer}</div>
-                    </div>
-                    <div>
-                      <div className="text-sm text-gray-400">DC # (Store/DC)</div>
-                      <div className="text-lg">{selectedPTDetails.store_dc || 'N/A'}</div>
-                    </div>
-                    <div>
-                      <div className="text-sm text-gray-400">Container #</div>
-                      <div className="text-lg">{selectedPTDetails.container_number}</div>
-                    </div>
-                    <div>
-                      <div className="text-sm text-gray-400">Pallet Count</div>
-                      <div className="text-lg font-bold text-blue-400">
-                        {selectedPTDetails.actual_pallet_count || 'TBD'}
-                      </div>
-                    </div>
-                    <div>
-                      <div className="text-sm text-gray-400">Start Date</div>
-                      <div className="text-lg">{selectedPTDetails.start_date || 'N/A'}</div>
-                    </div>
-                    <div>
-                      <div className="text-sm text-gray-400">Cancel Date</div>
-                      <div className="text-lg">{selectedPTDetails.cancel_date || 'N/A'}</div>
-                    </div>
-                    {selectedPTDetails.status && (
-                      <div className="col-span-2">
-                        <div className="text-sm text-gray-400">Status</div>
-                        <div className="text-lg">
-                          {selectedPTDetails.status === 'ready_to_ship' ? (
-                            <span className="bg-purple-700 text-purple-200 px-3 py-1 rounded-full text-sm font-semibold">
-                              📦 Preparing for Shipment
-                            </span>
-                          ) : (
-                            <span className="text-gray-300">{selectedPTDetails.status}</span>
-                          )}
-                        </div>
-                      </div>
-                    )}
+                <div className="grid grid-cols-2 gap-3 md:gap-4 text-sm md:text-base">
+                  <div>
+                    <div className="text-xs md:text-sm text-gray-400">PT #</div>
+                    <div className="font-bold break-all">{selectedPTDetails.pt_number}</div>
+                  </div>
+                  <div>
+                    <div className="text-xs md:text-sm text-gray-400">PO #</div>
+                    <div className="font-bold break-all">{selectedPTDetails.po_number}</div>
+                  </div>
+                  <div className="col-span-2">
+                    <div className="text-xs md:text-sm text-gray-400">Customer</div>
+                    <div className="break-all">{selectedPTDetails.customer}</div>
+                  </div>
+                  <div>
+                    <div className="text-xs md:text-sm text-gray-400">DC #</div>
+                    <div className="break-all">{selectedPTDetails.store_dc || 'N/A'}</div>
+                  </div>
+                  <div>
+                    <div className="text-xs md:text-sm text-gray-400">Pallets</div>
+                    <div className="font-bold text-blue-400">{selectedPTDetails.actual_pallet_count || 'TBD'}</div>
+                  </div>
+                  <div>
+                    <div className="text-xs md:text-sm text-gray-400">Start Date</div>
+                    <div>{selectedPTDetails.start_date || 'N/A'}</div>
+                  </div>
+                  <div>
+                    <div className="text-xs md:text-sm text-gray-400">Cancel Date</div>
+                    <div>{selectedPTDetails.cancel_date || 'N/A'}</div>
+                  </div>
+                  <div className="col-span-2">
+                    <div className="text-xs md:text-sm text-gray-400">Container</div>
+                    <div className="break-all">{selectedPTDetails.container_number}</div>
                   </div>
                 </div>
 
                 <button
                   onClick={() => setSelectedPTDetails(null)}
-                  className="w-full mt-6 bg-blue-600 hover:bg-blue-700 py-3 rounded-lg font-bold text-lg"
+                  className="w-full mt-4 md:mt-6 bg-blue-600 hover:bg-blue-700 py-2 md:py-3 rounded-lg font-bold"
                 >
                   Close
                 </button>
@@ -1021,15 +1001,15 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
         </div>
       </div>
 
-      {/* Toast Notification */}
+      {/* Toast */}
       {toast && (
-        <div className={`fixed top-4 right-4 z-[110] px-6 py-3 rounded-lg font-semibold shadow-lg animate-fade-in ${toast.type === 'success' ? 'bg-green-600' : 'bg-red-600'
+        <div className={`fixed top-4 right-4 z-[110] px-4 md:px-6 py-2 md:py-3 rounded-lg font-semibold shadow-lg animate-fade-in text-sm md:text-base ${toast.type === 'success' ? 'bg-green-600' : 'bg-red-600'
           }`}>
           {toast.message}
         </div>
       )}
 
-      {/* Confirmation Modal */}
+      {/* Confirm Modal */}
       <ConfirmModal
         isOpen={confirmModal.isOpen}
         title={confirmModal.title}

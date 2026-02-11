@@ -42,3 +42,16 @@ body {
 .animate-fade-in {
   animation: fade-in 0.3s ease-out;
 }
+
+
+
+/* Mobile optimizations */
+@media (max-width: 768px) {
+  html {
+    font-size: 14px;
+  }
+  
+  body {
+    overflow-x: hidden;
+  }
+}
