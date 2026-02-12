@@ -11,7 +11,11 @@ interface PrintData {
   customer: string;
   store_dc: string;
   cancel_date: string;
+  has_been_printed: boolean;
 }
+
+// CHANGE THIS PASSWORD TO WHATEVER YOU WANT
+const REPRINT_PASSWORD = 'envybeth2026';
 
 export default function PrinterPage() {
   const [inputVal, setInputVal] = useState('');
@@ -20,6 +24,8 @@ export default function PrinterPage() {
   const [palletCount, setPalletCount] = useState<number>(1);
   const [printing, setPrinting] = useState(false);
   const [statusMsg, setStatusMsg] = useState('');
+  const [showPasswordPrompt, setShowPasswordPrompt] = useState(false);
+  const [passwordInput, setPasswordInput] = useState('');
 
   async function handleSearch(e: React.FormEvent) {
     e.preventDefault();
@@ -30,6 +36,7 @@ export default function PrinterPage() {
     setStatusMsg('');
 
     try {
+      // Check if PT exists
       const { data, error } = await supabase
         .from('picktickets')
         .select('id, pt_number, po_number, customer, store_dc, cancel_date')
@@ -39,11 +46,25 @@ export default function PrinterPage() {
 
       if (error || !data) {
         setStatusMsg('❌ No Pick Ticket found');
-      } else {
-        setPrintData(data);
-        setPalletCount(1);
-        setStatusMsg('');
+        return;
       }
+
+      // Check if already printed
+      const { data: historyData } = await supabase
+        .from('print_history')
+        .select('id')
+        .eq('pt_number', data.pt_number)
+        .limit(1);
+
+      const hasPrinted = historyData && historyData.length > 0;
+
+      setPrintData({
+        ...data,
+        has_been_printed: hasPrinted || false
+      });
+      setPalletCount(1);
+      setStatusMsg('');
+
     } catch (err) {
       console.error(err);
       setStatusMsg('❌ Error searching');
@@ -52,13 +73,39 @@ export default function PrinterPage() {
     }
   }
 
-  async function sendToPrintQueue() {
+  async function handlePrintClick() {
+    if (!printData) return;
+
+    // If already printed, show password prompt
+    if (printData.has_been_printed) {
+      setShowPasswordPrompt(true);
+      return;
+    }
+
+    // First time print - send directly
+    await sendToPrintQueue();
+  }
+
+  async function handleReprintWithPassword() {
+    if (passwordInput !== REPRINT_PASSWORD) {
+      alert('❌ Incorrect password');
+      setPasswordInput('');
+      return;
+    }
+
+    setShowPasswordPrompt(false);
+    setPasswordInput('');
+    await sendToPrintQueue(true);
+  }
+
+  async function sendToPrintQueue(isReprint = false) {
     if (!printData) return;
     setPrinting(true);
     setStatusMsg('⏳ Sending to printer...');
 
     try {
-      const { error } = await supabase
+      // Add to print queue
+      const { error: queueError } = await supabase
         .from('print_queue')
         .insert({
           pt_number: printData.pt_number,
@@ -67,10 +114,23 @@ export default function PrinterPage() {
           store_dc: printData.store_dc,
           cancel_date: printData.cancel_date,
           pallet_count: palletCount,
-          status: 'pending'
+          status: 'pending',
+          is_reprint: isReprint
         });
 
-      if (error) throw error;
+      if (queueError) throw queueError;
+
+      // Add to print history if first time
+      if (!isReprint) {
+        await supabase
+          .from('print_history')
+          .insert({
+            pt_number: printData.pt_number,
+            po_number: printData.po_number,
+            customer: printData.customer,
+            pallet_count: palletCount
+          });
+      }
 
       setStatusMsg(`✅ Sent to printer! ${palletCount * 2} labels queued.`);
       
@@ -134,7 +194,15 @@ export default function PrinterPage() {
         </div>
 
         {printData && (
-          <div className="bg-gray-800 p-4 md:p-6 rounded-lg border-2 border-blue-500 animate-fade-in">
+          <div className="bg-gray-800 p-4 md:p-6 rounded-lg border-2 border-blue-500 animate-fade-in relative">
+            
+            {/* PRINTED BADGE */}
+            {printData.has_been_printed && (
+              <div className="absolute top-4 right-4 bg-red-600 px-4 py-2 rounded-lg border-2 border-red-400 animate-pulse">
+                <div className="text-white font-bold text-lg">⚠️ PRINTED</div>
+              </div>
+            )}
+
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-6 border-b border-gray-700 pb-4">
               <div>
                 <p className="text-gray-400 text-xs md:text-sm">Customer</p>
@@ -164,19 +232,55 @@ export default function PrinterPage() {
                   value={palletCount}
                   onChange={(e) => setPalletCount(parseInt(e.target.value) || 1)}
                   className="bg-gray-900 border border-gray-600 rounded-lg p-3 md:p-4 text-2xl md:text-3xl font-bold w-full sm:w-32 text-center"
+                  disabled={showPasswordPrompt}
                 />
                 <div className="text-gray-400 text-xs md:text-sm">
                   x 2 copies = <span className="text-white font-bold text-sm md:text-base">{palletCount * 2}</span> total labels
                 </div>
               </div>
 
-              <button
-                onClick={sendToPrintQueue}
-                disabled={printing}
-                className="mt-4 w-full bg-green-600 hover:bg-green-700 py-3 md:py-4 rounded-lg text-lg md:text-2xl font-bold transition-transform active:scale-95 disabled:bg-gray-600 disabled:scale-100"
-              >
-                {printing ? 'Sending...' : '🖨️ SEND TO PRINTER'}
-              </button>
+              {!showPasswordPrompt ? (
+                <button
+                  onClick={handlePrintClick}
+                  disabled={printing}
+                  className={`mt-4 w-full py-3 md:py-4 rounded-lg text-lg md:text-2xl font-bold transition-transform active:scale-95 disabled:bg-gray-600 disabled:scale-100 ${
+                    printData.has_been_printed 
+                      ? 'bg-orange-600 hover:bg-orange-700' 
+                      : 'bg-green-600 hover:bg-green-700'
+                  }`}
+                >
+                  {printing ? 'Sending...' : printData.has_been_printed ? '🔒 REPRINT (Password Required)' : '🖨️ PRINT LABELS'}
+                </button>
+              ) : (
+                <div className="mt-4 bg-red-900 border-2 border-red-600 p-4 rounded-lg">
+                  <label className="block text-sm font-bold mb-2 text-white">Enter Reprint Password:</label>
+                  <div className="flex gap-2">
+                    <input
+                      type="password"
+                      value={passwordInput}
+                      onChange={(e) => setPasswordInput(e.target.value)}
+                      placeholder="Password"
+                      className="flex-1 bg-gray-900 border border-gray-600 rounded-lg p-3 text-lg"
+                      autoFocus
+                    />
+                    <button
+                      onClick={handleReprintWithPassword}
+                      className="bg-green-600 hover:bg-green-700 px-6 py-3 rounded-lg font-bold"
+                    >
+                      Submit
+                    </button>
+                    <button
+                      onClick={() => {
+                        setShowPasswordPrompt(false);
+                        setPasswordInput('');
+                      }}
+                      className="bg-gray-600 hover:bg-gray-700 px-4 py-3 rounded-lg"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         )}
