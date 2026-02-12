@@ -15,7 +15,7 @@ interface PrintData {
 }
 
 // CHANGE THIS PASSWORD TO WHATEVER YOU WANT
-const REPRINT_PASSWORD = 'envybeth2026';
+const REPRINT_PASSWORD = '12345';
 
 export default function PrinterPage() {
   const [inputVal, setInputVal] = useState('');
