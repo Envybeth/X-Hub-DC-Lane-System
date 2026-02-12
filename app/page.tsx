@@ -29,6 +29,10 @@ export default function Home() {
   }
 
   async function handleSync() {
+    // Add confirmation
+    const confirmed = confirm('🔄 Sync data from Google Sheets?\n\nThis will update all pickticket information.');
+    if (!confirmed) return;
+
     setSyncing(true);
     try {
       const response = await fetch('/api/sync', { method: 'POST' });
@@ -66,7 +70,7 @@ export default function Home() {
                 href="/printer"
                 className="flex-1 sm:flex-none bg-orange-600 hover:bg-orange-700 px-3 md:px-6 py-2 md:py-3 rounded-lg font-semibold text-center text-sm md:text-base"
               >
-                🖨️ Label Printer
+                🖨️ Labels
               </Link>
               <Link 
                 href="/shipments"

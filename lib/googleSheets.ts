@@ -22,17 +22,14 @@ function parseDate(dateStr: string | undefined): string | null {
   return null;
 }
 
-// Handle both local file and Vercel environment variable
 const getGoogleAuth = () => {
   if (process.env.GOOGLE_CREDENTIALS_JSON) {
-    // Vercel: Use JSON from environment variable
     const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
     return new google.auth.GoogleAuth({
       credentials,
       scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
     });
   } else {
-    // Local: Use file
     return new google.auth.GoogleAuth({
       keyFile: process.env.GOOGLE_APPLICATION_CREDENTIALS,
       scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
@@ -59,9 +56,10 @@ export async function syncGoogleSheetData() {
 
     console.log(`📊 Syncing from sheet: ${firstSheetName}`);
     
+    // Fetch columns A through S (18 columns)
     const response = await sheets.spreadsheets.values.get({
       spreadsheetId,
-      range: `${firstSheetName}!A:Q`,
+      range: `${firstSheetName}!A:S`,
     });
 
     const rows = response.data.values;
@@ -72,28 +70,36 @@ export async function syncGoogleSheetData() {
     }
 
     const dataRows = rows.slice(1);
+
     let syncedCount = 0;
 
     for (const row of dataRows) {
       const [
-        customer,
-        store_dc,
-        pt_number,
-        po_number,
-        dept_number,
-        qty,
-        ctn_qty,
-        weight,
-        cubic_feet,
-        est_pallet,
-        start_date,
-        cancel_date,
-        container_number,
-        routing_number,
-        pu_number,
-        carrier,
-        pu_date,
+        customer,           // A (0)
+        store_dc,          // B (1)
+        pt_number,         // C (2)
+        po_number,         // D (3)
+        dept_number,       // E (4)
+        qty,               // F (5)
+        ctn_qty,           // G (6)
+        weight,            // H (7)
+        cubic_feet,        // I (8)
+        est_pallet,        // J (9)
+        start_date,        // K (10)
+        cancel_date,       // L (11)
+        container_number,  // M (12)
+        routing_number,    // N (13)
+        pu_number,         // O (14)
+        carrier,           // P (15)
+        pu_date,           // Q (16)
+        // R (17) - skipped/not used
+        pickup_status,     // S (18)
       ] = row;
+
+      // SKIP if already picked up
+      if (pickup_status && pickup_status.toLowerCase().includes('picked up')) {
+        continue;
+      }
 
       if (!pt_number || !po_number) continue;
 
