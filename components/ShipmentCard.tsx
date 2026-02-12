@@ -36,8 +36,7 @@ export interface ShipmentCardProps {
 export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) {
   const [expanded, setExpanded] = useState(false);
   const [selectingLane, setSelectingLane] = useState(false);
-  const [selectedLane, setSelectedLane] = useState(shipment.staging_lane || '');
-  const [lanes, setLanes] = useState<{ lane_number: string; max_capacity: number; current_pallets: number }[]>([]);
+  const [selectedLaneInput, setSelectedLaneInput] = useState('');
   const [selectedPTDetails, setSelectedPTDetails] = useState<ShipmentPT | null>(null);
   const [ptDepthInfo, setPtDepthInfo] = useState<{ [key: number]: { palletsInFront: number; maxCapacity: number } }>({});
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
@@ -157,113 +156,180 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
     return 'bg-red-600 text-white';
   }
 
-  async function fetchAvailableLanes() {
-    const { data } = await supabase
-      .from('lanes')
-      .select('lane_number, max_capacity, current_pallets')
-      .order('lane_number');
-
-    if (data) {
-      setLanes(data);
-    }
-  }
-
   async function handleSetStagingLane() {
-    if (!selectedLane) return;
-
-    try {
-      const { data: shipmentData, error: shipmentError } = await supabase
-        .from('shipments')
-        .upsert({
-          pu_number: shipment.pu_number,
-          pu_date: shipment.pu_date,
-          carrier: shipment.carrier,
-          staging_lane: selectedLane,
-          status: 'in_process',
-          updated_at: new Date().toISOString()
-        }, {
-          onConflict: 'pu_number,pu_date'
-        })
-        .select()
-        .single();
-
-      if (shipmentError) throw shipmentError;
-
-      showToast(`Staging lane ${selectedLane} set`, 'success');
-      setSelectingLane(false);
-      onUpdate();
-    } catch (error) {
-      console.error('Error setting staging lane:', error);
-      showToast('Failed to set staging lane', 'error');
-    }
+  if (!selectedLaneInput.trim()) {
+    showToast('Please enter a lane number', 'error');
+    return;
   }
+
+  const laneNumber = parseInt(selectedLaneInput.trim());
+  if (isNaN(laneNumber)) {
+    showToast('Please enter a valid lane number', 'error');
+    return;
+  }
+
+  // Check if lane has existing PTs
+  const { data: existingPTs } = await supabase
+    .from('lane_assignments')
+    .select('id, pt_id')
+    .eq('lane_number', laneNumber);
+
+  if (existingPTs && existingPTs.length > 0) {
+    showConfirm(
+      'Lane Has PTs',
+      `⚠️ Warning: Lane ${laneNumber} has ${existingPTs.length} PT(s) assigned.\n\nAre you sure you want to use this lane for staging?`,
+      async () => {
+        await performSetStagingLane(laneNumber, existingPTs.map(pt => pt.pt_id));
+        setConfirmModal({ ...confirmModal, isOpen: false });
+      }
+    );
+  } else {
+    await performSetStagingLane(laneNumber, []);
+  }
+}
+
+async function performSetStagingLane(laneNumber: number, existingPTIds: number[]) {
+  try {
+    // Create/update shipment
+    const { data: shipmentData, error: shipmentError } = await supabase
+      .from('shipments')
+      .upsert({
+        pu_number: shipment.pu_number,
+        pu_date: shipment.pu_date,
+        carrier: shipment.carrier,
+        staging_lane: laneNumber.toString(),
+        status: 'in_process',
+        updated_at: new Date().toISOString()
+      }, {
+        onConflict: 'pu_number,pu_date'
+      })
+      .select()
+      .single();
+
+    if (shipmentError) throw shipmentError;
+
+    // If there are existing PTs in this lane that belong to this shipment, mark them as staged
+    if (existingPTIds.length > 0) {
+      const shipmentPTIds = shipment.pts.map(pt => pt.id);
+      const ptsToMarkAsStaged = existingPTIds.filter(id => shipmentPTIds.includes(id));
+
+      for (const ptId of ptsToMarkAsStaged) {
+        // Add to shipment_pts
+        await supabase
+          .from('shipment_pts')
+          .upsert({
+            shipment_id: shipmentData.id,
+            pt_id: ptId,
+            original_lane: null,
+            removed_from_staging: false
+          }, {
+            onConflict: 'shipment_id,pt_id'
+          });
+
+        // Update status
+        await supabase
+          .from('picktickets')
+          .update({ status: 'ready_to_ship' })
+          .eq('id', ptId);
+      }
+
+      if (ptsToMarkAsStaged.length > 0) {
+        showToast(`Staging lane ${laneNumber} set (${ptsToMarkAsStaged.length} PTs already staged)`, 'success');
+      } else {
+        showToast(`Staging lane ${laneNumber} set`, 'success');
+      }
+    } else {
+      showToast(`Staging lane ${laneNumber} set`, 'success');
+    }
+
+    setSelectingLane(false);
+    setSelectedLaneInput('');
+    onUpdate();
+  } catch (error) {
+    console.error('Error setting staging lane:', error);
+    showToast('Failed to set staging lane', 'error');
+  }
+}
 
   async function handleChangeStagingLane() {
     if (!newStagingLane.trim() || !shipment.staging_lane) return;
 
-    const targetLaneNumber = newStagingLane.trim();
-    const targetLane = lanes.find(l => l.lane_number.toString() === targetLaneNumber);
-
-    if (!targetLane) {
-      setStagingLaneError('Invalid lane');
+    const targetLaneNumber = parseInt(newStagingLane.trim());
+    
+    if (isNaN(targetLaneNumber)) {
+      setStagingLaneError('Invalid lane number');
       setTimeout(() => setStagingLaneError(''), 3000);
       return;
     }
 
-    if (targetLane.current_pallets > 0) {
-      setStagingLaneError('Lane must be empty');
-      setTimeout(() => setStagingLaneError(''), 3000);
-      return;
-    }
-
-    if (targetLane.lane_number.toString() === shipment.staging_lane) {
+    if (targetLaneNumber.toString() === shipment.staging_lane) {
       setStagingLaneError('Already staging lane');
       setTimeout(() => setStagingLaneError(''), 3000);
       return;
     }
 
-    showConfirm(
-      'Change Staging Lane',
-      `Move all PTs from Lane ${shipment.staging_lane} to Lane ${targetLane.lane_number}?`,
-      async () => {
-        try {
-          const stagedPTs = shipment.pts.filter(pt => pt.moved_to_staging && !pt.removed_from_staging);
+    // Check if target lane has existing PTs
+    const { data: existingPTs } = await supabase
+      .from('lane_assignments')
+      .select('id')
+      .eq('lane_number', targetLaneNumber);
 
-          await supabase
-            .from('shipments')
-            .update({
-              staging_lane: targetLane.lane_number,
-              updated_at: new Date().toISOString()
-            })
-            .eq('pu_number', shipment.pu_number)
-            .eq('pu_date', shipment.pu_date);
-
-          for (const pt of stagedPTs) {
-            await supabase
-              .from('picktickets')
-              .update({ assigned_lane: targetLane.lane_number })
-              .eq('id', pt.id);
-
-            await supabase
-              .from('lane_assignments')
-              .update({ lane_number: targetLane.lane_number })
-              .eq('pt_id', pt.id)
-              .eq('lane_number', shipment.staging_lane);
-          }
-
-          showToast(`Moved to Lane ${targetLane.lane_number}`, 'success');
-          setChangingStagingLane(false);
-          setNewStagingLane('');
-          setStagingLaneError('');
-          onUpdate();
-        } catch (error) {
-          console.error('Error changing staging lane:', error);
-          showToast('Failed to change lane', 'error');
+    if (existingPTs && existingPTs.length > 0) {
+      showConfirm(
+        'Lane Has PTs',
+        `⚠️ Warning: Lane ${targetLaneNumber} has ${existingPTs.length} PT(s) assigned.\n\nMove staging lane anyway?`,
+        async () => {
+          await performChangeStagingLane(targetLaneNumber);
+          setConfirmModal({ ...confirmModal, isOpen: false });
         }
+      );
+    } else {
+      showConfirm(
+        'Change Staging Lane',
+        `Move all PTs from Lane ${shipment.staging_lane} to Lane ${targetLaneNumber}?`,
+        async () => {
+          await performChangeStagingLane(targetLaneNumber);
+          setConfirmModal({ ...confirmModal, isOpen: false });
+        }
+      );
+    }
+  }
 
-        setConfirmModal({ ...confirmModal, isOpen: false });
+  async function performChangeStagingLane(targetLaneNumber: number) {
+    try {
+      const stagedPTs = shipment.pts.filter(pt => pt.moved_to_staging && !pt.removed_from_staging);
+
+      await supabase
+        .from('shipments')
+        .update({
+          staging_lane: targetLaneNumber.toString(),
+          updated_at: new Date().toISOString()
+        })
+        .eq('pu_number', shipment.pu_number)
+        .eq('pu_date', shipment.pu_date);
+
+      for (const pt of stagedPTs) {
+        await supabase
+          .from('picktickets')
+          .update({ assigned_lane: targetLaneNumber.toString() })
+          .eq('id', pt.id);
+
+        await supabase
+          .from('lane_assignments')
+          .update({ lane_number: targetLaneNumber.toString() })
+          .eq('pt_id', pt.id)
+          .eq('lane_number', shipment.staging_lane);
       }
-    );
+
+      showToast(`Moved to Lane ${targetLaneNumber}`, 'success');
+      setChangingStagingLane(false);
+      setNewStagingLane('');
+      setStagingLaneError('');
+      onUpdate();
+    } catch (error) {
+      console.error('Error changing staging lane:', error);
+      showToast('Failed to change lane', 'error');
+    }
   }
 
   async function handleDeleteStagingData() {
@@ -295,6 +361,7 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
           .from('picktickets')
           .update({
             assigned_lane: null,
+            actual_pallet_count: null,
             status: 'labeled'
           })
           .eq('id', pt.id);
@@ -539,10 +606,7 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
 
               {shipment.staging_lane && !changingStagingLane && (
                 <button
-                  onClick={() => {
-                    setChangingStagingLane(true);
-                    fetchAvailableLanes();
-                  }}
+                  onClick={() => setChangingStagingLane(true)}
                   className="bg-purple-600 hover:bg-purple-700 px-3 md:px-6 py-2 md:py-3 rounded-lg font-bold text-sm md:text-base whitespace-nowrap"
                 >
                   Change Lane
@@ -560,7 +624,7 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
                         setNewStagingLane(e.target.value);
                         setStagingLaneError('');
                       }}
-                      placeholder="Lane #"
+                      placeholder="Enter lane number"
                       className={`bg-gray-900 text-white p-2 rounded flex-1 w-full text-sm md:text-base ${stagingLaneError ? 'border-2 border-red-500' : ''}`}
                     />
                     <div className="flex gap-2 w-full sm:w-auto">
@@ -633,45 +697,40 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
               )}
             </div>
 
-            {/* Staging lane selection */}
+            {/* Staging lane selection - TEXT INPUT */}
             {!shipment.staging_lane ? (
               <div className="bg-yellow-900 border-2 border-yellow-600 p-3 md:p-4 rounded-lg">
                 <div className="font-bold text-base md:text-xl mb-2 md:mb-3">⚠️ Select Staging Lane</div>
-                <p className="text-xs md:text-sm mb-3 md:mb-4">Choose a lane to consolidate all PTs</p>
+                <p className="text-xs md:text-sm mb-3 md:mb-4">Enter a lane number to consolidate all PTs</p>
                 {!selectingLane ? (
                   <button
-                    onClick={() => {
-                      setSelectingLane(true);
-                      fetchAvailableLanes();
-                    }}
+                    onClick={() => setSelectingLane(true)}
                     className="bg-blue-600 hover:bg-blue-700 px-4 md:px-6 py-2 md:py-3 rounded-lg font-bold text-sm md:text-base"
                   >
                     Select Lane
                   </button>
                 ) : (
                   <div className="flex flex-col sm:flex-row gap-2 md:gap-3">
-                    <select
-                      value={selectedLane}
-                      onChange={(e) => setSelectedLane(e.target.value)}
-                      className="flex-1 bg-gray-700 text-white p-2 md:p-3 rounded-lg text-sm md:text-base"
-                    >
-                      <option value="">-- Choose Lane --</option>
-                      {lanes.map(lane => (
-                        <option key={lane.lane_number} value={lane.lane_number}>
-                          L{lane.lane_number} (Cap: {lane.max_capacity}, Cur: {lane.current_pallets})
-                        </option>
-                      ))}
-                    </select>
+                    <input
+                      type="text"
+                      value={selectedLaneInput}
+                      onChange={(e) => setSelectedLaneInput(e.target.value)}
+                      placeholder="Enter lane number (e.g., 101)"
+                      className="flex-1 bg-gray-900 text-white p-2 md:p-3 rounded-lg text-sm md:text-base"
+                      autoFocus
+                    />
                     <div className="flex gap-2">
                       <button
                         onClick={handleSetStagingLane}
-                        disabled={!selectedLane}
-                        className="flex-1 sm:flex-none bg-green-600 hover:bg-green-700 disabled:bg-gray-600 px-4 md:px-6 py-2 rounded-lg font-bold text-sm md:text-base"
+                        className="flex-1 sm:flex-none bg-green-600 hover:bg-green-700 px-4 md:px-6 py-2 rounded-lg font-bold text-sm md:text-base"
                       >
                         Confirm
                       </button>
                       <button
-                        onClick={() => setSelectingLane(false)}
+                        onClick={() => {
+                          setSelectingLane(false);
+                          setSelectedLaneInput('');
+                        }}
                         className="flex-1 sm:flex-none bg-gray-600 hover:bg-gray-700 px-4 md:px-6 py-2 rounded-lg text-sm md:text-base"
                       >
                         Cancel

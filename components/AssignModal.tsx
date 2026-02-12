@@ -53,6 +53,7 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
   const [draggedItem, setDraggedItem] = useState<number | null>(null);
   const [isStaging, setIsStaging] = useState(false);
   const [stagingPUs, setStagingPUs] = useState<string[]>([]);
+  const [allUnassignedPTs, setAllUnassignedPTs] = useState<Pickticket[]>([]);
 
   const [containers, setContainers] = useState<Container[]>([]);
   const [selectedContainer, setSelectedContainer] = useState('');
@@ -196,14 +197,17 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
   }
 
   async function fetchAllUnassignedPTs() {
-    const { data } = await supabase
-      .from('picktickets')
-      .select('*')
-      .is('assigned_lane', null)
-      .order('pt_number');
+  const { data } = await supabase
+    .from('picktickets')
+    .select('*')
+    .is('assigned_lane', null)
+    .order('pt_number');
 
-    if (data) setAllPicktickets(data);
+  if (data) {
+    setAllPicktickets(data); // ADD THIS LINE
+    setAllUnassignedPTs(data);
   }
+}
 
   async function fetchPickticketsByContainer(containerNumber: string) {
     const { data } = await supabase
@@ -524,7 +528,14 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
   const availableCapacity = lane.max_capacity - (lane.current_pallets || 0);
 
   const selectedPTDetails_summary = Object.keys(selectedPTs).map(ptId => {
-    const pt = picktickets.find(p => p.id === parseInt(ptId));
+    // Try to find in current filtered results first
+    let pt = picktickets.find(p => p.id === parseInt(ptId));
+
+    // If not found, search in all unassigned PTs
+    if (!pt) {
+      pt = allUnassignedPTs.find(p => p.id === parseInt(ptId));
+    }
+
     return pt ? { pt, pallets: parseInt(selectedPTs[parseInt(ptId)]) || 1 } : null;
   }).filter(Boolean);
 
@@ -901,33 +912,37 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                 </div>
               )}
 
-              {/* Selected summary */}
-              {selectedPTDetails_summary.length > 0 && (
+              {/* Selected summary - ALWAYS VISIBLE */}
+              {view === 'add' && (
                 <div className="bg-gray-700 p-3 md:p-4 rounded-lg mb-4 md:mb-6">
                   <h3 className="text-sm md:text-xl font-bold mb-2 md:mb-3">Selected ({selectedPTDetails_summary.length})</h3>
-                  <div className="space-y-1 md:space-y-2 max-h-48 overflow-y-auto">
-                    {selectedPTDetails_summary.map((item, idx) => (
-                      item && (
-                        <div key={idx} className="bg-gray-800 p-2 rounded flex justify-between items-center gap-2">
-                          <div className="text-xs md:text-sm min-w-0 flex-1">
-                            <div className="font-bold break-all">PT #{item.pt.pt_number}</div>
-                            <div className="text-gray-400 break-all">
-                              {item.pt.customer} | PO: {item.pt.po_number} | Cont: {item.pt.container_number}
+                  {selectedPTDetails_summary.length > 0 ? (
+                    <div className="space-y-1 md:space-y-2 max-h-48 overflow-y-auto">
+                      {selectedPTDetails_summary.map((item, idx) => (
+                        item && (
+                          <div key={idx} className="bg-gray-800 p-2 rounded flex justify-between items-center gap-2">
+                            <div className="text-xs md:text-sm min-w-0 flex-1">
+                              <div className="font-bold break-all">PT #{item.pt.pt_number}</div>
+                              <div className="text-gray-400 break-all">
+                                {item.pt.customer} | PO: {item.pt.po_number} | Cont: {item.pt.container_number}
+                              </div>
+                            </div>
+                            <div className="flex items-center gap-2 flex-shrink-0">
+                              <div className="text-blue-400 font-bold text-xs md:text-base">{item.pallets}p</div>
+                              <button
+                                onClick={() => handlePTSelect(item.pt.id)}
+                                className="bg-red-600 hover:bg-red-700 px-2 py-1 rounded text-[10px] md:text-sm font-semibold"
+                              >
+                                ✕
+                              </button>
                             </div>
                           </div>
-                          <div className="flex items-center gap-2 flex-shrink-0">
-                            <div className="text-blue-400 font-bold text-xs md:text-base">{item.pallets}p</div>
-                            <button
-                              onClick={() => handlePTSelect(item.pt.id)}
-                              className="bg-red-600 hover:bg-red-700 px-2 py-1 rounded text-[10px] md:text-sm font-semibold"
-                            >
-                              ✕
-                            </button>
-                          </div>
-                        </div>
-                      )
-                    ))}
-                  </div>
+                        )
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="text-gray-400 text-xs md:text-sm">No PTs selected yet</div>
+                  )}
                 </div>
               )}
 
