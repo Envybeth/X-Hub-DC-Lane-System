@@ -76,6 +76,56 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
     }
   }, [toast]);
 
+  // THE WATCHDOG: Automatically syncs any PT placed into the staging lane into a "ready_to_ship" state.
+  useEffect(() => {
+    const unsyncedPTs = shipment.pts.filter(pt => 
+      pt.assigned_lane === shipment.staging_lane && 
+      (!pt.moved_to_staging || pt.removed_from_staging)
+    );
+
+    if (unsyncedPTs.length > 0 && shipment.staging_lane) {
+      autoSyncPTs(unsyncedPTs);
+    }
+  }, [shipment.pts, shipment.staging_lane]);
+
+  async function autoSyncPTs(ptsToSync: ShipmentPT[]) {
+    try {
+      const { data: shipmentData } = await supabase
+        .from('shipments')
+        .select('id')
+        .eq('pu_number', shipment.pu_number)
+        .eq('pu_date', shipment.pu_date)
+        .single();
+
+      if (!shipmentData) return;
+
+      let syncedCount = 0;
+      for (const pt of ptsToSync) {
+        await supabase
+          .from('shipment_pts')
+          .upsert({
+            shipment_id: shipmentData.id,
+            pt_id: pt.id,
+            original_lane: pt.assigned_lane,
+            removed_from_staging: false
+          }, { onConflict: 'shipment_id,pt_id' });
+
+        await supabase
+          .from('picktickets')
+          .update({ status: 'ready_to_ship' })
+          .eq('id', pt.id);
+
+        syncedCount++;
+      }
+      if (syncedCount > 0) {
+        onUpdate();
+        showToast(`${syncedCount} rogue PT(s) auto-staged`, 'success');
+      }
+    } catch (error) {
+      console.error('Auto-sync failed:', error);
+    }
+  }
+
   function showToast(message: string, type: 'success' | 'error') {
     setToast({ message, type });
   }
@@ -157,64 +207,75 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
   }
 
   async function handleSetStagingLane() {
-  if (!selectedLaneInput.trim()) {
-    showToast('Please enter a lane number', 'error');
-    return;
+    if (!selectedLaneInput.trim()) {
+      showToast('Please enter a lane number', 'error');
+      return;
+    }
+
+    const laneNumber = parseInt(selectedLaneInput.trim());
+    if (isNaN(laneNumber)) {
+      showToast('Please enter a valid lane number', 'error');
+      return;
+    }
+
+    // Check if lane has existing PTs
+    const { data: existingPTs } = await supabase
+      .from('lane_assignments')
+      .select('id, pt_id')
+      .eq('lane_number', laneNumber);
+
+    if (existingPTs && existingPTs.length > 0) {
+      showConfirm(
+        'Lane Has PTs',
+        `⚠️ Warning: Lane ${laneNumber} has ${existingPTs.length} PT(s) assigned.\n\nAre you sure you want to use this lane for staging?`,
+        async () => {
+          await performSetStagingLane(laneNumber, existingPTs.map(pt => pt.pt_id));
+          setConfirmModal({ ...confirmModal, isOpen: false });
+        }
+      );
+    } else {
+      await performSetStagingLane(laneNumber, []);
+    }
   }
 
-  const laneNumber = parseInt(selectedLaneInput.trim());
-  if (isNaN(laneNumber)) {
-    showToast('Please enter a valid lane number', 'error');
-    return;
-  }
+  async function performSetStagingLane(laneNumber: number, existingPTIds: number[]) {
+    try {
+      // Create/update shipment
+      const { data: shipmentData, error: shipmentError } = await supabase
+        .from('shipments')
+        .upsert({
+          pu_number: shipment.pu_number,
+          pu_date: shipment.pu_date,
+          carrier: shipment.carrier,
+          staging_lane: laneNumber.toString(),
+          status: 'in_process',
+          updated_at: new Date().toISOString()
+        }, {
+          onConflict: 'pu_number,pu_date'
+        })
+        .select()
+        .single();
 
-  // Check if lane has existing PTs
-  const { data: existingPTs } = await supabase
-    .from('lane_assignments')
-    .select('id, pt_id')
-    .eq('lane_number', laneNumber);
+      if (shipmentError) throw shipmentError;
 
-  if (existingPTs && existingPTs.length > 0) {
-    showConfirm(
-      'Lane Has PTs',
-      `⚠️ Warning: Lane ${laneNumber} has ${existingPTs.length} PT(s) assigned.\n\nAre you sure you want to use this lane for staging?`,
-      async () => {
-        await performSetStagingLane(laneNumber, existingPTs.map(pt => pt.pt_id));
-        setConfirmModal({ ...confirmModal, isOpen: false });
-      }
-    );
-  } else {
-    await performSetStagingLane(laneNumber, []);
-  }
-}
-
-async function performSetStagingLane(laneNumber: number, existingPTIds: number[]) {
-  try {
-    // Create/update shipment
-    const { data: shipmentData, error: shipmentError } = await supabase
-      .from('shipments')
-      .upsert({
-        pu_number: shipment.pu_number,
-        pu_date: shipment.pu_date,
-        carrier: shipment.carrier,
-        staging_lane: laneNumber.toString(),
-        status: 'in_process',
-        updated_at: new Date().toISOString()
-      }, {
-        onConflict: 'pu_number,pu_date'
-      })
-      .select()
-      .single();
-
-    if (shipmentError) throw shipmentError;
-
-    // If there are existing PTs in this lane that belong to this shipment, mark them as staged
-    if (existingPTIds.length > 0) {
+      // Automatically stage any PTs that belong to this shipment AND are already in the target lane
       const shipmentPTIds = shipment.pts.map(pt => pt.id);
-      const ptsToMarkAsStaged = existingPTIds.filter(id => shipmentPTIds.includes(id));
+      const ptsToMarkAsStaged = new Set<number>();
 
-      for (const ptId of ptsToMarkAsStaged) {
-        // Add to shipment_pts
+      shipment.pts.forEach(pt => {
+        if (pt.assigned_lane === laneNumber.toString()) {
+          ptsToMarkAsStaged.add(pt.id);
+        }
+      });
+      existingPTIds.forEach(id => {
+        if (shipmentPTIds.includes(id)) {
+          ptsToMarkAsStaged.add(id);
+        }
+      });
+
+      const ptsArray = Array.from(ptsToMarkAsStaged);
+
+      for (const ptId of ptsArray) {
         await supabase
           .from('shipment_pts')
           .upsert({
@@ -226,30 +287,26 @@ async function performSetStagingLane(laneNumber: number, existingPTIds: number[]
             onConflict: 'shipment_id,pt_id'
           });
 
-        // Update status
         await supabase
           .from('picktickets')
-          .update({ status: 'ready_to_ship' })
+          .update({ status: 'ready_to_ship', assigned_lane: laneNumber.toString() })
           .eq('id', ptId);
       }
 
-      if (ptsToMarkAsStaged.length > 0) {
-        showToast(`Staging lane ${laneNumber} set (${ptsToMarkAsStaged.length} PTs already staged)`, 'success');
+      if (ptsArray.length > 0) {
+        showToast(`Staging lane ${laneNumber} set (${ptsArray.length} PTs swept into staging)`, 'success');
       } else {
         showToast(`Staging lane ${laneNumber} set`, 'success');
       }
-    } else {
-      showToast(`Staging lane ${laneNumber} set`, 'success');
-    }
 
-    setSelectingLane(false);
-    setSelectedLaneInput('');
-    onUpdate();
-  } catch (error) {
-    console.error('Error setting staging lane:', error);
-    showToast('Failed to set staging lane', 'error');
+      setSelectingLane(false);
+      setSelectedLaneInput('');
+      onUpdate();
+    } catch (error) {
+      console.error('Error setting staging lane:', error);
+      showToast('Failed to set staging lane', 'error');
+    }
   }
-}
 
   async function handleChangeStagingLane() {
     if (!newStagingLane.trim() || !shipment.staging_lane) return;
@@ -268,7 +325,6 @@ async function performSetStagingLane(laneNumber: number, existingPTIds: number[]
       return;
     }
 
-    // Check if target lane has existing PTs
     const { data: existingPTs } = await supabase
       .from('lane_assignments')
       .select('id')

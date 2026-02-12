@@ -11,6 +11,8 @@ interface Lane {
   lane_type: string;
   current_pallets?: number;
   isStaging?: boolean;
+  stagingPuNumber?: string | null;
+  isFinalized?: boolean;
 }
 
 export default function LaneGrid() {
@@ -41,15 +43,32 @@ export default function LaneGrid() {
             0
           ) || 0;
 
-          // Check if it's a staging lane
-          const { data: pts } = await supabase
-            .from('picktickets')
-            .select('status')
-            .eq('assigned_lane', lane.lane_number);
+          // Check if it's an active or finalized staging lane from the shipments table
+          const { data: shipmentData } = await supabase
+            .from('shipments')
+            .select('pu_number, status')
+            .eq('staging_lane', lane.lane_number.toString());
 
-          const isStaging = pts && pts.length > 0 && pts.every(pt => pt.status === 'ready_to_ship');
+          const activeShipment = shipmentData?.find(s => s.status !== 'cleared') || shipmentData?.[0];
 
-          return { ...lane, current_pallets, isStaging };
+          let isStaging = false;
+          let stagingPuNumber = null;
+          let isFinalized = false;
+
+          if (activeShipment) {
+            isStaging = true;
+            stagingPuNumber = activeShipment.pu_number;
+            isFinalized = activeShipment.status === 'finalized';
+          } else {
+            // Fallback to legacy logic if no shipment explicitly claims it yet
+            const { data: pts } = await supabase
+              .from('picktickets')
+              .select('status')
+              .eq('assigned_lane', lane.lane_number);
+            isStaging = pts && pts.length > 0 && pts.every(pt => pt.status === 'ready_to_ship') || false;
+          }
+
+          return { ...lane, current_pallets, isStaging, stagingPuNumber, isFinalized };
         })
       );
       setLanes(lanesWithCapacity);
@@ -67,16 +86,20 @@ export default function LaneGrid() {
     fetchLanes();
   }
 
-  function getLaneColor(current: number, max: number, isStaging?: boolean) {
-  if (isStaging) return 'bg-purple-700 border-purple-500';
-  
-  const percentage = (current / max) * 100;
-  if (percentage >= 100) return 'bg-red-700 border-red-500';
-  if (percentage >= 75) return 'bg-orange-700 border-orange-500';
-  if (percentage >= 50) return 'bg-yellow-700 border-yellow-500';
-  if (current === 0) return 'bg-gray-700 border-gray-500'; // ADD THIS LINE
-  return 'bg-green-700 border-green-500';
-}
+  function getLaneColor(lane: Lane) {
+    if (lane.isFinalized) return 'bg-yellow-600 border-yellow-400'; // Golden Finish
+    if (lane.isStaging) return 'bg-purple-700 border-purple-500';
+
+    const current = lane.current_pallets || 0;
+    const max = lane.max_capacity;
+    const percentage = (current / max) * 100;
+    
+    if (percentage >= 100) return 'bg-red-700 border-red-500';
+    if (percentage >= 75) return 'bg-orange-700 border-orange-500';
+    if (percentage >= 50) return 'bg-yellow-700 border-yellow-500';
+    if (current === 0) return 'bg-gray-700 border-gray-500';
+    return 'bg-green-700 border-green-500';
+  }
 
   const lanesByType = {
     large: lanes.filter(l => l.max_capacity === 34),
@@ -84,6 +107,28 @@ export default function LaneGrid() {
     small: lanes.filter(l => l.max_capacity === 15),
     mini: lanes.filter(l => l.max_capacity === 4)
   };
+
+  const renderLaneContent = (lane: Lane) => (
+    <div className="flex flex-col items-center justify-center h-full space-y-1">
+      <div className="text-base md:text-2xl font-bold">
+        {lane.isStaging && '📦 '}
+        {lane.lane_number}
+      </div>
+      {lane.stagingPuNumber && (
+        <div className="text-[10px] md:text-xs font-bold text-purple-100 bg-black/30 px-2 py-0.5 rounded shadow-sm break-all">
+          PU: {lane.stagingPuNumber}
+        </div>
+      )}
+      <div className="text-xs md:text-sm">
+        {lane.current_pallets || 0}/{lane.max_capacity}
+      </div>
+      {lane.isFinalized && (
+        <div className="mt-1 bg-green-600 text-white font-bold text-[10px] md:text-xs px-2 py-1 rounded shadow-sm uppercase">
+          Finished
+        </div>
+      )}
+    </div>
+  );
 
   return (
     <div className="space-y-6 md:space-y-8">
@@ -98,15 +143,9 @@ export default function LaneGrid() {
               <button
                 key={lane.id}
                 onClick={() => handleLaneClick(lane)}
-                className={`${getLaneColor(lane.current_pallets || 0, lane.max_capacity, lane.isStaging)} border-2 rounded-lg p-2 md:p-4 hover:opacity-80 transition-all`}
+                className={`${getLaneColor(lane)} border-2 rounded-lg p-2 md:p-3 hover:opacity-80 transition-all flex flex-col justify-between`}
               >
-                <div className="text-base md:text-2xl font-bold">
-                  {lane.isStaging && '📦 '}
-                  {lane.lane_number}
-                </div>
-                <div className="text-xs md:text-sm mt-1">
-                  {lane.current_pallets || 0}/{lane.max_capacity}
-                </div>
+                {renderLaneContent(lane)}
               </button>
             ))}
           </div>
@@ -124,15 +163,9 @@ export default function LaneGrid() {
               <button
                 key={lane.id}
                 onClick={() => handleLaneClick(lane)}
-                className={`${getLaneColor(lane.current_pallets || 0, lane.max_capacity, lane.isStaging)} border-2 rounded-lg p-2 md:p-4 hover:opacity-80 transition-all`}
+                className={`${getLaneColor(lane)} border-2 rounded-lg p-2 md:p-3 hover:opacity-80 transition-all flex flex-col justify-between`}
               >
-                <div className="text-base md:text-2xl font-bold">
-                  {lane.isStaging && '📦 '}
-                  {lane.lane_number}
-                </div>
-                <div className="text-xs md:text-sm mt-1">
-                  {lane.current_pallets || 0}/{lane.max_capacity}
-                </div>
+                {renderLaneContent(lane)}
               </button>
             ))}
           </div>
@@ -150,15 +183,9 @@ export default function LaneGrid() {
               <button
                 key={lane.id}
                 onClick={() => handleLaneClick(lane)}
-                className={`${getLaneColor(lane.current_pallets || 0, lane.max_capacity, lane.isStaging)} border-2 rounded-lg p-2 md:p-4 hover:opacity-80 transition-all`}
+                className={`${getLaneColor(lane)} border-2 rounded-lg p-2 md:p-3 hover:opacity-80 transition-all flex flex-col justify-between`}
               >
-                <div className="text-base md:text-2xl font-bold">
-                  {lane.isStaging && '📦 '}
-                  {lane.lane_number}
-                </div>
-                <div className="text-xs md:text-sm mt-1">
-                  {lane.current_pallets || 0}/{lane.max_capacity}
-                </div>
+                {renderLaneContent(lane)}
               </button>
             ))}
           </div>
@@ -176,15 +203,9 @@ export default function LaneGrid() {
               <button
                 key={lane.id}
                 onClick={() => handleLaneClick(lane)}
-                className={`${getLaneColor(lane.current_pallets || 0, lane.max_capacity, lane.isStaging)} border-2 rounded-lg p-2 md:p-4 hover:opacity-80 transition-all`}
+                className={`${getLaneColor(lane)} border-2 rounded-lg p-2 md:p-3 hover:opacity-80 transition-all flex flex-col justify-between`}
               >
-                <div className="text-base md:text-2xl font-bold">
-                  {lane.isStaging && '📦 '}
-                  {lane.lane_number}
-                </div>
-                <div className="text-xs md:text-sm mt-1">
-                  {lane.current_pallets || 0}/{lane.max_capacity}
-                </div>
+                {renderLaneContent(lane)}
               </button>
             ))}
           </div>

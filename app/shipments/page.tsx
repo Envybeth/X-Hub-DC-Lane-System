@@ -5,31 +5,6 @@ import Link from 'next/link';
 import { supabase } from '@/lib/supabase';
 import ShipmentCard, { Shipment, ShipmentPT } from '@/components/ShipmentCard';
 
-// If these interfaces are not exported from ShipmentCard, uncomment them here:
-/*
-interface ShipmentPT {
-  id: number;
-  pt_number: string;
-  po_number: string;
-  customer: string;
-  assigned_lane: string | null;
-  actual_pallet_count: number;
-  moved_to_staging: boolean;
-  container_number?: string;
-  store_dc?: string;
-  cancel_date?: string;
-}
-
-interface Shipment {
-  pu_number: string;
-  pu_date: string;
-  carrier: string;
-  pts: ShipmentPT[];
-  staging_lane: string | null;
-  status: 'not_started' | 'in_process' | 'finalized';
-}
-*/
-
 export default function ShipmentsPage() {
   const [shipments, setShipments] = useState<Shipment[]>([]);
   const [loading, setLoading] = useState(true);
