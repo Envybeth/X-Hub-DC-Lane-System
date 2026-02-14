@@ -46,8 +46,9 @@ export default function LaneGrid() {
           // Check if it's an active or finalized staging lane from the shipments table
           const { data: shipmentData } = await supabase
             .from('shipments')
-            .select('pu_number, status')
-            .eq('staging_lane', lane.lane_number.toString());
+            .select('pu_number, status, archived')
+            .eq('staging_lane', lane.lane_number.toString())
+            .eq('archived', false); // Only get non-archived shipments
 
           const activeShipment = shipmentData?.find(s => s.status !== 'cleared') || shipmentData?.[0];
 
@@ -93,7 +94,7 @@ export default function LaneGrid() {
     const current = lane.current_pallets || 0;
     const max = lane.max_capacity;
     const percentage = (current / max) * 100;
-    
+
     if (percentage >= 100) return 'bg-red-700 border-red-500';
     if (percentage >= 75) return 'bg-orange-700 border-orange-500';
     if (percentage >= 50) return 'bg-yellow-700 border-yellow-500';

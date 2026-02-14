@@ -3,14 +3,14 @@ import { supabase } from './supabase';
 
 function parseDate(dateStr: string | undefined): string | null {
   if (!dateStr || dateStr.trim() === '') return null;
-  
+
   // Handle 4-digit year: "02/09/2026" or "1/30/2026"
   let dateMatch = dateStr.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
   if (dateMatch) {
     const [_, month, day, year] = dateMatch;
     return `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
   }
-  
+
   // Handle 2-digit year: "1/30/26" or "2/4/26"
   dateMatch = dateStr.match(/(\d{1,2})\/(\d{1,2})\/(\d{2})/);
   if (dateMatch) {
@@ -18,7 +18,7 @@ function parseDate(dateStr: string | undefined): string | null {
     const year = `20${yearShort}`;
     return `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
   }
-  
+
   return null;
 }
 
@@ -43,19 +43,19 @@ const sheets = google.sheets({ version: 'v4', auth });
 export async function syncGoogleSheetData() {
   try {
     const spreadsheetId = process.env.GOOGLE_SHEET_ID;
-    
+
     const sheetMetadata = await sheets.spreadsheets.get({
       spreadsheetId,
     });
-    
+
     const firstSheetName = sheetMetadata.data.sheets?.[0]?.properties?.title;
-    
+
     if (!firstSheetName) {
       throw new Error('No sheets found in the spreadsheet');
     }
 
     console.log(`📊 Syncing from sheet: ${firstSheetName}`);
-    
+
     // Fetch columns A through S (18 columns)
     const response = await sheets.spreadsheets.values.get({
       spreadsheetId,
@@ -63,7 +63,7 @@ export async function syncGoogleSheetData() {
     });
 
     const rows = response.data.values;
-    
+
     if (!rows || rows.length === 0) {
       console.log('No data found.');
       return { success: false, message: 'No data found' };
@@ -81,7 +81,7 @@ export async function syncGoogleSheetData() {
         po_number,         // D (3)
         dept_number,       // E (4)
         qty,               // F (5)
-        ctn_qty,           // G (6)
+        ctn,               // G (6) - CTN field (text)
         weight,            // H (7)
         cubic_feet,        // I (8)
         est_pallet,        // J (9)
@@ -122,7 +122,7 @@ export async function syncGoogleSheetData() {
             po_number,
             dept_number,
             qty: qty ? parseInt(qty) : null,
-            ctn_qty: ctn_qty ? parseInt(ctn_qty) : null,
+            ctn: ctn || null, // ADD THIS - Column G as text
             weight: weight ? parseFloat(weight) : null,
             cubic_feet: cubic_feet ? parseFloat(cubic_feet) : null,
             est_pallet: est_pallet ? parseInt(est_pallet) : null,
@@ -146,7 +146,7 @@ export async function syncGoogleSheetData() {
 
     console.log(`✅ Synced ${syncedCount} picktickets from Google Sheets`);
     return { success: true, count: syncedCount };
-    
+
   } catch (error) {
     console.error('Error syncing Google Sheets:', error);
     throw error;

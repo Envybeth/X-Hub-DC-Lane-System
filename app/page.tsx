@@ -5,11 +5,13 @@ import { supabase } from '@/lib/supabase';
 import LaneGrid from '@/components/LaneGrid';
 import SearchModal from '@/components/SearchModal';
 import Link from 'next/link';
+import PTDetails from '@/components/PTDetails';
 
 export default function Home() {
   const [showSearch, setShowSearch] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [lastSync, setLastSync] = useState<Date | null>(null);
+  const [viewingPTDetails, setViewingPTDetails] = useState<any>(null);
 
   useEffect(() => {
     checkLastSync();
@@ -100,6 +102,14 @@ export default function Home() {
       </div>
 
       {showSearch && <SearchModal onClose={() => setShowSearch(false)} />}
+
+      {/* PT Details Modal */}
+      {viewingPTDetails && (
+        <PTDetails 
+          pt={viewingPTDetails} 
+          onClose={() => setViewingPTDetails(null)} 
+        />
+      )}
     </div>
   );
 }

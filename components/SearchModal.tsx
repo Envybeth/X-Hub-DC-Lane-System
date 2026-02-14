@@ -2,12 +2,14 @@
 
 import { useState } from 'react';
 import { supabase } from '@/lib/supabase';
+import PTDetails from './PTDetails';
 
 interface SearchModalProps {
   onClose: () => void;
 }
 
 interface SearchResult {
+  id: number;
   pt_number: string;
   po_number: string;
   customer: string;
@@ -17,6 +19,8 @@ interface SearchResult {
   start_date: string;
   cancel_date: string;
   actual_pallet_count: number | null;
+  ctn?: string;
+  status?: string;
 }
 
 interface ContainerGroup {
@@ -32,6 +36,7 @@ export default function SearchModal({ onClose }: SearchModalProps) {
   const [expandedContainers, setExpandedContainers] = useState<Set<string>>(new Set());
   const [searching, setSearching] = useState(false);
   const [searched, setSearched] = useState(false);
+  const [viewingPTDetails, setViewingPTDetails] = useState<SearchResult | null>(null);
 
   async function handleSearch() {
     if (!searchQuery.trim()) return;
@@ -45,7 +50,7 @@ export default function SearchModal({ onClose }: SearchModalProps) {
     try {
       let query = supabase
         .from('picktickets')
-        .select('pt_number, po_number, customer, assigned_lane, container_number, store_dc, start_date, cancel_date, actual_pallet_count');
+        .select('id, pt_number, po_number, customer, assigned_lane, container_number, store_dc, start_date, cancel_date, actual_pallet_count, ctn, status');
 
       const searchValue = searchQuery.trim();
 
@@ -108,52 +113,36 @@ export default function SearchModal({ onClose }: SearchModalProps) {
     });
   }
 
-  function PTDetailCard({ pt, showContainer = true }: { pt: SearchResult, showContainer?: boolean }) {
+  function PTResultCard({ pt }: { pt: SearchResult }) {
     return (
       <div className="bg-gray-800 p-4 rounded-lg border-2 border-gray-600">
-        <div className="grid grid-cols-2 gap-4">
-          <div>
-            <div className="text-sm text-gray-400">Pickticket #</div>
-            <div className="text-lg font-bold">{pt.pt_number}</div>
-          </div>
-          <div>
-            <div className="text-sm text-gray-400">PO #</div>
-            <div className="text-lg font-bold">{pt.po_number}</div>
-          </div>
-          <div>
-            <div className="text-sm text-gray-400">Customer</div>
-            <div className="text-lg">{pt.customer}</div>
-          </div>
-          <div>
-            <div className="text-sm text-gray-400">DC # (Store/DC)</div>
-            <div className="text-lg">{pt.store_dc || 'N/A'}</div>
-          </div>
-          {showContainer && (
+        <div className="flex justify-between items-start gap-4">
+          <div className="flex-1 grid grid-cols-2 gap-4">
             <div>
-              <div className="text-sm text-gray-400">Container #</div>
-              <div className="text-lg">{pt.container_number}</div>
+              <div className="text-sm text-gray-400">Pickticket #</div>
+              <div className="text-lg font-bold">{pt.pt_number}</div>
             </div>
-          )}
-          <div>
-            <div className="text-sm text-gray-400">Pallet Count</div>
-            <div className="text-lg font-bold text-blue-400">
-              {pt.actual_pallet_count || 'TBD'}
+            <div>
+              <div className="text-sm text-gray-400">PO #</div>
+              <div className="text-lg font-bold">{pt.po_number}</div>
             </div>
-          </div>
-          <div>
-            <div className="text-sm text-gray-400">Start Date</div>
-            <div className="text-lg">{pt.start_date || 'N/A'}</div>
-          </div>
-          <div>
-            <div className="text-sm text-gray-400">Cancel Date</div>
-            <div className="text-lg">{pt.cancel_date || 'N/A'}</div>
-          </div>
-          <div className="col-span-2">
-            <div className="text-sm text-gray-400">Location</div>
-            <div className={`text-lg font-bold ${pt.assigned_lane ? 'text-green-400' : 'text-yellow-400'}`}>
-              {pt.assigned_lane ? `Lane ${pt.assigned_lane}` : 'Not assigned'}
+            <div>
+              <div className="text-sm text-gray-400">Customer</div>
+              <div className="text-lg">{pt.customer}</div>
+            </div>
+            <div>
+              <div className="text-sm text-gray-400">Location</div>
+              <div className={`text-lg font-bold ${pt.assigned_lane ? 'text-green-400' : 'text-yellow-400'}`}>
+                {pt.assigned_lane ? `Lane ${pt.assigned_lane}` : 'Not assigned'}
+              </div>
             </div>
           </div>
+          <button
+            onClick={() => setViewingPTDetails(pt)}
+            className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg font-semibold flex-shrink-0"
+          >
+            Details
+          </button>
         </div>
       </div>
     );
@@ -162,13 +151,23 @@ export default function SearchModal({ onClose }: SearchModalProps) {
   function PTCompactCard({ pt }: { pt: SearchResult }) {
     return (
       <div className="bg-gray-800 p-3 rounded-lg border-2 border-gray-600">
-        <div className="font-bold">PT #{pt.pt_number}</div>
-        <div className="text-xs text-gray-300">PO: {pt.po_number}</div>
-        <div className="text-sm text-blue-400 mt-1">
-          {pt.actual_pallet_count || 'TBD'} pallets
-        </div>
-        <div className={`text-sm font-semibold mt-1 ${pt.assigned_lane ? 'text-green-400' : 'text-yellow-400'}`}>
-          {pt.assigned_lane ? `Lane ${pt.assigned_lane}` : 'Unassigned'}
+        <div className="flex justify-between items-start gap-2">
+          <div className="flex-1">
+            <div className="font-bold">PT #{pt.pt_number}</div>
+            <div className="text-xs text-gray-300">PO: {pt.po_number}</div>
+            <div className="text-sm text-blue-400 mt-1">
+              {pt.actual_pallet_count || 'TBD'} pallets
+            </div>
+            <div className={`text-sm font-semibold mt-1 ${pt.assigned_lane ? 'text-green-400' : 'text-yellow-400'}`}>
+              {pt.assigned_lane ? `Lane ${pt.assigned_lane}` : 'Unassigned'}
+            </div>
+          </div>
+          <button
+            onClick={() => setViewingPTDetails(pt)}
+            className="bg-blue-600 hover:bg-blue-700 px-2 py-1 rounded text-xs font-semibold flex-shrink-0"
+          >
+            Details
+          </button>
         </div>
       </div>
     );
@@ -257,8 +256,8 @@ export default function SearchModal({ onClose }: SearchModalProps) {
               <p className="text-gray-400 text-center py-8">No results found</p>
             ) : (
               <div className="space-y-4">
-                {results.map((result, idx) => (
-                  <PTDetailCard key={idx} pt={result} showContainer={true} />
+                {results.map((result) => (
+                  <PTResultCard key={result.id} pt={result} />
                 ))}
               </div>
             )}
@@ -321,8 +320,8 @@ export default function SearchModal({ onClose }: SearchModalProps) {
                                   {customer}
                                 </h4>
                                 <div className="space-y-3">
-                                  {ptsByCustomer[customer].map((pt, idx) => (
-                                    <PTCompactCard key={idx} pt={pt} />
+                                  {ptsByCustomer[customer].map((pt) => (
+                                    <PTCompactCard key={pt.id} pt={pt} />
                                   ))}
                                 </div>
                               </div>
@@ -338,6 +337,14 @@ export default function SearchModal({ onClose }: SearchModalProps) {
           </div>
         )}
       </div>
+
+      {/* PT Details Modal */}
+      {viewingPTDetails && (
+        <PTDetails 
+          pt={viewingPTDetails} 
+          onClose={() => setViewingPTDetails(null)} 
+        />
+      )}
     </div>
   );
 }

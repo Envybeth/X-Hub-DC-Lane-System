@@ -3,6 +3,7 @@
 import { useState, useEffect } from 'react';
 import { supabase } from '@/lib/supabase';
 import ConfirmModal from './ConfirmModal';
+import PTDetails from './PTDetails';
 
 export interface ShipmentPT {
   id: number;
@@ -17,6 +18,8 @@ export interface ShipmentPT {
   start_date: string;
   cancel_date: string;
   removed_from_staging?: boolean;
+  status?: string;
+  ctn?: string;
 }
 
 export interface Shipment {
@@ -26,6 +29,7 @@ export interface Shipment {
   pts: ShipmentPT[];
   staging_lane: string | null;
   status: 'not_started' | 'in_process' | 'finalized';
+  archived?: boolean;
 }
 
 export interface ShipmentCardProps {
@@ -78,8 +82,8 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
 
   // THE WATCHDOG: Automatically syncs any PT placed into the staging lane into a "ready_to_ship" state.
   useEffect(() => {
-    const unsyncedPTs = shipment.pts.filter(pt => 
-      pt.assigned_lane === shipment.staging_lane && 
+    const unsyncedPTs = shipment.pts.filter(pt =>
+      pt.assigned_lane === shipment.staging_lane &&
       (!pt.moved_to_staging || pt.removed_from_staging)
     );
 
@@ -312,7 +316,7 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
     if (!newStagingLane.trim() || !shipment.staging_lane) return;
 
     const targetLaneNumber = parseInt(newStagingLane.trim());
-    
+
     if (isNaN(targetLaneNumber)) {
       setStagingLaneError('Invalid lane number');
       setTimeout(() => setStagingLaneError(''), 3000);
@@ -477,13 +481,14 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
     try {
       const { data: shipmentData } = await supabase
         .from('shipments')
-        .select('id')
+        .select('id, status')
         .eq('pu_number', shipment.pu_number)
         .eq('pu_date', shipment.pu_date)
         .single();
 
       if (!shipmentData) throw new Error('Shipment not found');
 
+      // Add to shipment_pts
       await supabase
         .from('shipment_pts')
         .upsert({
@@ -495,14 +500,19 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
           onConflict: 'shipment_id,pt_id'
         });
 
+      // Determine status based on shipment state
+      const ptStatus = shipmentData.status === 'finalized' ? 'ready_to_ship' : 'staged';
+
+      // Update PT
       await supabase
         .from('picktickets')
         .update({
           assigned_lane: shipment.staging_lane,
-          status: 'ready_to_ship'
+          status: ptStatus
         })
         .eq('id', pt.id);
 
+      // Remove old lane assignment if exists
       if (pt.assigned_lane) {
         const { data: oldAssignment } = await supabase
           .from('lane_assignments')
@@ -519,6 +529,7 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
         }
       }
 
+      // Get next position in staging lane
       const { data: existingAssignments } = await supabase
         .from('lane_assignments')
         .select('order_position')
@@ -530,6 +541,7 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
         ? existingAssignments[0].order_position + 1
         : 1;
 
+      // Add to staging lane
       await supabase
         .from('lane_assignments')
         .insert({
@@ -571,6 +583,18 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
         .update({ status: 'finalized', updated_at: new Date().toISOString() })
         .eq('pu_number', shipment.pu_number)
         .eq('pu_date', shipment.pu_date);
+
+      // UPDATE ALL STAGED PTs TO ready_to_ship
+      const stagedPTIds = shipment.pts
+        .filter(pt => pt.moved_to_staging && !pt.removed_from_staging)
+        .map(pt => pt.id);
+
+      if (stagedPTIds.length > 0) {
+        await supabase
+          .from('picktickets')
+          .update({ status: 'ready_to_ship' })
+          .in('id', stagedPTIds);
+      }
 
       showToast('Shipment finalized!', 'success');
       onUpdate();
@@ -615,146 +639,105 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
         {expanded && (
           <div className="p-3 md:p-6 border-t-2 border-gray-600 space-y-4 md:space-y-6">
             {/* Action buttons - wrap on mobile */}
-            <div className="flex gap-2 flex-wrap">
-              {editingStatus ? (
-                <div className="w-full bg-gray-700 p-3 md:p-4 rounded-lg">
-                  <div className="flex flex-col sm:flex-row items-start sm:items-center gap-2 md:gap-3">
-                    <label className="font-semibold text-sm md:text-base">Status:</label>
-                    <select
-                      value={newStatus}
-                      onChange={(e) => setNewStatus(e.target.value as any)}
-                      className="bg-gray-900 text-white p-2 rounded flex-1 w-full sm:w-auto text-sm md:text-base"
-                    >
-                      <option value="not_started">Not Started</option>
-                      <option value="in_process">In Process</option>
-                      <option value="finalized">Finalized</option>
-                    </select>
-                    <div className="flex gap-2 w-full sm:w-auto">
-                      <button
-                        onClick={handleUpdateStatus}
-                        className="flex-1 sm:flex-none bg-green-600 hover:bg-green-700 px-3 md:px-4 py-2 rounded font-semibold text-sm md:text-base"
-                      >
-                        Save
-                      </button>
-                      <button
-                        onClick={() => {
-                          setEditingStatus(false);
-                          setNewStatus(shipment.status);
-                        }}
-                        className="flex-1 sm:flex-none bg-gray-600 hover:bg-gray-700 px-3 md:px-4 py-2 rounded font-semibold text-sm md:text-base"
-                      >
-                        Cancel
-                      </button>
+            {/* Only show action buttons if NOT archived */}
+            {!shipment.archived && shipment.staging_lane && (
+              <>
+                {/* Clear Data Button - Always Visible */}
+                {!deletingShipment ? (
+                  <button
+                    onClick={() => setDeletingShipment(true)}
+                    className="bg-red-600 hover:bg-red-700 px-3 md:px-6 py-2 md:py-3 rounded-lg font-bold text-sm md:text-base whitespace-nowrap"
+                  >
+                    Reset Shipment
+                  </button>
+                ) : (
+                  <div className="w-full bg-red-900 border-2 border-red-600 p-3 md:p-4 rounded-lg">
+                    <div className="flex flex-col sm:flex-row items-start sm:items-center gap-2 md:gap-3">
+                      <label className="font-semibold text-white text-sm md:text-base whitespace-nowrap">Type DELETE:</label>
+                      <input
+                        type="text"
+                        value={deleteConfirmText}
+                        onChange={(e) => setDeleteConfirmText(e.target.value)}
+                        placeholder="DELETE"
+                        className="bg-gray-900 text-white p-2 rounded flex-1 w-full uppercase text-sm md:text-base"
+                      />
+                      <div className="flex gap-2 w-full sm:w-auto">
+                        <button
+                          onClick={handleDeleteStagingData}
+                          disabled={deleteConfirmText !== 'DELETE'}
+                          className="flex-1 sm:flex-none bg-red-700 hover:bg-red-800 disabled:bg-gray-600 px-3 md:px-4 py-2 rounded font-semibold text-sm md:text-base"
+                        >
+                          Delete
+                        </button>
+                        <button
+                          onClick={() => {
+                            setDeletingShipment(false);
+                            setDeleteConfirmText('');
+                          }}
+                          className="flex-1 sm:flex-none bg-gray-600 hover:bg-gray-700 px-3 md:px-4 py-2 rounded font-semibold text-sm md:text-base"
+                        >
+                          Cancel
+                        </button>
+                      </div>
                     </div>
                   </div>
-                </div>
-              ) : (
-                <button
-                  onClick={() => {
-                    setEditingStatus(true);
-                    setNewStatus(shipment.status);
-                  }}
-                  className="bg-orange-600 hover:bg-orange-700 px-3 md:px-6 py-2 md:py-3 rounded-lg font-bold text-sm md:text-base"
-                >
-                  Edit Status
-                </button>
-              )}
+                )}
 
-              {shipment.staging_lane && !changingStagingLane && (
-                <button
-                  onClick={() => setChangingStagingLane(true)}
-                  className="bg-purple-600 hover:bg-purple-700 px-3 md:px-6 py-2 md:py-3 rounded-lg font-bold text-sm md:text-base whitespace-nowrap"
-                >
-                  Change Lane
-                </button>
-              )}
+                {/* Change Lane Button */}
+                {shipment.staging_lane && !changingStagingLane && (
+                  <button
+                    onClick={() => setChangingStagingLane(true)}
+                    className="bg-purple-600 hover:bg-purple-700 px-3 md:px-6 py-2 md:py-3 rounded-lg font-bold text-sm md:text-base whitespace-nowrap"
+                  >
+                    Change Lane
+                  </button>
+                )}
 
-              {changingStagingLane && (
-                <div className="w-full bg-gray-700 p-3 md:p-4 rounded-lg relative">
-                  <div className="flex flex-col sm:flex-row items-start sm:items-center gap-2 md:gap-3">
-                    <label className="font-semibold text-sm md:text-base whitespace-nowrap">New Lane:</label>
-                    <input
-                      type="text"
-                      value={newStagingLane}
-                      onChange={(e) => {
-                        setNewStagingLane(e.target.value);
-                        setStagingLaneError('');
-                      }}
-                      placeholder="Enter lane number"
-                      className={`bg-gray-900 text-white p-2 rounded flex-1 w-full text-sm md:text-base ${stagingLaneError ? 'border-2 border-red-500' : ''}`}
-                    />
-                    <div className="flex gap-2 w-full sm:w-auto">
-                      <button
-                        onClick={handleChangeStagingLane}
-                        className="flex-1 sm:flex-none bg-green-600 hover:bg-green-700 px-3 md:px-4 py-2 rounded font-semibold text-sm md:text-base"
-                      >
-                        Move
-                      </button>
-                      <button
-                        onClick={() => {
-                          setChangingStagingLane(false);
-                          setNewStagingLane('');
+                {changingStagingLane && (
+                  <div className="w-full bg-gray-700 p-3 md:p-4 rounded-lg relative">
+                    <div className="flex flex-col sm:flex-row items-start sm:items-center gap-2 md:gap-3">
+                      <label className="font-semibold text-sm md:text-base whitespace-nowrap">New Lane:</label>
+                      <input
+                        type="text"
+                        value={newStagingLane}
+                        onChange={(e) => {
+                          setNewStagingLane(e.target.value);
                           setStagingLaneError('');
                         }}
-                        className="flex-1 sm:flex-none bg-gray-600 hover:bg-gray-700 px-3 md:px-4 py-2 rounded font-semibold text-sm md:text-base"
-                      >
-                        Cancel
-                      </button>
+                        placeholder="Enter lane number"
+                        className={`bg-gray-900 text-white p-2 rounded flex-1 w-full text-sm md:text-base ${stagingLaneError ? 'border-2 border-red-500' : ''}`}
+                      />
+                      <div className="flex gap-2 w-full sm:w-auto">
+                        <button
+                          onClick={handleChangeStagingLane}
+                          className="flex-1 sm:flex-none bg-green-600 hover:bg-green-700 px-3 md:px-4 py-2 rounded font-semibold text-sm md:text-base"
+                        >
+                          Move
+                        </button>
+                        <button
+                          onClick={() => {
+                            setChangingStagingLane(false);
+                            setNewStagingLane('');
+                            setStagingLaneError('');
+                          }}
+                          className="flex-1 sm:flex-none bg-gray-600 hover:bg-gray-700 px-3 md:px-4 py-2 rounded font-semibold text-sm md:text-base"
+                        >
+                          Cancel
+                        </button>
+                      </div>
                     </div>
+                    {stagingLaneError && (
+                      <div className="mt-2 text-red-500 text-xs md:text-sm animate-fade-in">
+                        {stagingLaneError}
+                      </div>
+                    )}
                   </div>
-                  {stagingLaneError && (
-                    <div className="mt-2 text-red-500 text-xs md:text-sm animate-fade-in">
-                      {stagingLaneError}
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {shipment.staging_lane && movedCount > 0 && !deletingShipment && (
-                <button
-                  onClick={() => setDeletingShipment(true)}
-                  className="bg-red-600 hover:bg-red-700 px-3 md:px-6 py-2 md:py-3 rounded-lg font-bold text-sm md:text-base whitespace-nowrap"
-                >
-                  Clear Data
-                </button>
-              )}
-
-              {deletingShipment && (
-                <div className="w-full bg-red-900 border-2 border-red-600 p-3 md:p-4 rounded-lg">
-                  <div className="flex flex-col sm:flex-row items-start sm:items-center gap-2 md:gap-3">
-                    <label className="font-semibold text-white text-sm md:text-base whitespace-nowrap">Type DELETE:</label>
-                    <input
-                      type="text"
-                      value={deleteConfirmText}
-                      onChange={(e) => setDeleteConfirmText(e.target.value)}
-                      placeholder="DELETE"
-                      className="bg-gray-900 text-white p-2 rounded flex-1 w-full uppercase text-sm md:text-base"
-                    />
-                    <div className="flex gap-2 w-full sm:w-auto">
-                      <button
-                        onClick={handleDeleteStagingData}
-                        disabled={deleteConfirmText !== 'DELETE'}
-                        className="flex-1 sm:flex-none bg-red-700 hover:bg-red-800 disabled:bg-gray-600 px-3 md:px-4 py-2 rounded font-semibold text-sm md:text-base"
-                      >
-                        Delete
-                      </button>
-                      <button
-                        onClick={() => {
-                          setDeletingShipment(false);
-                          setDeleteConfirmText('');
-                        }}
-                        className="flex-1 sm:flex-none bg-gray-600 hover:bg-gray-700 px-3 md:px-4 py-2 rounded font-semibold text-sm md:text-base"
-                      >
-                        Cancel
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              )}
-            </div>
+                )}
+              </>
+            )}
 
             {/* Staging lane selection - TEXT INPUT */}
-            {!shipment.staging_lane ? (
+            {!shipment.staging_lane && !shipment.archived ? (
               <div className="bg-yellow-900 border-2 border-yellow-600 p-3 md:p-4 rounded-lg">
                 <div className="font-bold text-base md:text-xl mb-2 md:mb-3">⚠️ Select Staging Lane</div>
                 <p className="text-xs md:text-sm mb-3 md:mb-4">Enter a lane number to consolidate all PTs</p>
@@ -795,7 +778,7 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
                   </div>
                 )}
               </div>
-            ) : (
+            ) : shipment.staging_lane && !shipment.archived ? (
               <div className="bg-gray-700 p-3 md:p-4 rounded-lg">
                 <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
                   <div>
@@ -812,9 +795,73 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
                       Finalize
                     </button>
                   )}
+                  {shipment.status === 'finalized' && !shipment.archived && (
+                    <button
+                      onClick={() => showConfirm(
+                        'Mark as Shipped',
+                        'This will clear the staging lane and archive this shipment. Continue?',
+                        async () => {
+                          try {
+                            // Archive shipment AND clear staging lane
+                            await supabase
+                              .from('shipments')
+                              .update({
+                                archived: true,
+                                staging_lane: null,
+                                updated_at: new Date().toISOString()
+                              })
+                              .eq('pu_number', shipment.pu_number)
+                              .eq('pu_date', shipment.pu_date);
+
+                            // Get PT IDs directly from picktickets by pu_number and pu_date
+                            const { data: ptsToShip } = await supabase
+                              .from('picktickets')
+                              .select('id')
+                              .eq('pu_number', shipment.pu_number)
+                              .eq('pu_date', shipment.pu_date);
+
+                            const ptIds = ptsToShip?.map(pt => pt.id) || [];
+
+                            if (ptIds.length === 0) {
+                              showToast('No PTs found to ship', 'error');
+                              return;
+                            }
+
+                            // Clear lane assignments
+                            await supabase
+                              .from('lane_assignments')
+                              .delete()
+                              .in('pt_id', ptIds);
+
+                            // Update PTs to shipped status
+                            await supabase
+                              .from('picktickets')
+                              .update({
+                                assigned_lane: null,
+                                actual_pallet_count: null,
+                                status: 'shipped'
+                              })
+                              .in('id', ptIds);
+
+                            console.log(`✅ Marked ${ptIds.length} PTs as shipped`);
+
+                            showToast('Shipment marked as shipped!', 'success');
+                            onUpdate();
+                          } catch (error) {
+                            console.error('Error marking as shipped:', error);
+                            showToast('Failed to mark as shipped', 'error');
+                          }
+                          setConfirmModal({ ...confirmModal, isOpen: false });
+                        }
+                      )}
+                      className="bg-green-600 hover:bg-green-700 px-3 md:px-6 py-2 md:py-3 rounded-lg font-bold text-sm md:text-base whitespace-nowrap"
+                    >
+                      ✈️ Mark as Shipped
+                    </button>
+                  )}
                 </div>
               </div>
-            )}
+            ) : null}
 
             {/* PT List */}
             <div className="space-y-4 md:space-y-6">
@@ -843,7 +890,7 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
                       const hasLaneAssigned = pt.assigned_lane && pt.assigned_lane !== shipment.staging_lane;
                       const isCurrentlyStaged = pt.moved_to_staging && !pt.removed_from_staging;
                       const canMoveToStaging = hasLaneAssigned && !isCurrentlyStaged && shipment.staging_lane && shipment.status !== 'finalized';
-
+                      const isShipped = pt.status === 'shipped';
                       return (
                         <div
                           key={pt.id}
@@ -905,7 +952,7 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
                                   ✓ Stage
                                 </button>
                               )}
-                              {!pt.assigned_lane && (
+                              {!pt.assigned_lane && !isShipped && (
                                 <div className="bg-yellow-700 px-2 md:px-4 py-1.5 md:py-2 rounded-lg text-xs md:text-sm font-semibold whitespace-nowrap">
                                   Assign first
                                 </div>
@@ -924,73 +971,10 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
 
         {/* PT Details Modal */}
         {selectedPTDetails && (
-          <div className="fixed inset-0 bg-black bg-opacity-90 flex items-center justify-center z-50 p-4">
-            <div className="bg-gray-800 rounded-lg p-4 md:p-8 max-w-2xl w-full max-h-[90vh] overflow-y-auto">
-              <div className="flex justify-between items-center mb-4 md:mb-6">
-                <h3 className="text-lg md:text-2xl font-bold">PT Details</h3>
-                <button
-                  onClick={() => setSelectedPTDetails(null)}
-                  className="text-3xl md:text-4xl hover:text-red-500"
-                >
-                  &times;
-                </button>
-              </div>
-
-              <div className="grid grid-cols-2 gap-3 md:gap-4 text-sm md:text-base">
-                <div>
-                  <div className="text-xs md:text-sm text-gray-400">PT #</div>
-                  <div className="font-bold break-all">{selectedPTDetails.pt_number}</div>
-                </div>
-                <div>
-                  <div className="text-xs md:text-sm text-gray-400">PO #</div>
-                  <div className="font-bold break-all">{selectedPTDetails.po_number}</div>
-                </div>
-                <div className="col-span-2">
-                  <div className="text-xs md:text-sm text-gray-400">Customer</div>
-                  <div className="break-all">{selectedPTDetails.customer}</div>
-                </div>
-                <div>
-                  <div className="text-xs md:text-sm text-gray-400">DC #</div>
-                  <div className="break-all">{selectedPTDetails.store_dc || 'N/A'}</div>
-                </div>
-                <div>
-                  <div className="text-xs md:text-sm text-gray-400">Pallets</div>
-                  <div className="font-bold text-blue-400">{selectedPTDetails.actual_pallet_count}</div>
-                </div>
-                <div>
-                  <div className="text-xs md:text-sm text-gray-400">Start Date</div>
-                  <div>{selectedPTDetails.start_date || 'N/A'}</div>
-                </div>
-                <div>
-                  <div className="text-xs md:text-sm text-gray-400">Cancel Date</div>
-                  <div>{selectedPTDetails.cancel_date || 'N/A'}</div>
-                </div>
-                <div className="col-span-2">
-                  <div className="text-xs md:text-sm text-gray-400">Container</div>
-                  <div className="break-all">{selectedPTDetails.container_number}</div>
-                </div>
-                <div className="col-span-2">
-                  <div className="text-xs md:text-sm text-gray-400">Location</div>
-                  <div className="font-bold text-blue-400">
-                    {selectedPTDetails.assigned_lane ? `Lane ${selectedPTDetails.assigned_lane}` : 'Unassigned'}
-                  </div>
-                </div>
-                <div className="col-span-2">
-                  <div className="text-xs md:text-sm text-gray-400">Status</div>
-                  <div className={`font-bold ${selectedPTDetails.moved_to_staging && !selectedPTDetails.removed_from_staging ? 'text-green-400' : 'text-yellow-400'}`}>
-                    {selectedPTDetails.moved_to_staging && !selectedPTDetails.removed_from_staging ? 'Ready (Staging)' : 'Awaiting Move'}
-                  </div>
-                </div>
-              </div>
-
-              <button
-                onClick={() => setSelectedPTDetails(null)}
-                className="w-full mt-4 md:mt-6 bg-blue-600 hover:bg-blue-700 py-2 md:py-3 rounded-lg font-bold text-sm md:text-lg"
-              >
-                Close
-              </button>
-            </div>
-          </div>
+          <PTDetails
+            pt={selectedPTDetails}
+            onClose={() => setSelectedPTDetails(null)}
+          />
         )}
       </div>
 
