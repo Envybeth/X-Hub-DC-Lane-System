@@ -101,6 +101,11 @@ export async function syncGoogleSheetData() {
         continue;
       }
 
+      // SKIP if customer is PAPER
+      if (customer && customer.trim().toUpperCase() === 'PAPER') {
+        continue;
+      }
+
       if (!pt_number || !po_number) continue;
 
       if (container_number) {
