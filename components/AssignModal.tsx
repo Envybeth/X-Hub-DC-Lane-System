@@ -241,10 +241,10 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
     const searchTerm = ptSearchQuery.trim().toLowerCase();
 
     const filtered = allPicktickets.filter(pt =>
-      pt.pt_number.toLowerCase().includes(searchTerm) ||
-      pt.po_number.toLowerCase().includes(searchTerm) ||
-      pt.customer.toLowerCase().includes(searchTerm) ||
-      pt.container_number.toLowerCase().includes(searchTerm)
+      (pt.pt_number || '').toLowerCase().includes(searchTerm) ||
+      (pt.po_number || '').toLowerCase().includes(searchTerm) ||
+      (pt.customer || '').toLowerCase().includes(searchTerm) ||
+      (pt.container_number || '').toLowerCase().includes(searchTerm)
     );
 
     setPicktickets(filtered);

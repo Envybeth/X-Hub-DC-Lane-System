@@ -133,7 +133,7 @@ export default function PrinterPage() {
       }
 
       setStatusMsg(`✅ Sent to printer! ${palletCount * 2} labels queued.`);
-      
+
       setTimeout(() => {
         setPrinting(false);
         setPrintData(null);
@@ -152,11 +152,11 @@ export default function PrinterPage() {
   return (
     <div className="min-h-screen bg-gray-900 text-white p-2 md:p-8">
       <div className="max-w-2xl mx-auto">
-        
+
         <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between mb-6 md:mb-8 gap-3">
           <h1 className="text-xl md:text-3xl font-bold">🖨️ Pallet Label Printer</h1>
-          <Link 
-            href="/" 
+          <Link
+            href="/"
             className="bg-gray-700 hover:bg-gray-600 px-3 md:px-4 py-2 rounded text-sm md:text-base"
           >
             ← Back
@@ -195,7 +195,7 @@ export default function PrinterPage() {
 
         {printData && (
           <div className="bg-gray-800 p-4 md:p-6 rounded-lg border-2 border-blue-500 animate-fade-in relative">
-            
+
             {/* PRINTED BADGE */}
             {printData.has_been_printed && (
               <div className="absolute top-4 right-4 bg-red-600 px-4 py-2 rounded-lg border-2 border-red-400 animate-pulse">
@@ -230,7 +230,20 @@ export default function PrinterPage() {
                   min="1"
                   max="50"
                   value={palletCount}
-                  onChange={(e) => setPalletCount(parseInt(e.target.value) || 1)}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    if (val === '') {
+                      setPalletCount(0); // Allow empty temporarily
+                    } else {
+                      setPalletCount(parseInt(val) || 1);
+                    }
+                  }}
+                  onBlur={(e) => {
+                    // Set to 1 if empty when user leaves the field
+                    if (e.target.value === '' || palletCount === 0) {
+                      setPalletCount(1);
+                    }
+                  }}
                   className="bg-gray-900 border border-gray-600 rounded-lg p-3 md:p-4 text-2xl md:text-3xl font-bold w-full sm:w-32 text-center"
                   disabled={showPasswordPrompt}
                 />
@@ -243,11 +256,10 @@ export default function PrinterPage() {
                 <button
                   onClick={handlePrintClick}
                   disabled={printing}
-                  className={`mt-4 w-full py-3 md:py-4 rounded-lg text-lg md:text-2xl font-bold transition-transform active:scale-95 disabled:bg-gray-600 disabled:scale-100 ${
-                    printData.has_been_printed 
-                      ? 'bg-orange-600 hover:bg-orange-700' 
+                  className={`mt-4 w-full py-3 md:py-4 rounded-lg text-lg md:text-2xl font-bold transition-transform active:scale-95 disabled:bg-gray-600 disabled:scale-100 ${printData.has_been_printed
+                      ? 'bg-orange-600 hover:bg-orange-700'
                       : 'bg-green-600 hover:bg-green-700'
-                  }`}
+                    }`}
                 >
                   {printing ? 'Sending...' : printData.has_been_printed ? '🔒 REPRINT (Password Required)' : '🖨️ PRINT LABELS'}
                 </button>
