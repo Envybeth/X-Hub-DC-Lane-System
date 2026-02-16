@@ -12,6 +12,7 @@ interface PrintData {
   store_dc: string;
   cancel_date: string;
   has_been_printed: boolean;
+  ctn?: string;
 }
 
 // CHANGE THIS PASSWORD TO WHATEVER YOU WANT
@@ -39,7 +40,7 @@ export default function PrinterPage() {
       // Check if PT exists
       const { data, error } = await supabase
         .from('picktickets')
-        .select('id, pt_number, po_number, customer, store_dc, cancel_date')
+        .select('id, pt_number, po_number, customer, store_dc, cancel_date, ctn')
         .or(`pt_number.eq.${inputVal.trim()},po_number.eq.${inputVal.trim()}`)
         .limit(1)
         .single();
@@ -115,7 +116,8 @@ export default function PrinterPage() {
           cancel_date: printData.cancel_date,
           pallet_count: palletCount,
           status: 'pending',
-          is_reprint: isReprint
+          is_reprint: isReprint,
+          ctn: printData.ctn || null
         });
 
       if (queueError) throw queueError;
@@ -220,6 +222,10 @@ export default function PrinterPage() {
                 <p className="text-gray-400 text-xs md:text-sm">PO Number</p>
                 <p className="font-bold text-lg md:text-xl break-all">{printData.po_number}</p>
               </div>
+              <div>
+                <p className="text-gray-400 text-xs md:text-sm">CTN</p>
+                <p className="font-bold text-lg md:text-xl">{printData.ctn || 'N/A'}</p>
+              </div>
             </div>
 
             <div className="flex flex-col gap-4">
@@ -257,8 +263,8 @@ export default function PrinterPage() {
                   onClick={handlePrintClick}
                   disabled={printing}
                   className={`mt-4 w-full py-3 md:py-4 rounded-lg text-lg md:text-2xl font-bold transition-transform active:scale-95 disabled:bg-gray-600 disabled:scale-100 ${printData.has_been_printed
-                      ? 'bg-orange-600 hover:bg-orange-700'
-                      : 'bg-green-600 hover:bg-green-700'
+                    ? 'bg-orange-600 hover:bg-orange-700'
+                    : 'bg-green-600 hover:bg-green-700'
                     }`}
                 >
                   {printing ? 'Sending...' : printData.has_been_printed ? '🔒 REPRINT (Password Required)' : '🖨️ PRINT LABELS'}

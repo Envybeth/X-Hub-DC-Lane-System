@@ -138,6 +138,7 @@ export async function syncGoogleSheetData() {
             pu_number: pu_number || null,
             carrier: carrier || null,
             pu_date: parseDate(pu_date),
+            last_synced_at: new Date().toISOString(),
           },
           { onConflict: 'pt_number,po_number' }
         );

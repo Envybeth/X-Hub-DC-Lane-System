@@ -211,7 +211,8 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
       .from('picktickets')
       .select('*')
       .is('assigned_lane', null)
-      .neq('status', 'shipped') // ADD THIS LINE
+      .neq('status', 'shipped')
+      .neq('customer', 'PAPER') // ADD THIS
       .order('pt_number');
 
     if (data) {
@@ -226,7 +227,8 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
       .select('*')
       .eq('container_number', containerNumber)
       .is('assigned_lane', null)
-      .neq('status', 'shipped') // ADD THIS LINE
+      .neq('status', 'shipped')
+      .neq('customer', 'PAPER') // ADD THIS
       .order('pt_number');
 
     if (data) setPicktickets(data);
@@ -565,8 +567,9 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
   }, {} as Record<string, Pickticket[]>);
 
   const customers = Object.keys(ptsByCustomer).sort();
+  const currentPallets = existingPTs.reduce((sum, pt) => sum + pt.pallet_count, 0);
   const totalNewPallets = Object.values(selectedPTs).reduce((sum, countStr) => sum + (parseInt(countStr) || 1), 0);
-  const availableCapacity = lane.max_capacity - (lane.current_pallets || 0);
+  const availableCapacity = lane.max_capacity - currentPallets;
 
   const selectedPTDetails_summary = Object.keys(selectedPTs).map(ptId => {
     // Try to find in current filtered results first
@@ -633,8 +636,7 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
             <div>
               <div className="bg-gray-700 p-3 md:p-4 rounded-lg mb-3 md:mb-4">
                 <div className="text-sm md:text-lg">
-                  <span className="font-bold">Capacity:</span> {lane.current_pallets} / {lane.max_capacity} pallets
-                </div>
+                  <span className="font-bold">Capacity:</span> {currentPallets} / {lane.max_capacity} pallets                </div>
               </div>
 
               <div className="space-y-2 md:space-y-3">

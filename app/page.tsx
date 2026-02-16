@@ -24,7 +24,7 @@ export default function Home() {
       .order('created_at', { ascending: false })
       .limit(1)
       .single();
-    
+
     if (data) {
       setLastSync(new Date(data.created_at));
     }
@@ -39,7 +39,7 @@ export default function Home() {
     try {
       const response = await fetch('/api/sync', { method: 'POST' });
       const data = await response.json();
-      
+
       if (data.success) {
         alert(`✅ Synced ${data.count} picktickets`);
         setLastSync(new Date());
@@ -68,17 +68,23 @@ export default function Home() {
               >
                 🔍 Search
               </button>
-              <Link 
+              <Link
                 href="/printer"
                 className="flex-1 sm:flex-none bg-orange-600 hover:bg-orange-700 px-3 md:px-6 py-2 md:py-3 rounded-lg font-semibold text-center text-sm md:text-base"
               >
                 🖨️ Labels
               </Link>
-              <Link 
+              <Link
                 href="/shipments"
                 className="flex-1 sm:flex-none bg-purple-600 hover:bg-purple-700 px-3 md:px-6 py-2 md:py-3 rounded-lg font-semibold text-center text-sm md:text-base"
               >
                 📦 Shipments
+              </Link>
+              <Link
+                href="/samples"
+                className="flex-1 sm:flex-none bg-yellow-600 hover:bg-yellow-700 px-3 md:px-6 py-2 md:py-3 rounded-lg font-semibold text-center text-sm md:text-base"
+              >
+                📋 Samples
               </Link>
               <button
                 onClick={handleSync}
@@ -105,9 +111,9 @@ export default function Home() {
 
       {/* PT Details Modal */}
       {viewingPTDetails && (
-        <PTDetails 
-          pt={viewingPTDetails} 
-          onClose={() => setViewingPTDetails(null)} 
+        <PTDetails
+          pt={viewingPTDetails}
+          onClose={() => setViewingPTDetails(null)}
         />
       )}
     </div>
