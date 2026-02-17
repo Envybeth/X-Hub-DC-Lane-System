@@ -154,7 +154,7 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
   async function fetchAllLanes() {
     const { data } = await supabase
       .from('lanes')
-      .select('lane_number, max_capacity, current_pallets')
+      .select('lane_number, max_capacity') // REMOVE current_pallets
       .order('lane_number');
 
     if (data) setAllLanes(data as Lane[]);
@@ -438,15 +438,17 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
       return;
     }
 
-    const targetLane = allLanes.find(l => String(l.lane_number).trim() === String(newLaneNumber).trim());
+    const targetLane = allLanes.find(l =>
+      String(l.lane_number).trim().toLowerCase() === String(newLaneNumber).trim().toLowerCase()
+    );
 
     if (!targetLane) {
-      setMoveLaneError('Invalid lane number');
+      setMoveLaneError(`Lane "${newLaneNumber}" not found`);
       setTimeout(() => setMoveLaneError(''), 3000);
       return;
     }
 
-    if (String(newLaneNumber).trim() === String(lane.lane_number).trim()) {
+    if (String(targetLane.lane_number).trim() === String(lane.lane_number).trim()) {
       setMoveLaneError('Already in this lane');
       setTimeout(() => setMoveLaneError(''), 3000);
       return;
@@ -456,37 +458,38 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
       const ptToMove = existingPTs.find(pt => pt.id === movingPT.assignmentId);
       if (!ptToMove) return;
 
-      if ((targetLane.current_pallets || 0) + ptToMove.pallet_count > targetLane.max_capacity) {
+      // Calculate current capacity of target lane
+      const { data: targetAssignments } = await supabase
+        .from('lane_assignments')
+        .select('pallet_count, order_position')
+        .eq('lane_number', String(targetLane.lane_number));
+
+      const targetCurrentPallets = targetAssignments?.reduce((sum, a) => sum + a.pallet_count, 0) || 0;
+
+      if (targetCurrentPallets + ptToMove.pallet_count > targetLane.max_capacity) {
         setMoveLaneError('Target lane full');
         setTimeout(() => setMoveLaneError(''), 3000);
         return;
       }
 
-      const { data: targetAssignments } = await supabase
-        .from('lane_assignments')
-        .select('order_position')
-        .eq('lane_number', String(newLaneNumber))
-        .order('order_position', { ascending: false })
-        .limit(1);
-
       const newPosition = targetAssignments && targetAssignments.length > 0
-        ? targetAssignments[0].order_position + 1
+        ? Math.max(...targetAssignments.map(a => a.order_position)) + 1
         : 1;
 
       await supabase
         .from('lane_assignments')
         .update({
-          lane_number: String(newLaneNumber),
+          lane_number: String(targetLane.lane_number),
           order_position: newPosition
         })
         .eq('id', movingPT.assignmentId);
 
       await supabase
         .from('picktickets')
-        .update({ assigned_lane: String(newLaneNumber) })
+        .update({ assigned_lane: String(targetLane.lane_number) })
         .eq('id', movingPT.ptId);
 
-      showToast(`PT moved to Lane ${newLaneNumber}`, 'success');
+      showToast(`PT moved to Lane ${targetLane.lane_number}`, 'success');
       setMovingPT(null);
       setMoveLaneInput('');
       setMoveLaneError('');
@@ -990,6 +993,15 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                               </div>
                             </div>
                             <div className="flex items-center gap-2 flex-shrink-0">
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setViewingSearchPTDetails(item.pt);
+                                }}
+                                className="mt-1 text-[8px] md:text-[8px] text-blue-400 hover:text-blue-300 border rounded p-1"
+                              >
+                                View Details
+                              </button>
                               <div className="text-blue-400 font-bold text-xs md:text-base">{item.pallets}p</div>
                               <button
                                 onClick={() => handlePTSelect(item.pt.id)}

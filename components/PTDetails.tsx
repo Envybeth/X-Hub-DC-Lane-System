@@ -17,6 +17,7 @@ interface PTDetailsProps {
         sample_checked?: boolean;
         sample_labeled?: boolean;
         sample_shipped?: boolean;
+        last_synced_at?: string;
     };
     onClose: () => void;
 }
@@ -53,8 +54,14 @@ function getStatusInfo(pt: PTDetailsProps['pt']): { label: string; color: string
     }
 }
 
+function isArchived(lastSynced: string): boolean {
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    return new Date(lastSynced) < sevenDaysAgo;
+}
+
 export default function PTDetails({ pt, onClose }: PTDetailsProps) {
     const statusInfo = getStatusInfo(pt);
+
 
     return (
         <div className="fixed inset-0 bg-black bg-opacity-90 flex items-center justify-center z-[100] p-4">
@@ -124,6 +131,19 @@ export default function PTDetails({ pt, onClose }: PTDetailsProps) {
                             {statusInfo.label}
                         </div>
                     </div>
+
+                    {pt.last_synced_at && (
+                        <div className="col-span-2">
+                            <div className="text-xs md:text-sm text-gray-400">Last Synced</div>
+                            <div className="text-sm">
+                                {new Date(pt.last_synced_at).toLocaleString()}
+                                {isArchived(pt.last_synced_at) && (
+                                    <span className="ml-2 bg-red-600 px-2 py-1 rounded text-xs">ARCHIVED</span>
+                                )}
+                            </div>
+                        </div>
+                    )}
+
                 </div>
 
                 <button
