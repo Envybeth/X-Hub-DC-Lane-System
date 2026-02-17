@@ -20,6 +20,7 @@ interface PT {
     assigned_lane: string | null;
     sample_checked?: boolean;
     sample_labeled?: boolean;
+    sample_shipped?: boolean;
 }
 
 interface ContainerGroup {
@@ -37,7 +38,7 @@ export default function SamplesPage() {
         isOpen: boolean;
         ptId: number;
         ptNumber: string;
-        type: 'checked' | 'labeled';
+        type: 'checked' | 'labeled' | 'shipped'; // ADD shipped
     } | null>(null);
 
     useEffect(() => {
@@ -71,7 +72,11 @@ export default function SamplesPage() {
                 }, [] as ContainerGroup[]);
 
                 grouped.forEach((group: ContainerGroup) => {
-                    group.allChecked = group.pts.every((pt: PT) => pt.sample_checked === true && pt.sample_labeled === true);
+                    group.allChecked = group.pts.every((pt: PT) =>
+                        pt.sample_checked === true &&
+                        pt.sample_labeled === true &&
+                        pt.sample_shipped === true
+                    );
                 });
 
                 setContainers(grouped);
@@ -123,22 +128,41 @@ export default function SamplesPage() {
         await updateStatus(pt.id, 'sample_labeled', true);
     }
 
+    async function handleShippedToggle(pt: PT, currentValue: boolean) {
+        if (currentValue) {
+            setShowConfirm({
+                isOpen: true,
+                ptId: pt.id,
+                ptNumber: pt.pt_number,
+                type: 'shipped'
+            });
+            return;
+        }
+
+        await updateStatus(pt.id, 'sample_shipped', true);
+    }
+
     async function confirmUncheck() {
         if (!showConfirm) return;
 
         if (showConfirm.type === 'checked') {
-            // Uncheck both
+            // Uncheck all three
             await updateStatus(showConfirm.ptId, 'sample_checked', false);
             await updateStatus(showConfirm.ptId, 'sample_labeled', false);
-        } else {
-            // Just uncheck labeled
+            await updateStatus(showConfirm.ptId, 'sample_shipped', false);
+        } else if (showConfirm.type === 'labeled') {
+            // Uncheck labeled and shipped
             await updateStatus(showConfirm.ptId, 'sample_labeled', false);
+            await updateStatus(showConfirm.ptId, 'sample_shipped', false);
+        } else if (showConfirm.type === 'shipped') {
+            // Just uncheck shipped
+            await updateStatus(showConfirm.ptId, 'sample_shipped', false);
         }
 
         setShowConfirm(null);
     }
 
-    async function updateStatus(ptId: number, field: 'sample_checked' | 'sample_labeled', value: boolean) {
+    async function updateStatus(ptId: number, field: 'sample_checked' | 'sample_labeled' | 'sample_shipped', value: boolean) {
         try {
             await supabase
                 .from('picktickets')
@@ -197,7 +221,7 @@ export default function SamplesPage() {
                                                 </div>
                                                 <div className="text-sm text-gray-400 mt-1">
                                                     {group.pts.length} PT{group.pts.length !== 1 ? 's' : ''} •
-                                                    {group.pts.filter((pt: PT) => pt.sample_checked && pt.sample_labeled).length} complete
+                                                    {group.pts.filter((pt: PT) => pt.sample_checked && pt.sample_labeled && pt.sample_shipped).length} complete
                                                 </div>
                                             </div>
                                         </div>
@@ -221,10 +245,10 @@ export default function SamplesPage() {
                                                             type="checkbox"
                                                             checked={pt.sample_checked || false}
                                                             onChange={(e) => {
-                                                                e.stopPropagation(); // ADD THIS
+                                                                e.stopPropagation();
                                                                 handleCheckToggle(pt, pt.sample_checked || false);
                                                             }}
-                                                            onClick={(e) => e.stopPropagation()} // ADD THIS TOO
+                                                            onClick={(e) => e.stopPropagation()}
                                                             className="w-6 h-6 cursor-pointer flex-shrink-0"
                                                         />
 
@@ -232,7 +256,7 @@ export default function SamplesPage() {
                                                         {pt.sample_checked && (
                                                             <button
                                                                 onClick={(e) => {
-                                                                    e.stopPropagation(); // ADD THIS
+                                                                    e.stopPropagation();
                                                                     handleLabeledToggle(pt, pt.sample_labeled || false);
                                                                 }}
                                                                 className={`px-4 py-2 rounded-lg font-semibold flex items-center gap-2 flex-shrink-0 ${pt.sample_labeled
@@ -241,6 +265,22 @@ export default function SamplesPage() {
                                                                     }`}
                                                             >
                                                                 {pt.sample_labeled && '✓'} Labeled
+                                                            </button>
+                                                        )}
+
+                                                        {/* Ship Button - Only shows when labeled */}
+                                                        {pt.sample_checked && pt.sample_labeled && (
+                                                            <button
+                                                                onClick={(e) => {
+                                                                    e.stopPropagation();
+                                                                    handleShippedToggle(pt, pt.sample_shipped || false);
+                                                                }}
+                                                                className={`px-4 py-2 rounded-lg font-semibold flex items-center gap-2 flex-shrink-0 ${pt.sample_shipped
+                                                                    ? 'bg-green-600 hover:bg-green-700'
+                                                                    : 'bg-gray-600 hover:bg-gray-500'
+                                                                    }`}
+                                                            >
+                                                                {pt.sample_shipped && '✓'} Ship
                                                             </button>
                                                         )}
 
@@ -253,7 +293,7 @@ export default function SamplesPage() {
                                                     </div>
                                                     <button
                                                         onClick={(e) => {
-                                                            e.stopPropagation(); // ADD THIS
+                                                            e.stopPropagation();
                                                             setViewingPTDetails(pt);
                                                         }}
                                                         className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg font-semibold flex-shrink-0"
@@ -282,12 +322,19 @@ export default function SamplesPage() {
                 <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50 p-4">
                     <div className="bg-gray-800 rounded-lg p-6 max-w-md w-full">
                         <h3 className="text-xl font-bold mb-4">
-                            {showConfirm.type === 'checked' ? 'Uncheck Sample?' : 'Unmark as Labeled?'}
+                            {showConfirm.type === 'checked'
+                                ? 'Uncheck Sample?'
+                                : showConfirm.type === 'labeled'
+                                    ? 'Unmark as Labeled?'
+                                    : 'Unmark as Shipped?'
+                            }
                         </h3>
                         <p className="text-gray-300 mb-6">
                             {showConfirm.type === 'checked'
-                                ? `This will uncheck both the sample and labeled status for PT #${showConfirm.ptNumber}. Continue?`
-                                : `Are you sure you want to unmark PT #${showConfirm.ptNumber} as labeled?`
+                                ? `This will reset all statuses for PT #${showConfirm.ptNumber}. Continue?`
+                                : showConfirm.type === 'labeled'
+                                    ? `This will unmark PT #${showConfirm.ptNumber} as labeled and shipped. Continue?`
+                                    : `Are you sure you want to unmark PT #${showConfirm.ptNumber} as shipped?`
                             }
                         </p>
                         <div className="flex gap-3">
