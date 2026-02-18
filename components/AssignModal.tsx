@@ -1,10 +1,15 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import React, { useState, useEffect } from 'react';
 import { supabase } from '@/lib/supabase';
 import ConfirmModal from './ConfirmModal';
 import PTDetails from './PTDetails';
 import { Pickticket } from '@/types/pickticket';
+
+import { createCompiledPallet } from '@/lib/compiledPallets';
+import { fetchCompiledPTInfo } from '@/lib/compiledPallets';
+
+import { isPTDefunct } from '@/lib/utils';
 
 
 interface Lane {
@@ -22,6 +27,7 @@ interface LaneAssignment {
   pallet_count: number;
   order_position: number;
   pickticket: Pickticket;
+  compiled_pallet_id?: number | null;
 }
 
 interface AssignModalProps {
@@ -57,6 +63,19 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
 
   const [viewingSearchPTDetails, setViewingSearchPTDetails] = useState<Pickticket | null>(null);
 
+  //defunct pts
+  const [mostRecentSync, setMostRecentSync] = useState<Date | null>(null);
+
+  //compiling PTs
+  const [compilingPTs, setCompilingPTs] = useState<Set<number>>(new Set());
+  const [compilingConfirm, setCompilingConfirm] = useState<number | null>(null);
+  const [compiledPalletCount, setCompiledPalletCount] = useState('');
+  const [previewCompiledGroups, setPreviewCompiledGroups] = useState<Array<{
+    id: number; // temp ID
+    ptIds: number[];
+    palletCount: number;
+  }>>([]);
+
   const [confirmModal, setConfirmModal] = useState<{
     isOpen: boolean;
     title: string;
@@ -77,6 +96,7 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
     fetchAllUnassignedPTs();
     checkIfStagingLane();
     fetchAllLanes();
+    fetchMostRecentSync();
   }, []);
 
   useEffect(() => {
@@ -111,6 +131,45 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
     // Refresh capacity display when existingPTs changes
     fetchExistingPTs();
   }, [selectedPTs]);
+
+  async function handleCompile() {
+    if (!compilingConfirm || compilingPTs.size === 0) return;
+
+    const count = parseInt(compiledPalletCount);
+    if (!count || count < 1) {
+      showToast('Invalid pallet count', 'error');
+      return;
+    }
+
+    if (compilingPTs.size < 2) {
+      showToast('Select at least 2 PTs to compile', 'error');
+      return;
+    }
+
+    const ptIdsArray = Array.from(compilingPTs);
+
+    // Create preview group (don't add to lane yet)
+    const newGroup = {
+      id: Date.now(), // temp ID
+      ptIds: ptIdsArray,
+      palletCount: count
+    };
+
+    setPreviewCompiledGroups([...previewCompiledGroups, newGroup]);
+
+    // Update pallet counts to the compiled count for display
+    const newSelected = { ...selectedPTs };
+    ptIdsArray.forEach(id => {
+      newSelected[id] = count.toString(); // All PTs show same compiled count
+    });
+    setSelectedPTs(newSelected);
+
+    setCompilingPTs(new Set());
+    setCompilingConfirm(null);
+    setCompiledPalletCount('');
+
+    showToast(`✅ Compiled ${ptIdsArray.length} PTs (preview)`, 'success');
+  }
 
   function showToast(message: string, type: 'success' | 'error') {
     setToast({ message, type });
@@ -153,6 +212,7 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
       id,
       pallet_count,
       order_position,
+      compiled_pallet_id,
       picktickets (
         id,
         pt_number,
@@ -168,7 +228,8 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
         pu_number,
         ctn,
         qty,
-        last_synced_at
+        last_synced_at,
+        compiled_pallet_id
       )
     `)
       .eq('lane_number', lane.lane_number)
@@ -179,8 +240,20 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
         id: a.id,
         pallet_count: a.pallet_count,
         order_position: a.order_position || 1,
-        pickticket: Array.isArray(a.picktickets) ? a.picktickets[0] : a.picktickets
+        compiled_pallet_id: a.compiled_pallet_id,
+        pickticket: (Array.isArray(a.picktickets) ? a.picktickets[0] : a.picktickets) as any
       })).filter(a => a.pickticket);
+
+      // Fetch compiled PT info
+      const ptIds = formattedAssignments.map(a => a.pickticket.id);
+      const compiledInfo = await fetchCompiledPTInfo(ptIds);
+
+      // Attach compiled_with info to each PT
+      formattedAssignments.forEach(assignment => {
+        if (compiledInfo[assignment.pickticket.id]) {
+          (assignment.pickticket as any).compiled_with = compiledInfo[assignment.pickticket.id];
+        }
+      });
 
       setExistingPTs(formattedAssignments as LaneAssignment[]);
     }
@@ -218,7 +291,6 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
       .is('assigned_lane', null)
       .neq('status', 'shipped')
       .neq('customer', 'PAPER')
-      .gte('last_synced_at', oneDayAgo) // Exclude defunct
       .order('pt_number');
 
     if (data) {
@@ -251,10 +323,23 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
       .is('assigned_lane', null)
       .neq('status', 'shipped')
       .neq('customer', 'PAPER')
-      .gte('last_synced_at', oneDayAgo) // Exclude defunct
       .order('pt_number');
 
     if (data) setPicktickets(data);
+  }
+
+  //fetch most recent sync
+  async function fetchMostRecentSync() {
+    const { data } = await supabase
+      .from('picktickets')
+      .select('last_synced_at')
+      .order('last_synced_at', { ascending: false })
+      .limit(1)
+      .single();
+
+    if (data?.last_synced_at) {
+      setMostRecentSync(new Date(data.last_synced_at));
+    }
   }
 
   function filterPickticketsBySearch() {
@@ -313,7 +398,46 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
 
       const isTargetLaneStaging = !!shipmentData;
 
-      // NEW PTs go to position 1 (front), shift others back
+      // STEP 1: Process preview compiled groups FIRST
+      for (const group of previewCompiledGroups) {
+        const result = await createCompiledPallet(group.ptIds, group.palletCount, lane.lane_number);
+
+        if (!result.success) {
+          showToast('Failed to create compiled pallet', 'error');
+          setLoading(false);
+          return;
+        }
+
+        // If adding to staging lane, add compiled group to shipment
+        if (isTargetLaneStaging && result.compiledId) {
+          for (const ptId of group.ptIds) {
+            await supabase
+              .from('shipment_pts')
+              .upsert({
+                shipment_id: shipmentData.id,
+                pt_id: ptId,
+                original_lane: null,
+                removed_from_staging: false
+              }, {
+                onConflict: 'shipment_id,pt_id'
+              });
+          }
+
+          // Update PT status for compiled group
+          const compiledStatus = shipmentData.status === 'finalized' ? 'ready_to_ship' : 'staged';
+          await supabase
+            .from('picktickets')
+            .update({ status: compiledStatus })
+            .in('id', group.ptIds);
+        }
+
+        // Remove these PTs from selectedPTs since they're now compiled
+        group.ptIds.forEach(id => {
+          delete selectedPTs[id];
+        });
+      }
+
+      // STEP 2: Process remaining individual PTs
       for (const [ptId, palletCountStr] of Object.entries(selectedPTs)) {
         const palletCount = parseInt(palletCountStr) || 1;
         if (palletCount === 0) continue;
@@ -365,12 +489,16 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
         }
       }
 
-      showToast(`✅ Assigned ${Object.keys(selectedPTs).length} PTs`, 'success');
+      const totalAssigned = previewCompiledGroups.length + Object.keys(selectedPTs).length;
+      showToast(`✅ Assigned ${totalAssigned} PT group(s)`, 'success');
 
+      // Clear everything
       setSelectedPTs({});
+      setPreviewCompiledGroups([]);
       setSelectedContainer('');
       setContainerSearch('');
       setPtSearchQuery('');
+
       await fetchExistingPTs();
       await fetchAllUnassignedPTs();
       setView('existing');
@@ -499,6 +627,7 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
         ? Math.max(...targetAssignments.map(a => a.order_position)) + 1
         : 1;
 
+      // Update lane assignment
       await supabase
         .from('lane_assignments')
         .update({
@@ -507,10 +636,26 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
         })
         .eq('id', movingPT.assignmentId);
 
-      await supabase
-        .from('picktickets')
-        .update({ assigned_lane: String(targetLane.lane_number) })
-        .eq('id', movingPT.ptId);
+      // If compiled, update ALL PTs in the group
+      if (ptToMove.compiled_pallet_id) {
+        const { data: compiledLinks } = await supabase
+          .from('compiled_pallet_pts')
+          .select('pt_id')
+          .eq('compiled_pallet_id', ptToMove.compiled_pallet_id);
+
+        const ptIds = compiledLinks?.map(l => l.pt_id) || [];
+
+        await supabase
+          .from('picktickets')
+          .update({ assigned_lane: String(targetLane.lane_number) })
+          .in('id', ptIds);
+      } else {
+        // Single PT
+        await supabase
+          .from('picktickets')
+          .update({ assigned_lane: String(targetLane.lane_number) })
+          .eq('id', movingPT.ptId);
+      }
 
       showToast(`PT moved to Lane ${targetLane.lane_number}`, 'success');
       setMovingPT(null);
@@ -669,6 +814,8 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                 {existingPTs.map((assignment, index) => {
                   const palletsInFront = calculatePalletsInFront(index);
                   const depthColor = getDepthColor(palletsInFront, lane.max_capacity);
+                  const isCompiled = assignment.pickticket.compiled_with && assignment.pickticket.compiled_with.length > 0;
+                  const compiledPTs = isCompiled ? [assignment.pickticket, ...assignment.pickticket.compiled_with!] : [assignment.pickticket];
 
                   return (
                     <div
@@ -677,161 +824,177 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                       onDragStart={() => handleDragStart(index)}
                       onDragOver={(e) => handleDragOver(e, index)}
                       onDragEnd={handleDragEnd}
-                      className="bg-gray-700 p-2 md:p-4 rounded-lg border-2 border-gray-600 cursor-move hover:border-blue-500 transition-all"
+                      className={`bg-gray-700 p-2 md:p-4 rounded-lg border-2 cursor-move hover:border-blue-500 transition-all ${isCompiled ? 'border-orange-500' : 'border-gray-600'
+                        }`}
                     >
                       <div className="flex items-stretch gap-2 md:gap-4">
-                        {/* Position number - mobile */}
-                        <div className="flex md:hidden flex-shrink-0 w-8 h-8 bg-blue-900 rounded-full items-center justify-center font-bold text-sm self-start">
-                          {index + 1}
-                        </div>
-
-                        {/* Position number - desktop */}
+                        {/* Position number */}
                         <div className="hidden md:flex flex-shrink-0 w-12 h-12 bg-blue-900 rounded-full items-center justify-center font-bold text-xl">
                           {index + 1}
                         </div>
 
-                        {/* PT Info and buttons container */}
-                        <div className="flex-1 flex flex-col md:flex-row md:items-center gap-2 md:gap-4 min-w-0">
-                          {/* PT Info */}
-                          <div className="flex-1 min-w-0">
-                            <div className="flex items-center gap-2 mb-1 flex-wrap">
-                              <div className="text-base md:text-xl font-bold break-all">PT #{assignment.pickticket.pt_number}</div>
-                              <span className={`px-2 py-0.5 md:px-3 md:py-1 rounded-full text-[10px] md:text-xs font-bold ${depthColor}`}>
-                                {palletsInFront} in front ({Math.round((palletsInFront / lane.max_capacity) * 100)}%)
-                              </span>
+                        {/* PT Info Container - Can be single or multiple */}
+                        <div className="flex-1 flex flex-col gap-2 md:gap-4 min-w-0">
+                          {isCompiled && (
+                            <div className="bg-orange-600 px-3 py-1 rounded font-bold text-sm inline-block self-start">
+                              COMPILED ({compiledPTs.length} PTs)
                             </div>
-                            <div className="text-xs md:text-sm text-gray-300 break-all">
-                              {assignment.pickticket.customer} | PO: {assignment.pickticket.po_number}
-                            </div>
-                            <div className="text-xs text-gray-400 break-all">
-                              Container: {assignment.pickticket.container_number}
-                            </div>
+                          )}
 
-                            {/* Edit/Move inputs */}
-                            {editingPT && editingPT.id === assignment.id ? (
-                              <div className="flex items-center gap-2 mt-2">
-                                <input
-                                  type="text"
-                                  value={editingPT.count}
-                                  onChange={(e) => setEditingPT({ ...editingPT, count: e.target.value })}
-                                  onBlur={(e) => {
-                                    if (!e.target.value) setEditingPT({ ...editingPT, count: '1' });
-                                  }}
-                                  className="bg-gray-900 text-white p-1 md:p-2 rounded w-16 md:w-20 text-center text-sm"
-                                />
-                                <button
-                                  onClick={handleEditPalletCount}
-                                  className="bg-green-600 hover:bg-green-700 px-2 md:px-3 py-1 rounded text-xs md:text-sm"
-                                >
-                                  Save
-                                </button>
-                                <button
-                                  onClick={() => setEditingPT(null)}
-                                  className="bg-gray-600 hover:bg-gray-700 px-2 md:px-3 py-1 rounded text-xs md:text-sm"
-                                >
-                                  Cancel
-                                </button>
+                          {/* Render each PT in the compiled group */}
+                          {compiledPTs.map((pt, ptIndex) => (
+                            <div key={pt.id} className={`flex-1 ${ptIndex > 0 ? 'border-t-2 border-orange-400 pt-2' : ''}`}>
+                              <div className="flex items-center gap-2 mb-1 flex-wrap">
+                                <div className="text-base md:text-xl font-bold break-all">PT #{pt.pt_number}</div>
+                                <span className={`px-2 py-0.5 md:px-3 md:py-1 rounded-full text-[10px] md:text-xs font-bold ${depthColor}`}>
+                                  {palletsInFront} in front ({Math.round((palletsInFront / lane.max_capacity) * 100)}%)
+                                </span>
                               </div>
-                            ) : movingPT && movingPT.id === assignment.id ? (
-                              <div className="flex items-center gap-2 mt-2 relative">
-                                <input
-                                  type="text"
-                                  value={moveLaneInput}
-                                  onChange={(e) => {
-                                    setMoveLaneInput(e.target.value);
-                                    setMoveLaneError('');
-                                  }}
-                                  placeholder="Lane #"
-                                  className={`bg-gray-900 text-white p-1 md:p-2 rounded flex-1 text-sm ${moveLaneError ? 'border-2 border-red-500' : ''}`}
-                                />
-                                <button
-                                  onClick={handleMoveLane}
-                                  className="bg-green-600 hover:bg-green-700 px-2 md:px-4 py-1 md:py-2 rounded text-xs md:text-sm font-semibold"
-                                >
-                                  Move
-                                </button>
-                                <button
-                                  onClick={() => {
-                                    setMovingPT(null);
-                                    setMoveLaneInput('');
-                                    setMoveLaneError('');
-                                  }}
-                                  className="bg-gray-600 hover:bg-gray-700 px-2 md:px-3 py-1 md:py-2 rounded text-xs md:text-sm"
-                                >
-                                  ✕
-                                </button>
-                                {moveLaneError && (
-                                  <div className="absolute -bottom-6 left-0 text-red-500 text-xs md:text-sm animate-fade-in">
-                                    {moveLaneError}
-                                  </div>
-                                )}
+                              <div className="text-xs md:text-sm text-gray-300 break-all">
+                                {pt.customer} | PO: {pt.po_number}
                               </div>
-                            ) : (
-                              <>
-                                <div className="text-sm md:text-lg text-blue-400 mt-1">
-                                  {assignment.pallet_count} pallets
+                              <div className="text-xs text-gray-400 break-all">
+                                Container: {pt.container_number}
+                              </div>
+                            </div>
+                          ))}
+
+                          {/* Edit/Move inputs */}
+                          {editingPT && editingPT.id === assignment.id ? (
+                            <div className="flex items-center gap-2 mt-2">
+                              <input
+                                type="text"
+                                value={editingPT.count}
+                                onChange={(e) => setEditingPT({ ...editingPT, count: e.target.value })}
+                                onBlur={(e) => {
+                                  if (!e.target.value) setEditingPT({ ...editingPT, count: '1' });
+                                }}
+                                className="bg-gray-900 text-white p-1 md:p-2 rounded w-16 md:w-20 text-center text-sm"
+                              />
+                              <button
+                                onClick={handleEditPalletCount}
+                                className="bg-green-600 hover:bg-green-700 px-2 md:px-3 py-1 rounded text-xs md:text-sm"
+                              >
+                                Save
+                              </button>
+                              <button
+                                onClick={() => setEditingPT(null)}
+                                className="bg-gray-600 hover:bg-gray-700 px-2 md:px-3 py-1 rounded text-xs md:text-sm"
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                          ) : movingPT && movingPT.id === assignment.id ? (
+                            <div className="flex items-center gap-2 mt-2 relative">
+                              <input
+                                type="text"
+                                value={moveLaneInput}
+                                onChange={(e) => {
+                                  setMoveLaneInput(e.target.value);
+                                  setMoveLaneError('');
+                                }}
+                                placeholder="Lane #"
+                                className={`bg-gray-900 text-white p-1 md:p-2 rounded flex-1 text-sm ${moveLaneError ? 'border-2 border-red-500' : ''}`}
+                              />
+                              <button
+                                onClick={handleMoveLane}
+                                className="bg-green-600 hover:bg-green-700 px-2 md:px-4 py-1 md:py-2 rounded text-xs md:text-sm font-semibold"
+                              >
+                                Move
+                              </button>
+                              <button
+                                onClick={() => {
+                                  setMovingPT(null);
+                                  setMoveLaneInput('');
+                                  setMoveLaneError('');
+                                }}
+                                className="bg-gray-600 hover:bg-gray-700 px-2 md:px-3 py-1 md:py-2 rounded text-xs md:text-sm"
+                              >
+                                ✕
+                              </button>
+                              {moveLaneError && (
+                                <div className="absolute -bottom-6 left-0 text-red-500 text-xs md:text-sm animate-fade-in">
+                                  {moveLaneError}
                                 </div>
-                                {assignment.pickticket.status === 'ready_to_ship' && isStaging && (
-                                  <div className="mt-2 flex flex-wrap items-center gap-2">
-                                    <span className="bg-green-700 text-green-200 px-2 py-0.5 md:px-3 md:py-1 rounded-full text-[10px] md:text-sm font-semibold">
-                                      📦 Ready
-                                    </span>
-                                    {assignment.pickticket.pu_number && (
-                                      <span className="bg-blue-700 text-blue-200 px-2 py-0.5 md:px-3 md:py-1 rounded-full text-[10px] md:text-sm font-semibold">
-                                        PU: {assignment.pickticket.pu_number}
-                                      </span>
-                                    )}
-                                  </div>
-                                )}
-                                {assignment.pickticket.status === 'staged' && (
-                                  <div className="mt-2 flex flex-wrap items-center gap-2">
-                                    <span className="bg-purple-700 text-purple-200 px-2 py-0.5 md:px-3 md:py-1 rounded-full text-[10px] md:text-sm font-semibold">
-                                      📦 Staging
-                                    </span>
-                                    {assignment.pickticket.pu_number && (
-                                      <span className="bg-blue-700 text-blue-200 px-2 py-0.5 md:px-3 md:py-1 rounded-full text-[10px] md:text-sm font-semibold">
-                                        PU: {assignment.pickticket.pu_number}
-                                      </span>
-                                    )}
-                                  </div>
-                                )}
-                              </>
-                            )}
-                          </div>
-
-                          {/* Action buttons - 2x2 grid on mobile, row on desktop */}
-                          <div className="grid grid-cols-2 md:flex gap-1 md:gap-2">
-                            <button
-                              onClick={() => setEditingPT({ id: assignment.id, count: assignment.pallet_count.toString(), assignmentId: assignment.id })}
-                              className="bg-orange-600 hover:bg-orange-700 px-2 md:px-4 py-1.5 md:py-2 rounded-lg font-semibold text-xs md:text-base whitespace-nowrap"
-                            >
-                              Edit
-                            </button>
-                            <button
-                              onClick={() => {
-                                setMovingPT({ id: assignment.id, assignmentId: assignment.id, ptId: assignment.pickticket.id, ptNumber: assignment.pickticket.pt_number });
-                                fetchAllLanes();
-                              }}
-                              className="bg-yellow-600 hover:bg-yellow-700 px-2 md:px-4 py-1.5 md:py-2 rounded-lg font-semibold text-xs md:text-base whitespace-nowrap"
-                            >
-                              Move
-                            </button>
-                            <button
-                              onClick={() => setSelectedPTDetails(assignment.pickticket)}
-                              className="bg-blue-600 hover:bg-blue-700 px-2 md:px-4 py-1.5 md:py-2 rounded-lg font-semibold text-xs md:text-base whitespace-nowrap"
-                            >
-                              Details
-                            </button>
-                            <button
-                              onClick={() => handleRemovePT(assignment.id, assignment.pickticket.id)}
-                              className="bg-red-600 hover:bg-red-700 px-2 md:px-4 py-1.5 md:py-2 rounded-lg font-semibold text-xs md:text-base whitespace-nowrap"
-                            >
-                              Remove
-                            </button>
-                          </div>
+                              )}
+                            </div>
+                          ) : (
+                            <>
+                              <div className="text-sm md:text-lg text-blue-400 mt-1">
+                                {assignment.pallet_count} pallet{assignment.pallet_count !== 1 ? 's' : ''}
+                              </div>
+                              {assignment.pickticket.status === 'ready_to_ship' && isStaging && (
+                                <div className="mt-2 flex flex-wrap items-center gap-2">
+                                  <span className="bg-green-700 text-green-200 px-2 py-0.5 md:px-3 md:py-1 rounded-full text-[10px] md:text-sm font-semibold">
+                                    📦 Ready
+                                  </span>
+                                </div>
+                              )}
+                            </>
+                          )}
                         </div>
 
-                        {/* Drag handle - FULL HEIGHT on right side */}
+                        {/* Action buttons - ONE SET for entire compiled group */}
+                        <div className="grid grid-cols-2 md:flex gap-1 md:gap-2">
+                          <button
+                            onClick={() => setEditingPT({ id: assignment.id, count: assignment.pallet_count.toString(), assignmentId: assignment.id })}
+                            className="bg-orange-600 hover:bg-orange-700 px-2 md:px-4 py-1.5 md:py-2 rounded-lg font-semibold text-xs md:text-base whitespace-nowrap"
+                          >
+                            Edit
+                          </button>
+                          <button
+                            onClick={() => {
+                              setMovingPT({ id: assignment.id, assignmentId: assignment.id, ptId: assignment.pickticket.id, ptNumber: assignment.pickticket.pt_number });
+                              fetchAllLanes();
+                            }}
+                            className="bg-yellow-600 hover:bg-yellow-700 px-2 md:px-4 py-1.5 md:py-2 rounded-lg font-semibold text-xs md:text-base whitespace-nowrap"
+                          >
+                            Move
+                          </button>
+                          <button
+                            onClick={() => setSelectedPTDetails(assignment.pickticket)}
+                            className="bg-blue-600 hover:bg-blue-700 px-2 md:px-4 py-1.5 md:py-2 rounded-lg font-semibold text-xs md:text-base whitespace-nowrap"
+                          >
+                            Details
+                          </button>
+                          <button
+                            onClick={() => {
+                              if (assignment.compiled_pallet_id) {
+                                // Compiled PT - delete entire group
+                                showConfirm(
+                                  'Remove Compiled Pallet',
+                                  `This will remove ALL ${compiledPTs.length} PTs in this compiled group. Continue?`,
+                                  async () => {
+                                    try {
+                                      const { deleteCompiledPallet } = await import('@/lib/compiledPallets');
+                                      const success = await deleteCompiledPallet(assignment.compiled_pallet_id!);
+
+                                      if (success) {
+                                        showToast('Compiled pallet removed', 'success');
+                                        await fetchExistingPTs();
+                                        await checkIfStagingLane();
+                                      } else {
+                                        showToast('Failed to remove', 'error');
+                                      }
+                                    } catch (error) {
+                                      console.error('Error:', error);
+                                      showToast('Failed to remove', 'error');
+                                    }
+                                    setConfirmModal({ ...confirmModal, isOpen: false });
+                                  }
+                                );
+                              } else {
+                                // Regular PT
+                                handleRemovePT(assignment.id, assignment.pickticket.id);
+                              }
+                            }}
+                            className="bg-red-600 hover:bg-red-700 px-2 md:px-4 py-1.5 md:py-2 rounded-lg font-semibold text-xs md:text-base whitespace-nowrap"
+                          >
+                            Remove
+                          </button>
+                        </div>
+
+                        {/* Drag handle */}
                         <div className="flex flex-col justify-center items-center flex-shrink-0 bg-gray-600 cursor-move touch-none px-3 md:px-2 min-w-[40px] md:min-w-0 rounded">
                           <div className="text-gray-300 text-2xl leading-none">⋮</div>
                           <div className="text-gray-300 text-2xl leading-none">⋮</div>
@@ -939,6 +1102,7 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                       <div className="space-y-2 md:space-y-3">
                         {ptsByCustomer[customer].map(pt => {
                           const isSelected = selectedPTs[pt.id] !== undefined;
+                          const isDefunct = isPTDefunct(pt, mostRecentSync); // ADD THIS
 
                           return (
                             <div
@@ -957,14 +1121,21 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                                   className="w-4 h-4 md:w-5 md:h-5 cursor-pointer mt-0.5 md:mt-1 pointer-events-none"
                                 />
                                 <div className="flex-1 min-w-0">
-                                  <div className="font-bold text-sm md:text-base break-all">PT #{pt.pt_number}</div>
+                                  <div className="flex items-center gap-2 flex-wrap">
+                                    <div className="font-bold text-sm md:text-base break-all">PT #{pt.pt_number}</div>
+                                    {/* ADD DEFUNCT BADGE */}
+                                    {isDefunct && (
+                                      <span className="bg-red-600 px-1.5 py-0.5 rounded text-[8px] md:text-[10px] font-bold text-white">
+                                        DEFUNCT
+                                      </span>
+                                    )}
+                                  </div>
                                   <div className="text-[10px] md:text-xs text-gray-300 break-all">
                                     PO: {pt.po_number}
                                   </div>
                                   <div className="text-[10px] md:text-xs text-gray-400 break-all">
                                     Cont: {pt.container_number}
                                   </div>
-                                  {/* ADD DETAILS BUTTON */}
                                   <button
                                     onClick={(e) => {
                                       e.stopPropagation();
@@ -1001,42 +1172,211 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
               )}
 
               {/* Selected summary - ALWAYS VISIBLE */}
+              {/* Selected summary */}
               {view === 'add' && (
                 <div className="bg-gray-700 p-3 md:p-4 rounded-lg mb-4 md:mb-6">
                   <h3 className="text-sm md:text-xl font-bold mb-2 md:mb-3">Selected ({selectedPTDetails_summary.length})</h3>
                   {selectedPTDetails_summary.length > 0 ? (
-                    <div className="space-y-1 md:space-y-2 max-h-48 overflow-y-auto">
-                      {selectedPTDetails_summary.map((item, idx) => (
-                        item && (
-                          <div key={idx} className="bg-gray-800 p-2 rounded flex justify-between items-center gap-2">
-                            <div className="text-xs md:text-sm min-w-0 flex-1">
-                              <div className="font-bold break-all">PT #{item.pt.pt_number}</div>
-                              <div className="text-gray-400 break-all">
-                                {item.pt.customer} | PO: {item.pt.po_number} | Cont: {item.pt.container_number}
+                    <>
+                      <div className="space-y-1 md:space-y-2 max-h-48 overflow-y-auto">
+                        {/* Group PTs that are in compiled groups */}
+                        {(() => {
+                          const renderedPTIds = new Set<number>();
+                          const elements: React.ReactElement[] = [];
+
+                          // Render compiled groups first
+                          previewCompiledGroups.forEach(group => {
+                            const groupPTs = selectedPTDetails_summary.filter(item =>
+                              item && group.ptIds.includes(item.pt.id)
+                            );
+
+                            if (groupPTs.length === 0) return;
+
+                            groupPTs.forEach(item => renderedPTIds.add(item!.pt.id));
+
+                            elements.push(
+                              <div key={`compiled-${group.id}`} className="bg-gray-800 p-2 rounded border-2 border-orange-500">
+                                <div className="bg-orange-600 px-2 py-1 rounded text-xs font-bold mb-2 inline-block">
+                                  COMPILED ({groupPTs.length} PTs)
+                                </div>
+
+                                {/* All PTs in the group */}
+                                <div className="space-y-2">
+                                  {groupPTs.map((item, idx) => {
+                                    if (!item) return null;
+                                    const isDefunct = isPTDefunct(item.pt, mostRecentSync);
+
+                                    return (
+                                      <div key={item.pt.id} className={`${idx > 0 ? 'border-t border-orange-400 pt-2' : ''}`}>
+                                        <div className="flex justify-between items-center gap-2">
+                                          <div className="text-xs md:text-sm min-w-0 flex-1">
+                                            <div className="flex items-center gap-2 flex-wrap">
+                                              <div className="font-bold break-all">PT #{item.pt.pt_number}</div>
+                                              {isDefunct && (
+                                                <span className="bg-red-600 px-1.5 py-0.5 rounded text-[8px] font-bold text-white">
+                                                  DEFUNCT
+                                                </span>
+                                              )}
+                                            </div>
+                                            <div className="text-gray-400 break-all">
+                                              {item.pt.customer} | PO: {item.pt.po_number}
+                                            </div>
+                                          </div>
+                                          <button
+                                            onClick={(e) => {
+                                              e.stopPropagation();
+                                              setViewingSearchPTDetails(item.pt);
+                                            }}
+                                            className="text-[8px] md:text-[8px] text-blue-400 hover:text-blue-300 border rounded p-1"
+                                          >
+                                            Details
+                                          </button>
+                                        </div>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+
+                                {/* Single remove button for entire group */}
+                                <div className="flex justify-between items-center mt-2 pt-2 border-t border-orange-400">
+                                  <div className="text-orange-400 font-bold text-xs md:text-base">
+                                    {group.palletCount}p total
+                                  </div>
+                                  <button
+                                    onClick={() => {
+                                      // Remove entire group
+                                      setPreviewCompiledGroups(previewCompiledGroups.filter(g => g.id !== group.id));
+                                      group.ptIds.forEach(id => handlePTSelect(id));
+                                    }}
+                                    className="bg-red-600 hover:bg-red-700 px-2 py-1 rounded text-[10px] md:text-sm font-semibold"
+                                  >
+                                    ✕ Remove Group
+                                  </button>
+                                </div>
                               </div>
-                            </div>
-                            <div className="flex items-center gap-2 flex-shrink-0">
-                              <button
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  setViewingSearchPTDetails(item.pt);
-                                }}
-                                className="mt-1 text-[8px] md:text-[8px] text-blue-400 hover:text-blue-300 border rounded p-1"
-                              >
-                                View Details
-                              </button>
-                              <div className="text-blue-400 font-bold text-xs md:text-base">{item.pallets}p</div>
-                              <button
-                                onClick={() => handlePTSelect(item.pt.id)}
-                                className="bg-red-600 hover:bg-red-700 px-2 py-1 rounded text-[10px] md:text-sm font-semibold"
-                              >
-                                ✕
-                              </button>
-                            </div>
+                            );
+                          });
+
+                          // Render non-compiled PTs
+                          selectedPTDetails_summary.forEach((item, idx) => {
+                            if (!item || renderedPTIds.has(item.pt.id)) return;
+
+                            const isDefunct = isPTDefunct(item.pt, mostRecentSync);
+                            const isInCompilingSet = compilingPTs.has(item.pt.id);
+
+                            elements.push(
+                              <div key={idx} className="bg-gray-800 p-2 rounded flex justify-between items-center gap-2">
+                                <div className="text-xs md:text-sm min-w-0 flex-1">
+                                  <div className="flex items-center gap-2 flex-wrap">
+                                    <div className="font-bold break-all">PT #{item.pt.pt_number}</div>
+                                    {isDefunct && (
+                                      <span className="bg-red-600 px-1.5 py-0.5 rounded text-[8px] font-bold text-white">
+                                        DEFUNCT
+                                      </span>
+                                    )}
+                                  </div>
+                                  <div className="text-gray-400 break-all">
+                                    {item.pt.customer} | PO: {item.pt.po_number}
+                                  </div>
+                                </div>
+                                <div className="flex items-center gap-2 flex-shrink-0">
+                                  <button
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setViewingSearchPTDetails(item.pt);
+                                    }}
+                                    className="text-[8px] md:text-[8px] text-blue-400 hover:text-blue-300 border rounded p-1"
+                                  >
+                                    Details
+                                  </button>
+                                  <div className="text-blue-400 font-bold text-xs md:text-base">{item.pallets}p</div>
+
+                                  {/* Compile button */}
+                                  {!compilingConfirm && (
+                                    <button
+                                      onClick={() => {
+                                        if (compilingPTs.has(item.pt.id)) {
+                                          const newSet = new Set(compilingPTs);
+                                          newSet.delete(item.pt.id);
+                                          setCompilingPTs(newSet);
+                                        } else {
+                                          setCompilingPTs(new Set([...compilingPTs, item.pt.id]));
+                                        }
+                                      }}
+                                      className={`px-2 py-1 rounded text-[10px] md:text-sm font-semibold ${isInCompilingSet
+                                        ? 'bg-orange-600 hover:bg-orange-700'
+                                        : 'bg-gray-600 hover:bg-gray-500'
+                                        }`}
+                                    >
+                                      {isInCompilingSet ? 'Selected' : 'Compile'}
+                                    </button>
+                                  )}
+
+                                  {/* Compiled flat button */}
+                                  {compilingConfirm && compilingPTs.has(item.pt.id) && (
+                                    <div className="bg-orange-600 px-2 py-1 rounded text-[10px] md:text-sm font-semibold">
+                                      Compiled
+                                    </div>
+                                  )}
+
+                                  <button
+                                    onClick={() => handlePTSelect(item.pt.id)}
+                                    className="bg-red-600 hover:bg-red-700 px-2 py-1 rounded text-[10px] md:text-sm font-semibold"
+                                  >
+                                    ✕
+                                  </button>
+                                </div>
+                              </div>
+                            );
+                          });
+
+                          return elements;
+                        })()}
+                      </div>
+
+                      {/* Compile confirmation UI */}
+                      {compilingPTs.size > 0 && !compilingConfirm && (
+                        <button
+                          onClick={() => setCompilingConfirm(Date.now())}
+                          disabled={compilingPTs.size < 2}
+                          className="mt-3 w-full bg-orange-600 hover:bg-orange-700 disabled:bg-gray-600 px-4 py-2 rounded-lg font-bold"
+                        >
+                          Confirm Compile ({compilingPTs.size} PTs)
+                        </button>
+                      )}
+
+                      {compilingConfirm && (
+                        <div className="mt-3 bg-orange-900 border-2 border-orange-600 p-3 rounded-lg">
+                          <div className="flex items-center gap-3">
+                            <label className="font-semibold whitespace-nowrap">Compiled Pallet Count:</label>
+                            <input
+                              type="number"
+                              min="1"
+                              value={compiledPalletCount}
+                              onChange={(e) => setCompiledPalletCount(e.target.value)}
+                              placeholder="1"
+                              className="bg-gray-900 text-white p-2 rounded flex-1"
+                            />
+                            <button
+                              onClick={handleCompile}
+                              className="bg-green-600 hover:bg-green-700 px-4 py-2 rounded font-semibold"
+                            >
+                              Confirm
+                            </button>
+                            <button
+                              onClick={() => {
+                                setCompilingConfirm(null);
+                                setCompilingPTs(new Set());
+                                setCompiledPalletCount('');
+                              }}
+                              className="bg-gray-600 hover:bg-gray-700 px-4 py-2 rounded font-semibold"
+                            >
+                              Cancel
+                            </button>
                           </div>
-                        )
-                      ))}
-                    </div>
+                        </div>
+                      )}
+                    </>
                   ) : (
                     <div className="text-gray-400 text-xs md:text-sm">No PTs selected yet</div>
                   )}

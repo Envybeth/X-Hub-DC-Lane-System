@@ -4,7 +4,7 @@ import { isPTDefunct } from '@/lib/utils';
 
 
 interface PTDetailsProps {
-    pt: Omit<Pickticket, 'id'>;
+    pt: Omit<Pickticket, 'id'> | any;
     onClose: () => void;
     mostRecentSync?: Date | null;
 }
@@ -49,16 +49,25 @@ function isArchived(lastSynced: string): boolean {
 export default function PTDetails({ pt, onClose, mostRecentSync }: PTDetailsProps) {
     const statusInfo = getStatusInfo(pt);
     const isDefunct = isPTDefunct(pt, mostRecentSync);
+    const isCompiled = pt.compiled_with && pt.compiled_with.length > 0;
 
 
     return (
-        <div className="fixed inset-0 bg-black bg-opacity-90 flex items-center justify-center z-[100] p-4">
-            <div className="bg-gray-800 rounded-lg p-4 md:p-8 max-w-2xl w-full max-h-[90vh] overflow-y-auto">
-                <div className="flex justify-between items-center mb-4 md:mb-6">
-                    <h3 className="text-lg md:text-2xl font-bold">PT Details</h3>
+        <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-[60] p-4">
+            <div className="bg-gray-800 rounded-lg p-6 max-w-2xl w-full max-h-[90vh] overflow-y-auto">
+                <div className="flex justify-between items-start mb-4 gap-4">
+                    <div className="flex-1">
+                        <h2 className="text-xl md:text-2xl font-bold break-all">PT #{pt.pt_number}</h2>
+                        <p className="text-xs md:text-sm text-gray-400 break-all">PO: {pt.po_number}</p>
+                        {isCompiled && (
+                            <div className="bg-orange-600 px-3 py-1 rounded font-bold text-sm inline-block mt-2">
+                                COMPILED PALLET
+                            </div>
+                        )}
+                    </div>
                     <button
                         onClick={onClose}
-                        className="text-3xl md:text-4xl hover:text-red-500"
+                        className="text-3xl md:text-4xl hover:text-red-500 flex-shrink-0"
                     >
                         &times;
                     </button>
@@ -85,10 +94,28 @@ export default function PTDetails({ pt, onClose, mostRecentSync }: PTDetailsProp
                         <div className="text-xs md:text-sm text-gray-400">DC #</div>
                         <div className="break-all">{pt.store_dc || 'N/A'}</div>
                     </div>
-                    <div>
-                        <div className="text-xs md:text-sm text-gray-400">Pallets</div>
-                        <div className="font-bold text-blue-400 text-xl">{pt.actual_pallet_count || 'TBD'}</div>
-                    </div>
+                    {pt.actual_pallet_count && (
+                        <div>
+                            <div className="text-xs md:text-sm text-gray-400">
+                                {isCompiled ? 'Compiled Pallet(s)' : 'Pallets'}
+                            </div>
+                            <div className="font-bold text-purple-400">{pt.actual_pallet_count}</div>
+                        </div>
+                    )}
+                    {isCompiled && (
+                        <div className="col-span-2">
+                            <div className="text-xs md:text-sm text-gray-400 mb-2">Compiled With:</div>
+                            <div className="bg-gray-700 p-3 rounded-lg space-y-2">
+                                {pt.compiled_with!.map((compiledPT: any) => (
+                                    <div key={compiledPT.id} className="border-l-4 border-orange-500 pl-3">
+                                        <div className="font-bold">PT #{compiledPT.pt_number}</div>
+                                        <div className="text-sm text-gray-300">PO: {compiledPT.po_number}</div>
+                                        <div className="text-xs text-gray-400">{compiledPT.customer}</div>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    )}
                     {pt.qty && (
                         <div>
                             <div className="text-xs md:text-sm text-gray-400">Shipment Qty</div>
@@ -110,9 +137,9 @@ export default function PTDetails({ pt, onClose, mostRecentSync }: PTDetailsProp
                     {/* Location OR DEFUNCT */}
                     <div className="col-span-2">
                         <div className="text-xs md:text-sm text-gray-400">
-                            {isDefunct ? 'Status' : 'Location'}
+                            {isDefunct && !pt.assigned_lane ? 'Status' : 'Location'}
                         </div>
-                        {isDefunct ? (
+                        {isDefunct && !pt.assigned_lane ? (
                             <div className="bg-red-600 px-4 py-2 rounded-lg font-bold text-white inline-block text-xl">
                                 DEFUNCT
                             </div>

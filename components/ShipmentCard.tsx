@@ -5,6 +5,7 @@ import { supabase } from '@/lib/supabase';
 import ConfirmModal from './ConfirmModal';
 import PTDetails from './PTDetails';
 import { isPTDefunct } from '@/lib/utils';
+import { fetchCompiledPTInfo } from '@/lib/compiledPallets';
 
 
 export interface ShipmentPT {
@@ -23,6 +24,8 @@ export interface ShipmentPT {
   status?: string;
   ctn?: string;
   last_synced_at?: string;
+  compiled_pallet_id?: number | null;
+  compiled_with?: ShipmentPT[];
 }
 
 export interface Shipment {
@@ -170,6 +173,17 @@ export default function ShipmentCard({ shipment, onUpdate, mostRecentSync }: Shi
 
   async function fetchDepthInfo() {
     const depthMap: { [key: number]: { palletsInFront: number; maxCapacity: number } } = {};
+
+    // Fetch compiled info for all PTs
+    const ptIds = shipment.pts.map(pt => pt.id);
+    const compiledInfo = await fetchCompiledPTInfo(ptIds);
+
+    // Attach compiled_with info to each PT
+    shipment.pts.forEach(pt => {
+      if (compiledInfo[pt.id]) {
+        (pt as any).compiled_with = compiledInfo[pt.id];
+      }
+    });
 
     for (const pt of shipment.pts) {
       if (pt.assigned_lane) {
@@ -876,6 +890,7 @@ export default function ShipmentCard({ shipment, onUpdate, mostRecentSync }: Shi
                     {ptsByLane[laneKey].map(pt => {
                       const isShipped = pt.status === 'shipped';
                       const isDefunct = isPTDefunct(pt, mostRecentSync);
+                      const isCompiled = pt.compiled_with && pt.compiled_with.length > 0;
                       const depthInfo = ptDepthInfo[pt.id];
                       const depthColor = depthInfo
                         ? getDepthColor(depthInfo.palletsInFront, depthInfo.maxCapacity)
@@ -884,24 +899,28 @@ export default function ShipmentCard({ shipment, onUpdate, mostRecentSync }: Shi
                       const hasLaneAssigned = pt.assigned_lane && pt.assigned_lane !== shipment.staging_lane;
                       const isCurrentlyStaged = pt.moved_to_staging && !pt.removed_from_staging;
                       const canMoveToStaging = hasLaneAssigned && !isCurrentlyStaged && shipment.staging_lane && shipment.status !== 'finalized';
-                      
 
                       return (
                         <div
                           key={pt.id}
-                          className={`p-2 md:p-4 rounded-lg border-2 ${isShipped
-                            ? 'bg-gray-800 border-gray-600 opacity-75'
-                            : isCurrentlyStaged
-                              ? 'bg-green-900 border-green-600'
-                              : !pt.assigned_lane
-                                ? 'bg-gray-700 border-gray-600'
-                                : 'bg-gray-700 border-gray-600'
+                          className={`p-2 md:p-4 rounded-lg border-2 ${isCompiled ? 'border-orange-500' :
+                            isShipped
+                              ? 'bg-gray-800 border-gray-600 opacity-75'
+                              : isCurrentlyStaged
+                                ? 'bg-green-900 border-green-600'
+                                : !pt.assigned_lane
+                                  ? 'bg-gray-700 border-gray-600'
+                                  : 'bg-gray-700 border-gray-600'
                             }`}
                         >
                           <div className="flex flex-col md:flex-row md:items-center justify-between gap-2 md:gap-4">
                             <div className="flex-1 min-w-0">
+                              {isCompiled && (
+                                <div className="bg-orange-600 px-3 py-1 rounded font-bold text-xs mb-2 inline-block">
+                                  COMPILED ({1 + pt.compiled_with!.length} PTs)
+                                </div>
+                              )}
                               <div className="flex items-start gap-2">
-                                {/* NO emoji for shipped */}
                                 {!isShipped && isCurrentlyStaged && (
                                   <div className="text-lg md:text-2xl text-green-400 flex-shrink-0">✓</div>
                                 )}
@@ -915,7 +934,19 @@ export default function ShipmentCard({ shipment, onUpdate, mostRecentSync }: Shi
                                   <div className="text-xs md:text-sm text-gray-300 break-all">
                                     {pt.customer} | {pt.actual_pallet_count}p
                                   </div>
-                                  {/* Show lane OR "Shipped" status OR Defunct */}
+
+                                  {/* Show compiled PTs */}
+                                  {isCompiled && (
+                                    <div className="mt-2 space-y-1">
+                                      {pt.compiled_with!.map((cpt: ShipmentPT) => (
+                                        <div key={cpt.id} className="text-xs text-gray-400 pl-3 border-l-2 border-orange-500">
+                                          + PT #{cpt.pt_number} ({cpt.customer})
+                                        </div>
+                                      ))}
+                                    </div>
+                                  )}
+
+                                  {/* Show location/status */}
                                   {isDefunct ? (
                                     <div className="bg-red-600 px-3 py-1 rounded-lg font-bold text-white inline-block mt-1">
                                       DEFUNCT
@@ -926,9 +957,16 @@ export default function ShipmentCard({ shipment, onUpdate, mostRecentSync }: Shi
                                     </div>
                                   ) : pt.assigned_lane ? (
                                     <div className="flex flex-wrap items-center gap-2 mt-1 md:mt-2">
-                                      {/* ... existing lane display ... */}
+                                      <div className="text-base md:text-xl font-bold text-white">
+                                        L{pt.assigned_lane}
+                                      </div>
+                                      {!isShipped && depthInfo && (
+                                        <span className={`px-2 py-0.5 md:px-3 md:py-1 rounded-full text-[10px] md:text-xs font-bold ${depthColor}`}>
+                                          {depthInfo.palletsInFront}p ({Math.round((depthInfo.palletsInFront / depthInfo.maxCapacity) * 100)}%)
+                                        </span>
+                                      )}
                                     </div>
-                                  ) : (
+                                  ) : !isShipped && (
                                     <div className="text-xs md:text-sm text-gray-400 mt-1">
                                       NOT ASSIGNED
                                     </div>
@@ -943,7 +981,6 @@ export default function ShipmentCard({ shipment, onUpdate, mostRecentSync }: Shi
                               >
                                 Details
                               </button>
-                              {/* HIDE action buttons if shipped */}
                               {!isShipped && (
                                 <>
                                   {canMoveToStaging && (
@@ -976,8 +1013,9 @@ export default function ShipmentCard({ shipment, onUpdate, mostRecentSync }: Shi
         {/* PT Details Modal */}
         {selectedPTDetails && (
           <PTDetails
-            pt={selectedPTDetails}
+            pt={selectedPTDetails as any}
             onClose={() => setSelectedPTDetails(null)}
+            mostRecentSync={mostRecentSync}
           />
         )}
       </div>

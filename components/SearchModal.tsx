@@ -5,6 +5,7 @@ import { supabase } from '@/lib/supabase';
 import PTDetails from './PTDetails';
 import { Pickticket } from '@/types/pickticket';
 import { isPTDefunct } from '@/lib/utils';
+import { fetchCompiledPTInfo } from '@/lib/compiledPallets';
 
 interface SearchModalProps {
   onClose: () => void;
@@ -38,7 +39,7 @@ export default function SearchModal({ onClose, mostRecentSync }: SearchModalProp
     try {
       let query = supabase
         .from('picktickets')
-        .select('id, pt_number, po_number, customer, assigned_lane, container_number, store_dc, start_date, cancel_date, actual_pallet_count, ctn, status, pu_number, qty, last_synced_at');
+        .select('id, pt_number, po_number, customer, assigned_lane, container_number, store_dc, start_date, cancel_date, actual_pallet_count, ctn, status, pu_number, qty, last_synced_at, compiled_pallet_id');
 
       const searchValue = searchQuery.trim();
 
@@ -55,8 +56,19 @@ export default function SearchModal({ onClose, mostRecentSync }: SearchModalProp
       if (error) {
         console.error('Search error:', error);
       } else if (data) {
+        // Fetch compiled info for all PTs
+        const ptIds = data.map(pt => pt.id);
+        const compiledInfo = await fetchCompiledPTInfo(ptIds);
+
+        // Attach compiled_with to each PT
+        // Attach compiled_with to each PT
+        data.forEach(pt => {
+          if (compiledInfo[pt.id]) {
+            (pt as any).compiled_with = compiledInfo[pt.id];
+          }
+        });
+
         if (searchType === 'CONTAINER') {
-          // Group by container
           const grouped = data.reduce((acc, pt) => {
             const containerNum = pt.container_number;
             const existing = acc.find(g => g.container_number === containerNum);
@@ -101,11 +113,17 @@ export default function SearchModal({ onClose, mostRecentSync }: SearchModalProp
     });
   }
 
-  function PTResultCard({ pt }: { pt: Pickticket }) {
+  function PTResultCard({ pt, mostRecentSync }: { pt: Pickticket; mostRecentSync?: Date | null }) {
     const isDefunct = isPTDefunct(pt, mostRecentSync);
+    const isCompiled = pt.compiled_with && pt.compiled_with.length > 0;
 
     return (
-      <div className="bg-gray-800 p-4 rounded-lg border-2 border-gray-600">
+      <div className={`bg-gray-800 p-4 rounded-lg border-2 ${isCompiled ? 'border-orange-500' : 'border-gray-600'}`}>
+        {isCompiled && (
+          <div className="bg-orange-600 px-3 py-1 rounded font-bold text-sm inline-block mb-2">
+            COMPILED ({1 + pt.compiled_with!.length} PTs)
+          </div>
+        )}
         <div className="flex justify-between items-start gap-4">
           <div className="flex-1 grid grid-cols-2 gap-4">
             <div>
@@ -121,8 +139,8 @@ export default function SearchModal({ onClose, mostRecentSync }: SearchModalProp
               <div className="text-lg">{pt.customer}</div>
             </div>
             <div>
-              <div className="text-sm text-gray-400">{isDefunct ? 'Status' : 'Location'}</div>
-              {isDefunct ? (
+              <div className="text-sm text-gray-400">{isDefunct && !pt.assigned_lane? 'Status' : 'Location'}</div>
+              {isDefunct && !pt.assigned_lane ? (
                 <div className="bg-red-600 px-3 py-1 rounded-lg font-bold text-white inline-block">
                   DEFUNCT
                 </div>
@@ -140,20 +158,38 @@ export default function SearchModal({ onClose, mostRecentSync }: SearchModalProp
             Details
           </button>
         </div>
+        {isCompiled && (
+          <div className="mt-3 pt-3 border-t border-gray-600">
+            <div className="text-xs text-gray-400 mb-2">Compiled with:</div>
+            <div className="space-y-1">
+              {pt.compiled_with!.map(cpt => (
+                <div key={cpt.id} className="text-sm text-gray-300">
+                  • PT #{cpt.pt_number} ({cpt.customer})
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
     );
   }
 
-  function PTCompactCard({ pt }: { pt: Pickticket }) {
+  function PTCompactCard({ pt, mostRecentSync }: { pt: Pickticket; mostRecentSync?: Date | null }) {
     const isDefunct = isPTDefunct(pt, mostRecentSync);
+    const isCompiled = pt.compiled_with && pt.compiled_with.length > 0;
 
     return (
-      <div className="bg-gray-800 p-3 rounded-lg border-2 border-gray-600">
+      <div className={`bg-gray-800 p-3 rounded-lg border-2 ${isCompiled ? 'border-orange-500' : 'border-gray-600'}`}>
+        {isCompiled && (
+          <div className="bg-orange-600 px-2 py-0.5 rounded text-xs font-bold text-white inline-block mb-1">
+            COMPILED
+          </div>
+        )}
         <div className="flex justify-between items-start gap-2">
           <div className="flex-1">
             <div className="font-bold">PT #{pt.pt_number}</div>
             <div className="text-xs text-gray-300">PO: {pt.po_number}</div>
-            {isDefunct ? (
+            {isDefunct && !pt.assigned_lane ? (
               <div className="bg-red-600 px-2 py-1 rounded text-xs font-bold text-white inline-block mt-1">
                 DEFUNCT
               </div>

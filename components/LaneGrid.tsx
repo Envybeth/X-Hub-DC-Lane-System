@@ -3,6 +3,7 @@
 import { useState, useEffect } from 'react';
 import { supabase } from '@/lib/supabase';
 import AssignModal from './AssignModal';
+import { fetchCompiledPTInfo } from '@/lib/compiledPallets';
 
 interface Lane {
   id: number;
