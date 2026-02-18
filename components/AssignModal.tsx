@@ -1347,32 +1347,34 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
 
                       {compilingConfirm && (
                         <div className="mt-3 bg-orange-900 border-2 border-orange-600 p-3 rounded-lg">
-                          <div className="flex items-center gap-3">
-                            <label className="font-semibold whitespace-nowrap">Compiled Pallet Count:</label>
-                            <input
-                              type="number"
-                              min="1"
-                              value={compiledPalletCount}
-                              onChange={(e) => setCompiledPalletCount(e.target.value)}
-                              placeholder="1"
-                              className="bg-gray-900 text-white p-2 rounded flex-1"
-                            />
-                            <button
-                              onClick={handleCompile}
-                              className="bg-green-600 hover:bg-green-700 px-4 py-2 rounded font-semibold"
-                            >
-                              Confirm
-                            </button>
-                            <button
-                              onClick={() => {
-                                setCompilingConfirm(null);
-                                setCompilingPTs(new Set());
-                                setCompiledPalletCount('');
-                              }}
-                              className="bg-gray-600 hover:bg-gray-700 px-4 py-2 rounded font-semibold"
-                            >
-                              Cancel
-                            </button>
+                          <div className="flex flex-col gap-2">
+                            <label className="font-semibold text-sm">Compiled Pallet Count:</label>
+                            <div className="flex items-center gap-2">
+                              <input
+                                type="number"
+                                min="1"
+                                value={compiledPalletCount}
+                                onChange={(e) => setCompiledPalletCount(e.target.value)}
+                                placeholder="1"
+                                className="bg-gray-900 text-white p-2 rounded w-20 md:flex-1 text-center"
+                              />
+                              <button
+                                onClick={handleCompile}
+                                className="flex-1 md:flex-none bg-green-600 hover:bg-green-700 px-3 md:px-4 py-2 rounded font-semibold text-sm md:text-base"
+                              >
+                                Confirm
+                              </button>
+                              <button
+                                onClick={() => {
+                                  setCompilingConfirm(null);
+                                  setCompilingPTs(new Set());
+                                  setCompiledPalletCount('');
+                                }}
+                                className="flex-1 md:flex-none bg-gray-600 hover:bg-gray-700 px-3 md:px-4 py-2 rounded font-semibold text-sm md:text-base"
+                              >
+                                Cancel
+                              </button>
+                            </div>
                           </div>
                         </div>
                       )}
