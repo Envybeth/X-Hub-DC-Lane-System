@@ -4,6 +4,8 @@ import { useState, useEffect } from 'react';
 import { supabase } from '@/lib/supabase';
 import ConfirmModal from './ConfirmModal';
 import PTDetails from './PTDetails';
+import { isPTDefunct } from '@/lib/utils';
+
 
 export interface ShipmentPT {
   id: number;
@@ -20,6 +22,7 @@ export interface ShipmentPT {
   removed_from_staging?: boolean;
   status?: string;
   ctn?: string;
+  last_synced_at?: string;
 }
 
 export interface Shipment {
@@ -35,17 +38,17 @@ export interface Shipment {
 export interface ShipmentCardProps {
   shipment: Shipment;
   onUpdate: () => void;
+  mostRecentSync?: Date | null;
 }
 
-export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) {
+
+export default function ShipmentCard({ shipment, onUpdate, mostRecentSync }: ShipmentCardProps) {
   const [expanded, setExpanded] = useState(false);
   const [selectingLane, setSelectingLane] = useState(false);
   const [selectedLaneInput, setSelectedLaneInput] = useState('');
   const [selectedPTDetails, setSelectedPTDetails] = useState<ShipmentPT | null>(null);
   const [ptDepthInfo, setPtDepthInfo] = useState<{ [key: number]: { palletsInFront: number; maxCapacity: number } }>({});
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
-  const [editingStatus, setEditingStatus] = useState(false);
-  const [newStatus, setNewStatus] = useState<'not_started' | 'in_process' | 'finalized'>(shipment.status);
   const [changingStagingLane, setChangingStagingLane] = useState(false);
   const [newStagingLane, setNewStagingLane] = useState('');
   const [stagingLaneError, setStagingLaneError] = useState('');
@@ -452,26 +455,6 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
     }
   }
 
-  async function handleUpdateStatus() {
-    try {
-      await supabase
-        .from('shipments')
-        .update({
-          status: newStatus,
-          updated_at: new Date().toISOString()
-        })
-        .eq('pu_number', shipment.pu_number)
-        .eq('pu_date', shipment.pu_date);
-
-      showToast('Status updated', 'success');
-      setEditingStatus(false);
-      onUpdate();
-    } catch (error) {
-      console.error('Error updating status:', error);
-      showToast('Failed to update', 'error');
-    }
-  }
-
   async function handleMovePT(pt: ShipmentPT) {
     if (!shipment.staging_lane) {
       showToast('Select staging lane first', 'error');
@@ -833,13 +816,12 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
                               .delete()
                               .in('pt_id', ptIds);
 
-                            // Update PTs to shipped status
+                            // This is ARCHIVING - CHANGE this one
                             await supabase
                               .from('picktickets')
                               .update({
-                                assigned_lane: null,
-                                actual_pallet_count: null,
                                 status: 'shipped'
+                                // ✅ REMOVE the lines that clear assigned_lane and actual_pallet_count
                               })
                               .in('id', ptIds);
 
@@ -869,19 +851,31 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
               {sortedLanes.map(laneKey => {
                 const isStaging = laneKey.startsWith('staging_');
                 const actualLaneNumber = isStaging ? laneKey.replace('staging_', '') : laneKey;
+                const isUnassigned = laneKey === 'unassigned';
+
+                // Check if this group has any shipped PTs
+                const hasShippedPTs = ptsByLane[laneKey].some(pt => pt.status === 'shipped');
 
                 return (
                   <div key={laneKey} className="space-y-2 md:space-y-3">
-                    {isStaging ? (
-                      <h4 className="text-lg md:text-2xl font-bold text-purple-400 border-b-2 border-purple-700 pb-2">
-                        📦 STAGING (L{actualLaneNumber}) - {ptsByLane[laneKey].length}
-                      </h4>
-                    ) : (
-                      <h4 className="text-sm md:text-lg font-semibold text-blue-400 border-b border-blue-700 pb-2">
-                        {laneKey === 'unassigned' ? '⚠️ Unassigned' : `L${laneKey} (${ptsByLane[laneKey].length})`}
-                      </h4>
+                    {/* ONLY show header if NOT all shipped */}
+                    {!hasShippedPTs && (
+                      <>
+                        {isStaging ? (
+                          <h4 className="text-lg md:text-2xl font-bold text-purple-400 border-b-2 border-purple-700 pb-2">
+                            📦 STAGING (L{actualLaneNumber}) - {ptsByLane[laneKey].length}
+                          </h4>
+                        ) : (
+                          <h4 className="text-sm md:text-lg font-semibold text-blue-400 border-b border-blue-700 pb-2">
+                            {isUnassigned ? '⚠️ Unassigned' : `L${laneKey} (${ptsByLane[laneKey].length})`}
+                          </h4>
+                        )}
+                      </>
                     )}
+
                     {ptsByLane[laneKey].map(pt => {
+                      const isShipped = pt.status === 'shipped';
+                      const isDefunct = isPTDefunct(pt, mostRecentSync);
                       const depthInfo = ptDepthInfo[pt.id];
                       const depthColor = depthInfo
                         ? getDepthColor(depthInfo.palletsInFront, depthInfo.maxCapacity)
@@ -890,24 +884,28 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
                       const hasLaneAssigned = pt.assigned_lane && pt.assigned_lane !== shipment.staging_lane;
                       const isCurrentlyStaged = pt.moved_to_staging && !pt.removed_from_staging;
                       const canMoveToStaging = hasLaneAssigned && !isCurrentlyStaged && shipment.staging_lane && shipment.status !== 'finalized';
-                      const isShipped = pt.status === 'shipped';
+                      
+
                       return (
                         <div
                           key={pt.id}
-                          className={`p-2 md:p-4 rounded-lg border-2 ${isCurrentlyStaged
-                            ? 'bg-green-900 border-green-600'
-                            : !pt.assigned_lane
-                              ? 'bg-gray-700 border-gray-600'
-                              : 'bg-gray-700 border-gray-600'
+                          className={`p-2 md:p-4 rounded-lg border-2 ${isShipped
+                            ? 'bg-gray-800 border-gray-600 opacity-75'
+                            : isCurrentlyStaged
+                              ? 'bg-green-900 border-green-600'
+                              : !pt.assigned_lane
+                                ? 'bg-gray-700 border-gray-600'
+                                : 'bg-gray-700 border-gray-600'
                             }`}
                         >
                           <div className="flex flex-col md:flex-row md:items-center justify-between gap-2 md:gap-4">
                             <div className="flex-1 min-w-0">
                               <div className="flex items-start gap-2">
-                                {isCurrentlyStaged && (
+                                {/* NO emoji for shipped */}
+                                {!isShipped && isCurrentlyStaged && (
                                   <div className="text-lg md:text-2xl text-green-400 flex-shrink-0">✓</div>
                                 )}
-                                {!pt.assigned_lane && (
+                                {!isShipped && !pt.assigned_lane && (
                                   <div className="text-lg md:text-2xl text-yellow-400 flex-shrink-0">⚠️</div>
                                 )}
                                 <div className="flex-1 min-w-0">
@@ -917,19 +915,20 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
                                   <div className="text-xs md:text-sm text-gray-300 break-all">
                                     {pt.customer} | {pt.actual_pallet_count}p
                                   </div>
-                                  {pt.assigned_lane && (
-                                    <div className="flex flex-wrap items-center gap-2 mt-1 md:mt-2">
-                                      <div className="text-base md:text-xl font-bold text-white">
-                                        L{pt.assigned_lane}
-                                      </div>
-                                      {depthInfo && (
-                                        <span className={`px-2 py-0.5 md:px-3 md:py-1 rounded-full text-[10px] md:text-xs font-bold ${depthColor}`}>
-                                          {depthInfo.palletsInFront}p ({Math.round((depthInfo.palletsInFront / depthInfo.maxCapacity) * 100)}%)
-                                        </span>
-                                      )}
+                                  {/* Show lane OR "Shipped" status OR Defunct */}
+                                  {isDefunct ? (
+                                    <div className="bg-red-600 px-3 py-1 rounded-lg font-bold text-white inline-block mt-1">
+                                      DEFUNCT
                                     </div>
-                                  )}
-                                  {!pt.assigned_lane && (
+                                  ) : isShipped ? (
+                                    <div className="text-base md:text-xl font-bold text-green-400 mt-1">
+                                      ✈️ Shipped
+                                    </div>
+                                  ) : pt.assigned_lane ? (
+                                    <div className="flex flex-wrap items-center gap-2 mt-1 md:mt-2">
+                                      {/* ... existing lane display ... */}
+                                    </div>
+                                  ) : (
                                     <div className="text-xs md:text-sm text-gray-400 mt-1">
                                       NOT ASSIGNED
                                     </div>
@@ -944,18 +943,23 @@ export default function ShipmentCard({ shipment, onUpdate }: ShipmentCardProps) 
                               >
                                 Details
                               </button>
-                              {canMoveToStaging && (
-                                <button
-                                  onClick={() => handleMovePT(pt)}
-                                  className="bg-green-600 hover:bg-green-700 px-2 md:px-4 py-1.5 md:py-2 rounded-lg font-semibold text-xs md:text-base whitespace-nowrap"
-                                >
-                                  ✓ Stage
-                                </button>
-                              )}
-                              {!pt.assigned_lane && !isShipped && (
-                                <div className="bg-yellow-700 px-2 md:px-4 py-1.5 md:py-2 rounded-lg text-xs md:text-sm font-semibold whitespace-nowrap">
-                                  Assign first
-                                </div>
+                              {/* HIDE action buttons if shipped */}
+                              {!isShipped && (
+                                <>
+                                  {canMoveToStaging && (
+                                    <button
+                                      onClick={() => handleMovePT(pt)}
+                                      className="bg-green-600 hover:bg-green-700 px-2 md:px-4 py-1.5 md:py-2 rounded-lg font-semibold text-xs md:text-base whitespace-nowrap"
+                                    >
+                                      ✓ Stage
+                                    </button>
+                                  )}
+                                  {!pt.assigned_lane && (
+                                    <div className="bg-yellow-700 px-2 md:px-4 py-1.5 md:py-2 rounded-lg text-xs md:text-sm font-semibold whitespace-nowrap">
+                                      Assign first
+                                    </div>
+                                  )}
+                                </>
                               )}
                             </div>
                           </div>

@@ -3,29 +3,14 @@
 import { useState, useEffect } from 'react';
 import { supabase } from '@/lib/supabase';
 import PTDetails from '@/components/PTDetails';
+import { Pickticket } from '@/types/pickticket';
+
 import Link from 'next/link';
 
-interface PT {
-    id: number;
-    pt_number: string;
-    po_number: string;
-    customer: string;
-    container_number: string;
-    store_dc: string;
-    start_date: string;
-    cancel_date: string;
-    actual_pallet_count: number | null;
-    ctn?: string;
-    status?: string;
-    assigned_lane: string | null;
-    sample_checked?: boolean;
-    sample_labeled?: boolean;
-    sample_shipped?: boolean;
-}
 
 interface ContainerGroup {
     container_number: string;
-    pts: PT[];
+    pts: Pickticket[];
     allChecked: boolean;
 }
 
@@ -33,7 +18,7 @@ export default function SamplesPage() {
     const [containers, setContainers] = useState<ContainerGroup[]>([]);
     const [expandedContainers, setExpandedContainers] = useState<Set<string>>(new Set());
     const [loading, setLoading] = useState(true);
-    const [viewingPTDetails, setViewingPTDetails] = useState<PT | null>(null);
+    const [viewingPTDetails, setViewingPTDetails] = useState<Pickticket | null>(null);
     const [showConfirm, setShowConfirm] = useState<{
         isOpen: boolean;
         ptId: number;
@@ -55,7 +40,7 @@ export default function SamplesPage() {
                 .order('container_number');
 
             if (pts) {
-                const grouped = pts.reduce((acc: ContainerGroup[], pt: PT) => {
+                const grouped = pts.reduce((acc: ContainerGroup[], pt: Pickticket) => {
                     const container = pt.container_number || 'NO CONTAINER';
                     const existing = acc.find((g: ContainerGroup) => g.container_number === container);
 
@@ -72,7 +57,7 @@ export default function SamplesPage() {
                 }, [] as ContainerGroup[]);
 
                 grouped.forEach((group: ContainerGroup) => {
-                    group.allChecked = group.pts.every((pt: PT) =>
+                    group.allChecked = group.pts.every((pt: Pickticket) =>
                         pt.sample_checked === true &&
                         pt.sample_labeled === true &&
                         pt.sample_shipped === true
@@ -100,7 +85,7 @@ export default function SamplesPage() {
         });
     }
 
-    async function handleCheckToggle(pt: PT, currentValue: boolean) {
+    async function handleCheckToggle(pt: Pickticket, currentValue: boolean) {
         if (currentValue) {
             setShowConfirm({
                 isOpen: true,
@@ -114,7 +99,7 @@ export default function SamplesPage() {
         await updateStatus(pt.id, 'sample_checked', true);
     }
 
-    async function handleLabeledToggle(pt: PT, currentValue: boolean) {
+    async function handleLabeledToggle(pt: Pickticket, currentValue: boolean) {
         if (currentValue) {
             setShowConfirm({
                 isOpen: true,
@@ -128,7 +113,7 @@ export default function SamplesPage() {
         await updateStatus(pt.id, 'sample_labeled', true);
     }
 
-    async function handleShippedToggle(pt: PT, currentValue: boolean) {
+    async function handleShippedToggle(pt: Pickticket, currentValue: boolean) {
         if (currentValue) {
             setShowConfirm({
                 isOpen: true,
@@ -221,7 +206,7 @@ export default function SamplesPage() {
                                                 </div>
                                                 <div className="text-sm text-gray-400 mt-1">
                                                     {group.pts.length} PT{group.pts.length !== 1 ? 's' : ''} •
-                                                    {group.pts.filter((pt: PT) => pt.sample_checked && pt.sample_labeled && pt.sample_shipped).length} complete
+                                                    {group.pts.filter((pt: Pickticket) => pt.sample_checked && pt.sample_labeled && pt.sample_shipped).length} complete
                                                 </div>
                                             </div>
                                         </div>
@@ -234,7 +219,7 @@ export default function SamplesPage() {
 
                                     {isExpanded && (
                                         <div className="p-6 border-t-2 border-gray-700 space-y-3">
-                                            {group.pts.map((pt: PT) => (
+                                            {group.pts.map((pt: Pickticket) => (
                                                 <div
                                                     key={pt.id}
                                                     className="bg-gray-700 p-4 rounded-lg flex items-center justify-between gap-4"

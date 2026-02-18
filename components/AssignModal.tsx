@@ -4,6 +4,8 @@ import { useState, useEffect } from 'react';
 import { supabase } from '@/lib/supabase';
 import ConfirmModal from './ConfirmModal';
 import PTDetails from './PTDetails';
+import { Pickticket } from '@/types/pickticket';
+
 
 interface Lane {
   lane_number: string;
@@ -13,22 +15,6 @@ interface Lane {
 
 interface Container {
   container_number: string;
-}
-
-interface Pickticket {
-  id: number;
-  pt_number: string;
-  po_number: string;
-  customer: string;
-  container_number: string;
-  assigned_lane: string | null;
-  store_dc: string;
-  start_date: string;
-  cancel_date: string;
-  actual_pallet_count: number;
-  status?: string;
-  pu_number?: string;
-  ctn?: string;
 }
 
 interface LaneAssignment {
@@ -164,7 +150,7 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
     const { data: assignments } = await supabase
       .from('lane_assignments')
       .select(`
-        id,
+      id,
       pallet_count,
       order_position,
       picktickets (
@@ -177,11 +163,14 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
         start_date,
         cancel_date,
         actual_pallet_count,
+        assigned_lane,
         status,
         pu_number,
-        ctn
-        )
-      `)
+        ctn,
+        qty,
+        last_synced_at
+      )
+    `)
       .eq('lane_number', lane.lane_number)
       .order('order_position', { ascending: true });
 
@@ -207,12 +196,29 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
   }
 
   async function fetchAllUnassignedPTs() {
+    // Get most recent sync date first
+    const { data: recentPT } = await supabase
+      .from('picktickets')
+      .select('last_synced_at')
+      .order('last_synced_at', { ascending: false })
+      .limit(1)
+      .single();
+
+    const mostRecentSync = recentPT?.last_synced_at
+      ? new Date(recentPT.last_synced_at)
+      : null;
+
+    const oneDayAgo = mostRecentSync
+      ? new Date(mostRecentSync.getTime() - 1 * 24 * 60 * 60 * 1000).toISOString()  // CHANGED from 2 days to 1 day
+      : null;
+
     const { data } = await supabase
       .from('picktickets')
       .select('*')
       .is('assigned_lane', null)
       .neq('status', 'shipped')
-      .neq('customer', 'PAPER') // ADD THIS
+      .neq('customer', 'PAPER')
+      .gte('last_synced_at', oneDayAgo) // Exclude defunct
       .order('pt_number');
 
     if (data) {
@@ -222,13 +228,30 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
   }
 
   async function fetchPickticketsByContainer(containerNumber: string) {
+    // Get most recent sync date first
+    const { data: recentPT } = await supabase
+      .from('picktickets')
+      .select('last_synced_at')
+      .order('last_synced_at', { ascending: false })
+      .limit(1)
+      .single();
+
+    const mostRecentSync = recentPT?.last_synced_at
+      ? new Date(recentPT.last_synced_at)
+      : null;
+
+    const oneDayAgo = mostRecentSync
+      ? new Date(mostRecentSync.getTime() - 1 * 24 * 60 * 60 * 1000).toISOString()  // CHANGED from 2 days to 1 day
+      : null;
+
     const { data } = await supabase
       .from('picktickets')
       .select('*')
       .eq('container_number', containerNumber)
       .is('assigned_lane', null)
       .neq('status', 'shipped')
-      .neq('customer', 'PAPER') // ADD THIS
+      .neq('customer', 'PAPER')
+      .gte('last_synced_at', oneDayAgo) // Exclude defunct
       .order('pt_number');
 
     if (data) setPicktickets(data);

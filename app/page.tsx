@@ -20,13 +20,13 @@ export default function Home() {
   async function checkLastSync() {
     const { data } = await supabase
       .from('picktickets')
-      .select('created_at')
-      .order('created_at', { ascending: false })
+      .select('last_synced_at')  // CHANGE from 'created_at' to 'last_synced_at'
+      .order('last_synced_at', { ascending: false })
       .limit(1)
       .single();
 
     if (data) {
-      setLastSync(new Date(data.created_at));
+      setLastSync(new Date(data.last_synced_at));  // CHANGE to last_synced_at
     }
   }
 
@@ -107,7 +107,7 @@ export default function Home() {
         <LaneGrid />
       </div>
 
-      {showSearch && <SearchModal onClose={() => setShowSearch(false)} />}
+      {showSearch && <SearchModal onClose={() => setShowSearch(false)} mostRecentSync={lastSync} />}
 
       {/* PT Details Modal */}
       {viewingPTDetails && (

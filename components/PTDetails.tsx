@@ -1,25 +1,12 @@
 'use client';
+import { Pickticket } from '@/types/pickticket';
+import { isPTDefunct } from '@/lib/utils';
+
 
 interface PTDetailsProps {
-    pt: {
-        pt_number: string;
-        po_number: string;
-        customer: string;
-        store_dc: string;
-        container_number: string;
-        start_date: string;
-        cancel_date: string;
-        actual_pallet_count: number | null;
-        assigned_lane: string | null;
-        status?: string;
-        qty?: number | null;
-        ctn?: string;
-        sample_checked?: boolean;
-        sample_labeled?: boolean;
-        sample_shipped?: boolean;
-        last_synced_at?: string;
-    };
+    pt: Omit<Pickticket, 'id'>;
     onClose: () => void;
+    mostRecentSync?: Date | null;
 }
 
 function getStatusInfo(pt: PTDetailsProps['pt']): { label: string; color: string } {
@@ -59,8 +46,9 @@ function isArchived(lastSynced: string): boolean {
     return new Date(lastSynced) < sevenDaysAgo;
 }
 
-export default function PTDetails({ pt, onClose }: PTDetailsProps) {
+export default function PTDetails({ pt, onClose, mostRecentSync }: PTDetailsProps) {
     const statusInfo = getStatusInfo(pt);
+    const isDefunct = isPTDefunct(pt, mostRecentSync);
 
 
     return (
@@ -99,7 +87,7 @@ export default function PTDetails({ pt, onClose }: PTDetailsProps) {
                     </div>
                     <div>
                         <div className="text-xs md:text-sm text-gray-400">Pallets</div>
-                        <div className="font-bold text-blue-400">{pt.actual_pallet_count || 'TBD'}</div>
+                        <div className="font-bold text-blue-400 text-xl">{pt.actual_pallet_count || 'TBD'}</div>
                     </div>
                     {pt.qty && (
                         <div>
@@ -119,18 +107,30 @@ export default function PTDetails({ pt, onClose }: PTDetailsProps) {
                         <div className="text-xs md:text-sm text-gray-400">Container</div>
                         <div className="break-all">{pt.container_number}</div>
                     </div>
+                    {/* Location OR DEFUNCT */}
                     <div className="col-span-2">
-                        <div className="text-xs md:text-sm text-gray-400">Location</div>
-                        <div className="font-bold text-blue-400">
-                            {pt.assigned_lane ? `Lane ${pt.assigned_lane}` : 'Unassigned'}
+                        <div className="text-xs md:text-sm text-gray-400">
+                            {isDefunct ? 'Status' : 'Location'}
                         </div>
+                        {isDefunct ? (
+                            <div className="bg-red-600 px-4 py-2 rounded-lg font-bold text-white inline-block text-xl">
+                                DEFUNCT
+                            </div>
+                        ) : (
+                            <div className="text-base md:text-2xl text-green-500 font-bold">
+                                {pt.assigned_lane ? `Lane ${pt.assigned_lane}` : 'Not Assigned'}
+                            </div>
+                        )}
                     </div>
-                    <div className="col-span-2">
-                        <div className="text-xs md:text-sm text-gray-400">Status</div>
-                        <div className={`inline-block px-3 py-1 rounded-lg font-bold text-sm ${statusInfo.color}`}>
-                            {statusInfo.label}
+                    {!isDefunct &&
+                        <div className="col-span-2">
+                            <div className="text-xs md:text-sm text-gray-400">Status</div>
+                            <div className={`inline-block px-3 py-1 rounded-lg font-bold text-sm ${statusInfo.color}`}>
+                                {statusInfo.label}
+                            </div>
                         </div>
-                    </div>
+                    }
+
 
                     {pt.last_synced_at && (
                         <div className="col-span-2">

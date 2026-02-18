@@ -3,40 +3,28 @@
 import { useState } from 'react';
 import { supabase } from '@/lib/supabase';
 import PTDetails from './PTDetails';
+import { Pickticket } from '@/types/pickticket';
+import { isPTDefunct } from '@/lib/utils';
 
 interface SearchModalProps {
   onClose: () => void;
-}
-
-interface SearchResult {
-  id: number;
-  pt_number: string;
-  po_number: string;
-  customer: string;
-  assigned_lane: string | null;
-  container_number: string;
-  store_dc: string;
-  start_date: string;
-  cancel_date: string;
-  actual_pallet_count: number | null;
-  ctn?: string;
-  status?: string;
+  mostRecentSync?: Date | null;
 }
 
 interface ContainerGroup {
   container_number: string;
-  pts: SearchResult[];
+  pts: Pickticket[];
 }
 
-export default function SearchModal({ onClose }: SearchModalProps) {
+export default function SearchModal({ onClose, mostRecentSync }: SearchModalProps) {
   const [searchType, setSearchType] = useState<'PT' | 'PO' | 'CONTAINER'>('PT');
   const [searchQuery, setSearchQuery] = useState('');
-  const [results, setResults] = useState<SearchResult[]>([]);
+  const [results, setResults] = useState<Pickticket[]>([]);
   const [containerGroups, setContainerGroups] = useState<ContainerGroup[]>([]);
   const [expandedContainers, setExpandedContainers] = useState<Set<string>>(new Set());
   const [searching, setSearching] = useState(false);
   const [searched, setSearched] = useState(false);
-  const [viewingPTDetails, setViewingPTDetails] = useState<SearchResult | null>(null);
+  const [viewingPTDetails, setViewingPTDetails] = useState<Pickticket | null>(null);
 
   async function handleSearch() {
     if (!searchQuery.trim()) return;
@@ -46,11 +34,11 @@ export default function SearchModal({ onClose }: SearchModalProps) {
     setResults([]);
     setContainerGroups([]);
     setExpandedContainers(new Set());
-    
+
     try {
       let query = supabase
         .from('picktickets')
-        .select('id, pt_number, po_number, customer, assigned_lane, container_number, store_dc, start_date, cancel_date, actual_pallet_count, ctn, status');
+        .select('id, pt_number, po_number, customer, assigned_lane, container_number, store_dc, start_date, cancel_date, actual_pallet_count, ctn, status, pu_number, qty, last_synced_at');
 
       const searchValue = searchQuery.trim();
 
@@ -82,7 +70,7 @@ export default function SearchModal({ onClose }: SearchModalProps) {
             }
             return acc;
           }, [] as ContainerGroup[]);
-          
+
           setContainerGroups(grouped);
         } else {
           setResults(data);
@@ -113,7 +101,9 @@ export default function SearchModal({ onClose }: SearchModalProps) {
     });
   }
 
-  function PTResultCard({ pt }: { pt: SearchResult }) {
+  function PTResultCard({ pt }: { pt: Pickticket }) {
+    const isDefunct = isPTDefunct(pt, mostRecentSync);
+
     return (
       <div className="bg-gray-800 p-4 rounded-lg border-2 border-gray-600">
         <div className="flex justify-between items-start gap-4">
@@ -131,10 +121,16 @@ export default function SearchModal({ onClose }: SearchModalProps) {
               <div className="text-lg">{pt.customer}</div>
             </div>
             <div>
-              <div className="text-sm text-gray-400">Location</div>
-              <div className={`text-lg font-bold ${pt.assigned_lane ? 'text-green-400' : 'text-yellow-400'}`}>
-                {pt.assigned_lane ? `Lane ${pt.assigned_lane}` : 'Not assigned'}
-              </div>
+              <div className="text-sm text-gray-400">{isDefunct ? 'Status' : 'Location'}</div>
+              {isDefunct ? (
+                <div className="bg-red-600 px-3 py-1 rounded-lg font-bold text-white inline-block">
+                  DEFUNCT
+                </div>
+              ) : (
+                <div className={`text-lg font-bold ${pt.assigned_lane ? 'text-green-400' : 'text-yellow-400'}`}>
+                  {pt.assigned_lane ? `Lane ${pt.assigned_lane}` : 'Not assigned'}
+                </div>
+              )}
             </div>
           </div>
           <button
@@ -148,19 +144,29 @@ export default function SearchModal({ onClose }: SearchModalProps) {
     );
   }
 
-  function PTCompactCard({ pt }: { pt: SearchResult }) {
+  function PTCompactCard({ pt }: { pt: Pickticket }) {
+    const isDefunct = isPTDefunct(pt, mostRecentSync);
+
     return (
       <div className="bg-gray-800 p-3 rounded-lg border-2 border-gray-600">
         <div className="flex justify-between items-start gap-2">
           <div className="flex-1">
             <div className="font-bold">PT #{pt.pt_number}</div>
             <div className="text-xs text-gray-300">PO: {pt.po_number}</div>
-            <div className="text-sm text-blue-400 mt-1">
-              {pt.actual_pallet_count || 'TBD'} pallets
-            </div>
-            <div className={`text-sm font-semibold mt-1 ${pt.assigned_lane ? 'text-green-400' : 'text-yellow-400'}`}>
-              {pt.assigned_lane ? `Lane ${pt.assigned_lane}` : 'Unassigned'}
-            </div>
+            {isDefunct ? (
+              <div className="bg-red-600 px-2 py-1 rounded text-xs font-bold text-white inline-block mt-1">
+                DEFUNCT
+              </div>
+            ) : (
+              <>
+                <div className="text-sm text-blue-400 mt-1">
+                  {pt.actual_pallet_count || 'TBD'} pallets
+                </div>
+                <div className={`text-sm font-semibold mt-1 ${pt.assigned_lane ? 'text-green-400' : 'text-yellow-400'}`}>
+                  {pt.assigned_lane ? `Lane ${pt.assigned_lane}` : 'Unassigned'}
+                </div>
+              </>
+            )}
           </div>
           <button
             onClick={() => setViewingPTDetails(pt)}
@@ -277,19 +283,20 @@ export default function SearchModal({ onClose }: SearchModalProps) {
               <div className="space-y-4">
                 {containerGroups.map((group) => {
                   const isExpanded = expandedContainers.has(group.container_number);
-                  
+                  const allDefunct = group.pts.every(pt => isPTDefunct(pt, mostRecentSync));
+
                   // Group PTs by customer for multi-column layout
                   const ptsByCustomer = group.pts.reduce((acc, pt) => {
                     const customer = pt.customer || 'OTHER';
                     if (!acc[customer]) acc[customer] = [];
                     acc[customer].push(pt);
                     return acc;
-                  }, {} as Record<string, SearchResult[]>);
-                  
+                  }, {} as Record<string, Pickticket[]>);
+
                   const customers = Object.keys(ptsByCustomer).sort();
-                  
+
                   return (
-                    <div key={group.container_number} className="bg-gray-800 rounded-lg border-2 border-purple-500">
+                    <div key={group.container_number} className={`bg-gray-800 rounded-lg border-2 ${allDefunct ? 'border-red-500' : 'border-purple-500'}`}>
                       {/* Container Header - Clickable */}
                       <button
                         onClick={() => toggleContainer(group.container_number)}
@@ -308,6 +315,11 @@ export default function SearchModal({ onClose }: SearchModalProps) {
                             </div>
                           </div>
                         </div>
+                        {allDefunct && (
+                          <div className="bg-red-600 px-4 py-2 rounded-lg font-bold text-white">
+                            ALL DEFUNCT
+                          </div>
+                        )}
                       </button>
 
                       {/* Expanded PT List - Multi-Column by Customer */}
@@ -340,9 +352,10 @@ export default function SearchModal({ onClose }: SearchModalProps) {
 
       {/* PT Details Modal */}
       {viewingPTDetails && (
-        <PTDetails 
-          pt={viewingPTDetails} 
-          onClose={() => setViewingPTDetails(null)} 
+        <PTDetails
+          pt={viewingPTDetails}
+          onClose={() => setViewingPTDetails(null)}
+          mostRecentSync={mostRecentSync}
         />
       )}
     </div>

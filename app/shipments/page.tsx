@@ -4,14 +4,30 @@ import { useState, useEffect } from 'react';
 import Link from 'next/link';
 import { supabase } from '@/lib/supabase';
 import ShipmentCard, { Shipment, ShipmentPT } from '@/components/ShipmentCard';
+import { isPTDefunct } from '@/lib/utils';
 
 export default function ShipmentsPage() {
   const [shipments, setShipments] = useState<Shipment[]>([]);
   const [loading, setLoading] = useState(true);
+  const [mostRecentSync, setMostRecentSync] = useState<Date | null>(null);
 
   useEffect(() => {
+    fetchMostRecentSync();
     fetchShipments();
   }, []);
+
+  async function fetchMostRecentSync() {
+    const { data } = await supabase
+      .from('picktickets')
+      .select('last_synced_at')
+      .order('last_synced_at', { ascending: false })
+      .limit(1)
+      .single();
+
+    if (data?.last_synced_at) {
+      setMostRecentSync(new Date(data.last_synced_at));
+    }
+  }
 
   async function fetchShipments() {
     setLoading(true);
@@ -20,10 +36,11 @@ export default function ShipmentsPage() {
       // Get all PTs with PU numbers from Excel sync
       const { data: pts, error } = await supabase
         .from('picktickets')
-        .select('id, pt_number, po_number, customer, assigned_lane, actual_pallet_count, container_number, store_dc, cancel_date, start_date, pu_number, pu_date, status, ctn')
+        .select('id, pt_number, po_number, customer, assigned_lane, actual_pallet_count, container_number, store_dc, cancel_date, start_date, pu_number, pu_date, status, ctn, last_synced_at')
         .not('pu_number', 'is', null)
         .not('pu_date', 'is', null)
-        .neq('status', 'shipped');
+        .neq('status', 'shipped')
+        .neq('customer', 'PAPER');
 
       if (error) throw error;
 
@@ -61,7 +78,8 @@ export default function ShipmentsPage() {
           start_date: pt.start_date,
           removed_from_staging: false,
           status: pt.status,
-          ctn: pt.ctn  // ADD THIS
+          ctn: pt.ctn,
+          last_synced_at: pt.last_synced_at
         });
       });
 
@@ -100,10 +118,11 @@ export default function ShipmentsPage() {
       // Also get shipped PTs
       const { data: shippedPTs } = await supabase
         .from('picktickets')
-        .select('id, pt_number, po_number, customer, assigned_lane, actual_pallet_count, container_number, store_dc, cancel_date, start_date, pu_number, pu_date, status, ctn')
+        .select('id, pt_number, po_number, customer, assigned_lane, actual_pallet_count, container_number, store_dc, cancel_date, start_date, pu_number, pu_date, status, ctn, last_synced_at')
         .eq('status', 'shipped')
         .not('pu_number', 'is', null)
-        .not('pu_date', 'is', null);
+        .not('pu_date', 'is', null)
+        .neq('customer', 'PAPER');
 
       // Group shipped PTs
       shippedPTs?.forEach(pt => {
@@ -135,7 +154,8 @@ export default function ShipmentsPage() {
           start_date: pt.start_date,
           removed_from_staging: false,
           status: 'shipped',
-          ctn: pt.ctn  // ADD THIS
+          ctn: pt.ctn,
+          last_synced_at: pt.last_synced_at
         });
 
         groupedShipments[key].archived = true;
@@ -157,8 +177,20 @@ export default function ShipmentsPage() {
     }
   }
 
-  const activeShipments = shipments.filter(s => !s.archived);
+  // Categorize shipments
+  const activeShipments = shipments.filter(s => {
+    if (s.archived) return false;
+    const allDefunct = s.pts.every(pt => isPTDefunct(pt, mostRecentSync));
+    return !allDefunct;
+  });
+
   const shippedShipments = shipments.filter(s => s.archived);
+
+  const defunctShipments = shipments.filter(s => {
+    if (s.archived) return false;
+    const allDefunct = s.pts.every(pt => isPTDefunct(pt, mostRecentSync));
+    return allDefunct;
+  });
 
   return (
     <div className="min-h-screen bg-gray-900 text-white p-4 md:p-8">
@@ -197,6 +229,7 @@ export default function ShipmentsPage() {
                       key={`${shipment.pu_number}-${shipment.pu_date}`}
                       shipment={shipment}
                       onUpdate={fetchShipments}
+                      mostRecentSync={mostRecentSync}
                     />
                   ))}
                 </div>
@@ -205,7 +238,7 @@ export default function ShipmentsPage() {
 
             {/* Shipped Shipments */}
             {shippedShipments.length > 0 && (
-              <div className="border-t-4 border-green-600 pt-8">
+              <div className="border-t-4 border-green-600 pt-8 mb-8">
                 <h2 className="text-2xl font-bold mb-4 text-green-400">✈️ Shipped ({shippedShipments.length})</h2>
                 <div className="space-y-4 opacity-75">
                   {shippedShipments.map((shipment) => (
@@ -213,6 +246,24 @@ export default function ShipmentsPage() {
                       key={`${shipment.pu_number}-${shipment.pu_date}`}
                       shipment={shipment}
                       onUpdate={fetchShipments}
+                      mostRecentSync={mostRecentSync}
+                    />
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* DEFUNCT Shipments */}
+            {defunctShipments.length > 0 && (
+              <div className="border-t-4 border-red-600 pt-8">
+                <h2 className="text-2xl font-bold mb-4 text-red-400">⚠️ DEFUNCT ({defunctShipments.length})</h2>
+                <div className="space-y-4 opacity-60">
+                  {defunctShipments.map((shipment) => (
+                    <ShipmentCard
+                      key={`${shipment.pu_number}-${shipment.pu_date}`}
+                      shipment={shipment}
+                      onUpdate={fetchShipments}
+                      mostRecentSync={mostRecentSync}
                     />
                   ))}
                 </div>
