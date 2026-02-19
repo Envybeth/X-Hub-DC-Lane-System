@@ -78,42 +78,26 @@ export default function OCRCamera({ expectedPT, expectedPO, onSuccess, onCancel 
 
             ctx.drawImage(video, 0, 0);
 
+            // Get base64 image (remove prefix)
             const base64Image = canvas.toDataURL('image/png').split(',')[1];
 
-            const apiKey = process.env.NEXT_PUBLIC_GOOGLE_VISION_KEY;
-            if (!apiKey) {
-                throw new Error('Google Vision API key not configured');
-            }
+            console.log('Sending to server OCR endpoint...');
 
-            console.log('Sending to Google Vision API...');
-
-            const response = await fetch(
-                `https://vision.googleapis.com/v1/images:annotate?key=${apiKey}`,
-                {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        requests: [{
-                            image: { content: base64Image },
-                            features: [{ type: 'TEXT_DETECTION', maxResults: 1 }]
-                        }]
-                    })
-                }
-            );
+            // Call OUR server endpoint instead of Google directly
+            const response = await fetch('/api/ocr', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ image: base64Image })
+            });
 
             if (!response.ok) {
                 const errorData = await response.json();
-                throw new Error(`API Error: ${errorData.error?.message || 'Unknown error'}`);
+                throw new Error(errorData.error || 'OCR failed');
             }
 
             const data = await response.json();
-            console.log('Google Vision response:', data);
+            const detectedText = data.text;
 
-            if (!data.responses?.[0]?.textAnnotations?.[0]) {
-                throw new Error('No text detected');
-            }
-
-            const detectedText = data.responses[0].textAnnotations[0].description;
             console.log('Detected text:', detectedText);
 
             const { ptNumber, poNumber } = parseLabel(detectedText);
@@ -121,7 +105,6 @@ export default function OCRCamera({ expectedPT, expectedPO, onSuccess, onCancel 
             console.log('Parsed PT:', ptNumber, 'PO:', poNumber);
             console.log('Expected PT:', expectedPT, 'PO:', expectedPO);
 
-            // Clean expected values for comparison
             const expectedPTClean = expectedPT.replace(/\s/g, '');
             const expectedPOClean = expectedPO.replace(/\s/g, '');
 
@@ -139,7 +122,6 @@ export default function OCRCamera({ expectedPT, expectedPO, onSuccess, onCancel 
                 if (!poMatch) errorMsg += `PO: Expected ${expectedPO}, got ${poNumber || 'none'}`;
                 setError(errorMsg);
 
-                // Auto-expand manual override after 3 failed attempts
                 if (attempts >= 3) {
                     setShowManualOverride(true);
                 }
