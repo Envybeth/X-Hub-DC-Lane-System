@@ -15,9 +15,11 @@ export default function PTDetails({ pt, onClose, mostRecentSync }: PTDetailsProp
     const allPTs = isCompiled ? [pt, ...pt.compiled_with] : [pt];
     const [selectedTabIndex, setSelectedTabIndex] = useState(0);
     const displayPT = allPTs[selectedTabIndex];
-
     const statusInfo = getStatusInfo(displayPT);
     const isDefunct = isPTDefunct(displayPT, mostRecentSync);
+    const showDefunct = isDefunct && !displayPT.assigned_lane;
+
+
 
     return (
         <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-[60] p-4">
@@ -50,8 +52,8 @@ export default function PTDetails({ pt, onClose, mostRecentSync }: PTDetailsProp
                                     key={index}
                                     onClick={() => setSelectedTabIndex(index)}
                                     className={`px-3 py-2 rounded-t-lg font-semibold text-sm whitespace-nowrap transition-colors ${selectedTabIndex === index
-                                            ? 'bg-orange-600 text-white'
-                                            : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                                        ? 'bg-orange-600 text-white'
+                                        : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
                                         }`}
                                 >
                                     PT #{tabPT.pt_number}
@@ -84,9 +86,9 @@ export default function PTDetails({ pt, onClose, mostRecentSync }: PTDetailsProp
                     {/* Location OR DEFUNCT */}
                     <div className="col-span-2">
                         <div className="text-xs md:text-sm text-gray-400">
-                            {isDefunct ? 'Status' : 'Location'}
+                            {showDefunct ? 'Status' : 'Location'}
                         </div>
-                        {isDefunct ? (
+                        {showDefunct ? (
                             <div className="bg-red-600 px-4 py-2 rounded-lg font-bold text-white inline-block text-xl">
                                 DEFUNCT
                             </div>

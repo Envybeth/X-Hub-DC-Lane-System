@@ -91,10 +91,10 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
 
   useEffect(() => {
+    checkIfStagingLane();
     fetchExistingPTs();
     fetchContainers();
     fetchAllUnassignedPTs();
-    checkIfStagingLane();
     fetchAllLanes();
     fetchMostRecentSync();
   }, []);
@@ -180,18 +180,31 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
   }
 
   async function checkIfStagingLane() {
-    const { data: pts } = await supabase
-      .from('picktickets')
-      .select('status, pu_number')
-      .eq('assigned_lane', lane.lane_number);
+    const { data } = await supabase
+      .from('shipments')
+      .select('id, pu_number, staging_lane, status')
+      .eq('staging_lane', lane.lane_number)
+      .eq('archived', false)
+      .maybeSingle();
 
-    if (pts && pts.length > 0) {
-      const allReadyToShip = pts.every(pt => pt.status === 'ready_to_ship');
-      setIsStaging(allReadyToShip);
+    if (data) {
+      setIsStaging(true);
+      setStagingPUs([data.pu_number]);
+      setView('existing'); // Force to existing view
+    } else {
+      // ALSO check if ANY PTs in this lane have staged/ready_to_ship status
+      const { data: stagedPTs } = await supabase
+        .from('picktickets')
+        .select('pu_number, status')
+        .eq('assigned_lane', lane.lane_number)
+        .in('status', ['staged', 'ready_to_ship'])
+        .limit(1);
 
-      if (allReadyToShip) {
-        const uniquePUs = [...new Set(pts.map(pt => pt.pu_number).filter(Boolean))];
-        setStagingPUs(uniquePUs as string[]);
+      if (stagedPTs && stagedPTs.length > 0) {
+        setIsStaging(true);
+        setView('existing');
+      } else {
+        setIsStaging(false);
       }
     }
   }
@@ -383,6 +396,20 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
     if (isStaging) {
       showToast('Cannot add new PTs to a staging lane', 'error');
       return;
+    }
+
+    if (view === 'add' && ptSearchQuery.trim() !== '') {
+      const { data: shipmentData } = await supabase
+        .from('shipments')
+        .select('id, pu_number, staging_lane')
+        .eq('staging_lane', lane.lane_number)
+        .eq('archived', false)
+        .maybeSingle();
+
+      if (shipmentData) {
+        showToast('Cannot add individual PTs to a staging lane. Use the Shipments page instead.', 'error');
+        return;
+      }
     }
 
     setLoading(true);
@@ -764,9 +791,15 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
               <h2 className="text-xl md:text-3xl font-bold">Lane {lane.lane_number}</h2>
               {isStaging && (
                 <div className="flex flex-wrap items-center gap-2">
-                  <span className="bg-purple-700 px-2 md:px-4 py-1 md:py-2 rounded-lg font-bold text-sm md:text-xl">
-                    📦 STAGING
-                  </span>
+                  {existingPTs.every(pt => pt.pickticket.status === 'ready_to_ship') && existingPTs.length > 0 ? (
+                    <h2 className="bg-yellow-600 border-2 border-yellow-400 px-2 md:px-4 py-1 md:py-2 rounded-lg font-bold text-sm md:text-xl">
+                      ✈️ Ready to Ship
+                    </h2>
+                  ) : (
+                    <h2 className="bg-purple-700 border-2 border-purple-400 px-2 md:px-4 py-1 md:py-2 rounded-lg font-bold text-sm md:text-xl">
+                      📦 Staging
+                    </h2>
+                  )}
                   {stagingPUs.length > 0 && (
                     <span className="bg-blue-700 px-2 md:px-4 py-1 md:py-2 rounded-lg font-bold text-xs md:text-base">
                       PU: {stagingPUs.join(', ')}

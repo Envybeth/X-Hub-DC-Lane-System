@@ -42,11 +42,19 @@ export interface ShipmentCardProps {
   shipment: Shipment;
   onUpdate: () => void;
   mostRecentSync?: Date | null;
+  isExpanded?: boolean;
+  onToggleExpand?: (isExpanded: boolean) => void;
 }
 
 
-export default function ShipmentCard({ shipment, onUpdate, mostRecentSync }: ShipmentCardProps) {
-  const [expanded, setExpanded] = useState(false);
+export default function ShipmentCard({
+  shipment,
+  onUpdate,
+  mostRecentSync,
+  isExpanded = false,
+  onToggleExpand
+}: ShipmentCardProps) {
+  const [expanded, setExpanded] = useState(isExpanded);
   const [selectingLane, setSelectingLane] = useState(false);
   const [selectedLaneInput, setSelectedLaneInput] = useState('');
   const [selectedPTDetails, setSelectedPTDetails] = useState<ShipmentPT | null>(null);
@@ -78,6 +86,20 @@ export default function ShipmentCard({ shipment, onUpdate, mostRecentSync }: Shi
     in_process: { label: 'In Process', color: 'bg-orange-600', textColor: 'text-orange-400' },
     finalized: { label: 'Finalized', color: 'bg-green-600', textColor: 'text-green-400' }
   };
+
+  // Sync with prop
+  useEffect(() => {
+    setExpanded(isExpanded);
+  }, [isExpanded]);
+
+  // Update parent when toggling
+  function handleToggle() {
+    const newExpanded = !expanded;
+    setExpanded(newExpanded);
+    if (onToggleExpand) {
+      onToggleExpand(newExpanded);
+    }
+  }
 
   useEffect(() => {
     if (toast) {
@@ -606,7 +628,7 @@ export default function ShipmentCard({ shipment, onUpdate, mostRecentSync }: Shi
       <div className="bg-gray-800 rounded-lg border-2 border-gray-600">
         {/* Header - mobile responsive */}
         <button
-          onClick={() => setExpanded(!expanded)}
+          onClick={handleToggle}
           className="w-full p-3 md:p-5 flex flex-col sm:flex-row items-start sm:items-center justify-between hover:bg-gray-750 transition-colors gap-3"
         >
           <div className="flex items-center gap-3 md:gap-6 w-full sm:w-auto">
