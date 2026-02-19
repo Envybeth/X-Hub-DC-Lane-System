@@ -6,6 +6,7 @@ import PTDetails from './PTDetails';
 import { Pickticket } from '@/types/pickticket';
 import { isPTDefunct } from '@/lib/utils';
 import { fetchCompiledPTInfo } from '@/lib/compiledPallets';
+import { useRouter } from 'next/navigation';
 
 interface SearchModalProps {
   onClose: () => void;
@@ -26,6 +27,7 @@ export default function SearchModal({ onClose, mostRecentSync }: SearchModalProp
   const [searching, setSearching] = useState(false);
   const [searched, setSearched] = useState(false);
   const [viewingPTDetails, setViewingPTDetails] = useState<Pickticket | null>(null);
+  const router = useRouter();
 
   async function handleSearch() {
     if (!searchQuery.trim()) return;
@@ -146,7 +148,20 @@ export default function SearchModal({ onClose, mostRecentSync }: SearchModalProp
                   DEFUNCT
                 </div>
               ) : (
-                <div className={`text-lg font-bold ${pt.assigned_lane ? 'text-green-400' : 'text-yellow-400'}`}>
+                <div
+                  onClick={() => {
+                    if (pt.assigned_lane) {
+                      // Close the search modal immediately
+                      onClose();
+                      // Navigate to the main page with the lane query
+                      router.push(`/?lane=${pt.assigned_lane}`);
+                    }
+                  }}
+                  className={`text-xl md:text-3xl font-bold transition-all ${pt.assigned_lane
+                    ? 'text-green-400 cursor-pointer hover:text-green-300 hover:underline'
+                    : 'text-yellow-400'
+                    }`}
+                >
                   {pt.assigned_lane ? `Lane ${pt.assigned_lane}` : 'Not assigned'}
                 </div>
               )}

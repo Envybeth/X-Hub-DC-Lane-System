@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect } from 'react';
+import { useSearchParams, useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabase';
 import AssignModal from './AssignModal';
 import { fetchCompiledPTInfo } from '@/lib/compiledPallets';
@@ -21,6 +22,9 @@ export default function LaneGrid() {
   const [selectedLane, setSelectedLane] = useState<Lane | null>(null);
   const [showAssignModal, setShowAssignModal] = useState(false);
 
+  const searchParams = useSearchParams();
+  const router = useRouter();
+
   useEffect(() => {
     fetchLanes();
   }, []);
@@ -28,7 +32,7 @@ export default function LaneGrid() {
   async function fetchLanes() {
     const { data } = await supabase
       .from('lanes')
-      .select('*')
+      .select('*') 
       .order('id');
 
     if (data) {
@@ -77,6 +81,18 @@ export default function LaneGrid() {
     }
   }
 
+  useEffect(() => {
+    const laneQuery = searchParams.get('lane');
+
+    if (laneQuery && lanes.length > 0) {
+      const targetLane = lanes.find(l => l.lane_number === laneQuery);
+      if (targetLane) {
+        setSelectedLane(targetLane);
+        setShowAssignModal(true);
+      }
+    }
+  }, [searchParams, lanes]);
+
   function handleLaneClick(lane: Lane) {
     setSelectedLane(lane);
     setShowAssignModal(true);
@@ -86,6 +102,7 @@ export default function LaneGrid() {
     setShowAssignModal(false);
     setSelectedLane(null);
     fetchLanes();
+    router.replace('/', { scroll: false });
   }
 
   function getLaneColor(lane: Lane) {

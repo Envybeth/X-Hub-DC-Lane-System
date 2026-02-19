@@ -10,6 +10,7 @@ export default function ShipmentsPage() {
   const [shipments, setShipments] = useState<Shipment[]>([]);
   const [loading, setLoading] = useState(true);
   const [mostRecentSync, setMostRecentSync] = useState<Date | null>(null);
+const [expandedShipmentKey, setExpandedShipmentKey] = useState<string | null>(null);
 
   useEffect(() => {
     fetchMostRecentSync();
@@ -215,61 +216,85 @@ export default function ShipmentsPage() {
           </div>
         ) : (
           <>
-            {/* Active Shipments */}
-            <div className="mb-8">
-              <h2 className="text-2xl font-bold mb-4">Active Shipments ({activeShipments.length})</h2>
-              {activeShipments.length === 0 ? (
-                <div className="bg-gray-800 p-8 rounded-lg text-center text-gray-400">
-                  No active shipments found
-                </div>
-              ) : (
-                <div className="space-y-4">
-                  {activeShipments.map((shipment) => (
-                    <ShipmentCard
-                      key={`${shipment.pu_number}-${shipment.pu_date}`}
-                      shipment={shipment}
-                      onUpdate={fetchShipments}
-                      mostRecentSync={mostRecentSync}
-                    />
-                  ))}
-                </div>
-              )}
-            </div>
+  {/* Active Shipments */}
+  <div className="mb-8">
+    <h2 className="text-2xl font-bold mb-4">Active Shipments ({activeShipments.length})</h2>
+    {activeShipments.length === 0 ? (
+      <div className="bg-gray-800 p-8 rounded-lg text-center text-gray-400">
+        No active shipments found
+      </div>
+    ) : (
+      <div className="space-y-4">
+        {activeShipments.map((shipment) => (
+          <ShipmentCard
+            key={`${shipment.pu_number}-${shipment.pu_date}`}
+            shipment={shipment}
+            onUpdate={() => {
+              const currentKey = `${shipment.pu_number}-${shipment.pu_date}`;
+              setExpandedShipmentKey(currentKey);
+              fetchShipments();
+            }}
+            mostRecentSync={mostRecentSync}
+            isExpanded={expandedShipmentKey === `${shipment.pu_number}-${shipment.pu_date}`}
+            onToggleExpand={(isExpanded) => {
+              setExpandedShipmentKey(isExpanded ? `${shipment.pu_number}-${shipment.pu_date}` : null);
+            }}
+          />
+        ))}
+      </div>
+    )}
+  </div>
 
-            {/* Shipped Shipments */}
-            {shippedShipments.length > 0 && (
-              <div className="border-t-4 border-green-600 pt-8 mb-8">
-                <h2 className="text-2xl font-bold mb-4 text-green-400">✈️ Shipped ({shippedShipments.length})</h2>
-                <div className="space-y-4 opacity-75">
-                  {shippedShipments.map((shipment) => (
-                    <ShipmentCard
-                      key={`${shipment.pu_number}-${shipment.pu_date}`}
-                      shipment={shipment}
-                      onUpdate={fetchShipments}
-                      mostRecentSync={mostRecentSync}
-                    />
-                  ))}
-                </div>
-              </div>
-            )}
+  {/* Shipped Shipments */}
+  {shippedShipments.length > 0 && (
+    <div className="border-t-4 border-green-600 pt-8 mb-8">
+      <h2 className="text-2xl font-bold mb-4 text-green-400">✈️ Shipped ({shippedShipments.length})</h2>
+      <div className="space-y-4 opacity-75">
+        {shippedShipments.map((shipment) => (
+          <ShipmentCard
+            key={`${shipment.pu_number}-${shipment.pu_date}`}
+            shipment={shipment}
+            onUpdate={() => {
+              const currentKey = `${shipment.pu_number}-${shipment.pu_date}`;
+              setExpandedShipmentKey(currentKey);
+              fetchShipments();
+            }}
+            mostRecentSync={mostRecentSync}
+            isExpanded={expandedShipmentKey === `${shipment.pu_number}-${shipment.pu_date}`}
+            onToggleExpand={(isExpanded) => {
+              setExpandedShipmentKey(isExpanded ? `${shipment.pu_number}-${shipment.pu_date}` : null);
+            }}
+          />
+        ))}
+      </div>
+    </div>
+  )}
 
-            {/* DEFUNCT Shipments */}
-            {defunctShipments.length > 0 && (
-              <div className="border-t-4 border-red-600 pt-8">
-                <h2 className="text-2xl font-bold mb-4 text-red-400">⚠️ DEFUNCT ({defunctShipments.length})</h2>
-                <div className="space-y-4 opacity-60">
-                  {defunctShipments.map((shipment) => (
-                    <ShipmentCard
-                      key={`${shipment.pu_number}-${shipment.pu_date}`}
-                      shipment={shipment}
-                      onUpdate={fetchShipments}
-                      mostRecentSync={mostRecentSync}
-                    />
-                  ))}
-                </div>
-              </div>
-            )}
-          </>
+  {/* DEFUNCT Shipments */}
+  {defunctShipments.length > 0 && (
+    <div className="border-t-4 border-red-600 pt-8">
+      <h2 className="text-2xl font-bold mb-4 text-red-400">⚠️ DEFUNCT ({defunctShipments.length})</h2>
+      <div className="space-y-4 opacity-60">
+        {defunctShipments.map((shipment) => (
+          <ShipmentCard
+            key={`${shipment.pu_number}-${shipment.pu_date}`}
+            shipment={shipment}
+            onUpdate={() => {
+              const currentKey = `${shipment.pu_number}-${shipment.pu_date}`;
+              setExpandedShipmentKey(currentKey);
+              fetchShipments();
+            }}
+            mostRecentSync={mostRecentSync}
+            isExpanded={expandedShipmentKey === `${shipment.pu_number}-${shipment.pu_date}`}
+            onToggleExpand={(isExpanded) => {
+              setExpandedShipmentKey(isExpanded ? `${shipment.pu_number}-${shipment.pu_date}` : null);
+            }}
+          />
+        ))}
+      </div>
+    </div>
+  )}
+</>
         )}
       </div>
     </div>
