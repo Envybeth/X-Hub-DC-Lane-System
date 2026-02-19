@@ -7,6 +7,8 @@ import PTDetails from './PTDetails';
 import { isPTDefunct } from '@/lib/utils';
 import { fetchCompiledPTInfo } from '@/lib/compiledPallets';
 
+import OCRCamera from './OCRCamera';
+
 
 export interface ShipmentPT {
   id: number;
@@ -66,6 +68,9 @@ export default function ShipmentCard({
   const [deletingShipment, setDeletingShipment] = useState(false);
   const [deleteConfirmText, setDeleteConfirmText] = useState('');
 
+  //ocr
+  const [scanningPT, setScanningPT] = useState<ShipmentPT | null>(null);
+
   const [confirmModal, setConfirmModal] = useState<{
     isOpen: boolean;
     title: string;
@@ -119,6 +124,89 @@ export default function ShipmentCard({
       autoSyncPTs(unsyncedPTs);
     }
   }, [shipment.pts, shipment.staging_lane]);
+
+  //OCR move PT
+  async function performMovePT(pt: ShipmentPT) {
+    try {
+      const { data: shipmentData } = await supabase
+        .from('shipments')
+        .select('id, status')
+        .eq('pu_number', shipment.pu_number)
+        .eq('pu_date', shipment.pu_date)
+        .single();
+
+      if (!shipmentData) throw new Error('Shipment not found');
+
+      // Add to shipment_pts
+      await supabase
+        .from('shipment_pts')
+        .upsert({
+          shipment_id: shipmentData.id,
+          pt_id: pt.id,
+          original_lane: pt.assigned_lane,
+          removed_from_staging: false
+        }, {
+          onConflict: 'shipment_id,pt_id'
+        });
+
+      // Determine status based on shipment state
+      const ptStatus = shipmentData.status === 'finalized' ? 'ready_to_ship' : 'staged';
+
+      // Update PT
+      await supabase
+        .from('picktickets')
+        .update({
+          assigned_lane: shipment.staging_lane,
+          status: ptStatus
+        })
+        .eq('id', pt.id);
+
+      // Remove old lane assignment if exists
+      if (pt.assigned_lane) {
+        const { data: oldAssignment } = await supabase
+          .from('lane_assignments')
+          .select('id')
+          .eq('pt_id', pt.id)
+          .eq('lane_number', pt.assigned_lane)
+          .maybeSingle();
+
+        if (oldAssignment) {
+          await supabase
+            .from('lane_assignments')
+            .delete()
+            .eq('id', oldAssignment.id);
+        }
+      }
+
+      // Get next position in staging lane
+      const { data: existingAssignments } = await supabase
+        .from('lane_assignments')
+        .select('order_position')
+        .eq('lane_number', shipment.staging_lane)
+        .order('order_position', { ascending: false })
+        .limit(1);
+
+      const newPosition = existingAssignments && existingAssignments.length > 0
+        ? existingAssignments[0].order_position + 1
+        : 1;
+
+      // Add to staging lane
+      await supabase
+        .from('lane_assignments')
+        .insert({
+          lane_number: shipment.staging_lane,
+          pt_id: pt.id,
+          pallet_count: pt.actual_pallet_count,
+          order_position: newPosition
+        });
+
+      showToast(`✅ PT ${pt.pt_number} staged`, 'success');
+      onUpdate();
+    } catch (error) {
+      console.error('Error moving PT:', error);
+      showToast('Failed to move PT', 'error');
+    }
+  }
 
   async function autoSyncPTs(ptsToSync: ShipmentPT[]) {
     try {
@@ -496,6 +584,8 @@ export default function ShipmentCard({
       showToast('Select staging lane first', 'error');
       return;
     }
+
+    setScanningPT(pt);
 
     try {
       const { data: shipmentData } = await supabase
@@ -1058,6 +1148,19 @@ export default function ShipmentCard({
         onConfirm={confirmModal.onConfirm}
         onCancel={() => setConfirmModal({ ...confirmModal, isOpen: false })}
       />
+
+      {/* OCR Camera Modal */}
+      {scanningPT && (
+        <OCRCamera
+          expectedPT={scanningPT.pt_number}
+          expectedPO={scanningPT.po_number}
+          onSuccess={() => {
+            performMovePT(scanningPT);
+            setScanningPT(null);
+          }}
+          onCancel={() => setScanningPT(null)}
+        />
+      )}
     </>
   );
 }
