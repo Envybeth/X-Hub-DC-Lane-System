@@ -6,6 +6,8 @@ import LaneGrid from '@/components/LaneGrid';
 import SearchModal from '@/components/SearchModal';
 import Link from 'next/link';
 import PTDetails from '@/components/PTDetails';
+import { Suspense } from 'react';
+export const dynamic = 'force-dynamic';
 
 export default function Home() {
   const [showSearch, setShowSearch] = useState(false);
@@ -104,7 +106,9 @@ export default function Home() {
       </div>
 
       <div className="p-2 md:p-6">
-        <LaneGrid />
+        <Suspense>
+          <LaneGrid />
+        </Suspense>
       </div>
 
       {showSearch && <SearchModal onClose={() => setShowSearch(false)} mostRecentSync={lastSync} />}
