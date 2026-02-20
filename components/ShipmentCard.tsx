@@ -85,6 +85,7 @@ export default function ShipmentCard({
 
   const totalPallets = shipment.pts.reduce((sum, pt) => sum + pt.actual_pallet_count, 0);
   const movedCount = shipment.pts.filter(pt => pt.moved_to_staging && !pt.removed_from_staging).length;
+  const movedPTsTotalPallets = shipment.pts.filter(pt => pt.moved_to_staging && !pt.removed_from_staging).reduce((sum, pt) => sum + pt.actual_pallet_count, 0);
 
   const statusConfig = {
     not_started: { label: 'Not Started', color: 'bg-red-600', textColor: 'text-red-400' },
@@ -647,21 +648,22 @@ export default function ShipmentCard({
               {expanded ? '▼' : '▶'}
             </div>
             <div className="text-left flex-1">
-              <div className="text-lg md:text-2xl font-bold break-all">PU #{shipment.pu_number}</div>
-              <div className="text-xs md:text-sm text-gray-400 mt-1 break-all">
-                {shipment.carrier} | {shipment.pu_date} | {shipment.pts.length} PTs | {totalPallets}p
+              <div className="text-2xl md:text-3xl font-bold break-all">PU #{shipment.pu_number}</div>
+              <div className="text-gray-300 mt-1 break-all">
+                <span className='text-m md:text-xl'>{shipment.carrier} | {shipment.pu_date} | {shipment.pts.length} PTs | </span><span className='text-yellow-300 font-bold text-xl md:text-2xl'>{totalPallets}</span><span className='text-yellow-400 text-l font-bold md:text-xl'>p</span>
               </div>
             </div>
           </div>
           <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
-            <div className={`px-2 md:px-4 py-1 md:py-2 rounded-lg font-bold text-xs md:text-base ${statusConfig[shipment.status].color}`}>
-              {statusConfig[shipment.status].label}
-            </div>
+
             {shipment.staging_lane && (
-              <div className="bg-purple-700 px-2 md:px-4 py-1 md:py-2 rounded-lg font-bold text-xs md:text-base">
+              <div className="bg-purple-700 px-2 md:px-4 py-1 md:py-2 rounded-lg font-bold text-l md:text-base">
                 Staging: L{shipment.staging_lane}
               </div>
             )}
+            <div className={`px-2 md:px-4 py-1 md:py-2 rounded-lg font-bold text-xs md:text-base ${statusConfig[shipment.status].color}`}>
+              {statusConfig[shipment.status].label}
+            </div>
           </div>
         </button>
 
@@ -672,11 +674,21 @@ export default function ShipmentCard({
             {/* Only show action buttons if NOT archived */}
             {!shipment.archived && shipment.staging_lane && (
               <>
+                {/* Change Lane Button */}
+                {shipment.staging_lane && !changingStagingLane && (
+                  <button
+                    onClick={() => setChangingStagingLane(true)}
+                    className="bg-purple-600 hover:bg-purple-700 px-3 md:px-6 py-2 md:py-3 rounded-lg font-bold text-sm md:text-base whitespace-nowrap border border-purple-700 mr-3"
+                  >
+                    Change Lane
+                  </button>
+                )}
+
                 {/* Clear Data Button - Always Visible */}
                 {!deletingShipment ? (
                   <button
                     onClick={() => setDeletingShipment(true)}
-                    className="bg-red-600 hover:bg-red-700 px-3 md:px-6 py-2 md:py-3 rounded-lg font-bold text-sm md:text-base whitespace-nowrap"
+                    className="bg-red-600 hover:bg-red-700 px-3 md:px-6 py-2 md:py-3 rounded-lg font-bold text-sm md:text-base whitespace-nowrap border border-red-700"
                   >
                     Reset Shipment
                   </button>
@@ -711,16 +723,6 @@ export default function ShipmentCard({
                       </div>
                     </div>
                   </div>
-                )}
-
-                {/* Change Lane Button */}
-                {shipment.staging_lane && !changingStagingLane && (
-                  <button
-                    onClick={() => setChangingStagingLane(true)}
-                    className="bg-purple-600 hover:bg-purple-700 px-3 md:px-6 py-2 md:py-3 rounded-lg font-bold text-sm md:text-base whitespace-nowrap"
-                  >
-                    Change Lane
-                  </button>
                 )}
 
                 {changingStagingLane && (
@@ -813,8 +815,10 @@ export default function ShipmentCard({
                 <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
                   <div>
                     <div className="font-bold text-sm md:text-lg">Staging Progress</div>
-                    <div className="text-xs md:text-sm text-gray-400 mt-1">
-                      {movedCount} of {shipment.pts.length} PTs → Lane {shipment.staging_lane}
+                    <div className="text-gray-400 mt-1">
+                      <span className='text-yellow-300 font-bold text-lg md:text-lg'>{movedPTsTotalPallets} of {totalPallets} Pallets → Lane {shipment.staging_lane}</span>
+                      <br></br>
+                      <span className='text-sm md:text-m '>{movedCount} of {shipment.pts.length} PTs → Lane {shipment.staging_lane}</span>
                     </div>
                   </div>
                   {shipment.status !== 'finalized' && (
@@ -961,11 +965,11 @@ export default function ShipmentCard({
                                   <div className="text-lg md:text-2xl text-yellow-400 flex-shrink-0">⚠️</div>
                                 )}
                                 <div className="flex-1 min-w-0">
-                                  <div className="text-lg md:text-lg font-bold break-all">
+                                  <div className="text-2xl md:text-2xl font-bold break-all">
                                     PT #{pt.pt_number} | PO: {pt.po_number}
                                   </div>
-                                  <div className="text-xs md:text-sm text-gray-300 break-all">
-                                    {pt.customer} | {pt.actual_pallet_count}p
+                                  <div className="text-l md:text-sm text-gray-200 break-all">
+                                    {pt.customer} | <span className='text-lg md:text-xl font-bold text-yellow-300'>{pt.actual_pallet_count}p</span>
                                   </div>
 
                                   {/* Show compiled PTs */}
@@ -990,7 +994,7 @@ export default function ShipmentCard({
                                     </div>
                                   ) : pt.assigned_lane ? (
                                     <div className="flex flex-wrap items-center gap-2 mt-1 md:mt-2">
-                                      <div className="text-base md:text-xl font-bold text-white">
+                                      <div className="text-l md:text-lg font-bold text-white bg-purple-700 border border-purple-800 rounded-lg p-1 px-2">
                                         L{pt.assigned_lane}
                                       </div>
                                       {!isShipped && depthInfo && (
