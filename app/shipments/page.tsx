@@ -421,7 +421,7 @@ export default function ShipmentsPage() {
   const selectedSearchShipment = searchSelectedShipmentKey
     ? shipments.find(shipment => shipmentKey(shipment) === searchSelectedShipmentKey) || null
     : null;
-  const readyToShipCount = readyToShipActiveLoads.reduce((sum, load) => sum + load.rows.length, 0);
+  const readyToShipCount = readyToShipActiveLoads.length;
 
   function handleOpenSearchShipment(targetShipment: Shipment) {
     setSearchSelectedShipmentKey(shipmentKey(targetShipment));

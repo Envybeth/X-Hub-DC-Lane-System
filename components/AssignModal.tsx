@@ -48,6 +48,7 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
   const [isStaging, setIsStaging] = useState(false);
   const [stagingPUs, setStagingPUs] = useState<string[]>([]);
   const [allUnassignedPTs, setAllUnassignedPTs] = useState<Pickticket[]>([]);
+  const [isTouchDevice, setIsTouchDevice] = useState(false);
 
   const [containers, setContainers] = useState<Container[]>([]);
   const [selectedContainer, setSelectedContainer] = useState('');
@@ -107,6 +108,10 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
       setSelectedPTs({});
     }
   }, [selectedContainer, searchMode]);
+
+  useEffect(() => {
+    setIsTouchDevice(typeof window !== 'undefined' && (navigator.maxTouchPoints > 0 || 'ontouchstart' in window));
+  }, []);
 
   useEffect(() => {
     if (searchMode === 'pt') {
@@ -688,17 +693,46 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
     setDraggedItem(index);
   }
 
-  function handleDragOver(e: React.DragEvent, index: number) {
-    e.preventDefault();
-    if (draggedItem === null || draggedItem === index) return;
+  function reorderPTs(targetIndex: number) {
+    if (draggedItem === null || draggedItem === targetIndex) return;
 
     const newPTs = [...existingPTs];
     const draggedPT = newPTs[draggedItem];
     newPTs.splice(draggedItem, 1);
-    newPTs.splice(index, 0, draggedPT);
+    newPTs.splice(targetIndex, 0, draggedPT);
 
     setExistingPTs(newPTs);
+    setDraggedItem(targetIndex);
+  }
+
+  function handleDragOver(e: React.DragEvent, index: number) {
+    e.preventDefault();
+    reorderPTs(index);
+  }
+
+  function handleTouchStart(index: number) {
     setDraggedItem(index);
+  }
+
+  function handleTouchMove(e: React.TouchEvent) {
+    if (draggedItem === null) return;
+    e.preventDefault();
+
+    const touch = e.touches[0];
+    const element = document.elementFromPoint(touch.clientX, touch.clientY) as HTMLElement | null;
+    const card = element?.closest('[data-assignment-index]') as HTMLElement | null;
+    if (!card) return;
+
+    const indexValue = card.dataset.assignmentIndex;
+    if (!indexValue) return;
+
+    const targetIndex = parseInt(indexValue, 10);
+    if (Number.isNaN(targetIndex)) return;
+    reorderPTs(targetIndex);
+  }
+
+  function handleTouchEnd() {
+    void handleDragEnd();
   }
 
   async function handleDragEnd() {
@@ -840,11 +874,12 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                   return (
                     <div
                       key={assignment.id}
-                      draggable
-                      onDragStart={() => handleDragStart(index)}
-                      onDragOver={(e) => handleDragOver(e, index)}
-                      onDragEnd={handleDragEnd}
-                      className={`bg-gray-700 p-2 md:p-4 rounded-lg border-2 cursor-move hover:border-blue-500 transition-all ${isCompiled ? 'border-orange-500' : 'border-gray-600'
+                      data-assignment-index={index}
+                      draggable={!isTouchDevice}
+                      onDragStart={!isTouchDevice ? () => handleDragStart(index) : undefined}
+                      onDragOver={!isTouchDevice ? (e) => handleDragOver(e, index) : undefined}
+                      onDragEnd={!isTouchDevice ? handleDragEnd : undefined}
+                      className={`bg-gray-700 p-2 md:p-4 rounded-lg border-2 ${!isTouchDevice ? 'cursor-move hover:border-blue-500' : ''} transition-all ${isCompiled ? 'border-orange-500' : 'border-gray-600'
                         }`}
                     >
                       <div className="flex items-stretch gap-2 md:gap-4">
@@ -1015,7 +1050,13 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                         </div>
 
                         {/* Drag handle */}
-                        <div className="flex flex-col justify-center items-center flex-shrink-0 bg-gray-600 cursor-move touch-none px-3 md:px-2 min-w-[40px] md:min-w-0 rounded">
+                        <div
+                          onTouchStart={() => handleTouchStart(index)}
+                          onTouchMove={handleTouchMove}
+                          onTouchEnd={handleTouchEnd}
+                          onTouchCancel={handleTouchEnd}
+                          className="flex flex-col justify-center items-center flex-shrink-0 bg-gray-600 cursor-move touch-none px-3 md:px-2 min-w-[40px] md:min-w-0 rounded"
+                        >
                           <div className="text-gray-300 text-2xl leading-none">⋮</div>
                           <div className="text-gray-300 text-2xl leading-none">⋮</div>
                           <div className="text-gray-300 text-2xl leading-none">⋮</div>

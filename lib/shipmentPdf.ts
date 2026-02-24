@@ -48,9 +48,14 @@ function formatToday() {
 
 function formatPuDate(value: string) {
   if (!value) return '';
+  const isoDateMatch = value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (isoDateMatch) {
+    return `${Number(isoDateMatch[2])}/${Number(isoDateMatch[3])}`;
+  }
+
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) return value;
-  return `${parsed.getMonth() + 1}/${parsed.getDate()}`;
+  return `${parsed.getUTCMonth() + 1}/${parsed.getUTCDate()}`;
 }
 
 function drawCenteredWrappedText(

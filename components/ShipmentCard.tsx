@@ -71,6 +71,8 @@ export default function ShipmentCard({
   const [stagingLaneError, setStagingLaneError] = useState('');
   const [deletingShipment, setDeletingShipment] = useState(false);
   const [deleteConfirmText, setDeleteConfirmText] = useState('');
+  const [laneOrderByPtId, setLaneOrderByPtId] = useState<Record<number, number>>({});
+  const [stagingPTIds, setStagingPTIds] = useState<number[]>([]);
 
   //ocr
   const [scanningPT, setScanningPT] = useState<ShipmentPT | null>(null);
@@ -90,12 +92,18 @@ export default function ShipmentCard({
   const totalPallets = shipment.pts.reduce((sum, pt) => sum + pt.actual_pallet_count, 0);
   const movedCount = shipment.pts.filter(pt => pt.moved_to_staging && !pt.removed_from_staging).length;
   const movedPTsTotalPallets = shipment.pts.filter(pt => pt.moved_to_staging && !pt.removed_from_staging).reduce((sum, pt) => sum + pt.actual_pallet_count, 0);
+  const hasShippedPT = shipment.pts.some(pt => pt.status === 'shipped');
+  const hasReadyToShipPT = shipment.pts.some(pt => pt.status === 'ready_to_ship');
+  const isReadyToShipLoad = shipment.status === 'finalized' && hasReadyToShipPT && !hasShippedPT && !shipment.archived;
 
   const statusConfig = {
     not_started: { label: 'Not Started', color: 'bg-red-600', textColor: 'text-red-400' },
     in_process: { label: 'In Process', color: 'bg-orange-600', textColor: 'text-orange-400' },
     finalized: { label: 'Finalized', color: 'bg-green-600', textColor: 'text-green-400' }
   };
+  const headerStatus = hasShippedPT
+    ? { label: 'Shipped', color: 'bg-blue-600 text-white' }
+    : statusConfig[shipment.status];
 
   // Sync with prop
   useEffect(() => {
@@ -134,6 +142,9 @@ export default function ShipmentCard({
 
   //OCR move PT
   async function performMovePT(pt: ShipmentPT) {
+    setStagingPTIds((prev) => (prev.includes(pt.id) ? prev : [...prev, pt.id]));
+    showToast(`Staging PT ${pt.pt_number}...`, 'success');
+
     try {
       const { data: shipmentData } = await supabase
         .from('shipments')
@@ -185,17 +196,21 @@ export default function ShipmentCard({
         }
       }
 
-      // Get next position in staging lane
+      // Shift existing staging PTs back so newly staged PT is always #1.
       const { data: existingAssignments } = await supabase
         .from('lane_assignments')
-        .select('order_position')
+        .select('id, order_position')
         .eq('lane_number', shipment.staging_lane)
-        .order('order_position', { ascending: false })
-        .limit(1);
+        .order('order_position', { ascending: true });
 
-      const newPosition = existingAssignments && existingAssignments.length > 0
-        ? existingAssignments[0].order_position + 1
-        : 1;
+      if (existingAssignments) {
+        for (const assignment of existingAssignments) {
+          await supabase
+            .from('lane_assignments')
+            .update({ order_position: (assignment.order_position || 0) + 1 })
+            .eq('id', assignment.id);
+        }
+      }
 
       // Add to staging lane
       await supabase
@@ -204,7 +219,7 @@ export default function ShipmentCard({
           lane_number: shipment.staging_lane,
           pt_id: pt.id,
           pallet_count: pt.actual_pallet_count,
-          order_position: newPosition
+          order_position: 1
         });
 
       showToast(`✅ PT ${pt.pt_number} staged`, 'success');
@@ -212,6 +227,8 @@ export default function ShipmentCard({
     } catch (error) {
       console.error('Error moving PT:', error);
       showToast('Failed to move PT', 'error');
+    } finally {
+      setStagingPTIds((prev) => prev.filter((id) => id !== pt.id));
     }
   }
 
@@ -274,6 +291,18 @@ export default function ShipmentCard({
     return acc;
   }, {} as Record<string, ShipmentPT[]>);
 
+  const sortedPtsByLane = Object.fromEntries(
+    Object.entries(ptsByLane).map(([laneKey, pts]) => [
+      laneKey,
+      [...pts].sort((a, b) => {
+        const aOrder = laneOrderByPtId[a.id] ?? Number.MAX_SAFE_INTEGER;
+        const bOrder = laneOrderByPtId[b.id] ?? Number.MAX_SAFE_INTEGER;
+        if (aOrder !== bOrder) return aOrder - bOrder;
+        return b.id - a.id;
+      })
+    ])
+  ) as Record<string, ShipmentPT[]>;
+
   const sortedLanes = Object.keys(ptsByLane).sort((a, b) => {
     if (a.startsWith('staging_')) return -1;
     if (b.startsWith('staging_')) return 1;
@@ -285,8 +314,33 @@ export default function ShipmentCard({
   useEffect(() => {
     if (expanded) {
       fetchDepthInfo();
+      fetchLaneOrderMap();
     }
   }, [expanded, shipment.pts]);
+
+  async function fetchLaneOrderMap() {
+    const ptIds = shipment.pts.map((pt) => pt.id);
+    if (ptIds.length === 0) {
+      setLaneOrderByPtId({});
+      return;
+    }
+
+    const { data: assignments, error } = await supabase
+      .from('lane_assignments')
+      .select('pt_id, order_position')
+      .in('pt_id', ptIds);
+
+    if (error) {
+      console.error('Failed to fetch lane order positions:', error);
+      return;
+    }
+
+    const orderMap: Record<number, number> = {};
+    (assignments || []).forEach((assignment) => {
+      orderMap[assignment.pt_id] = assignment.order_position || Number.MAX_SAFE_INTEGER;
+    });
+    setLaneOrderByPtId(orderMap);
+  }
 
   async function fetchDepthInfo() {
     const depthMap: { [key: number]: { palletsInFront: number; maxCapacity: number } } = {};
@@ -687,15 +741,22 @@ export default function ShipmentCard({
               </div>
             </div>
           </div>
-          <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
-
+          <div className="flex flex-wrap items-center gap-2.5 w-full sm:w-auto">
             {shipment.staging_lane && (
               <div className="bg-purple-700 px-2 md:px-4 py-1 md:py-2 rounded-lg font-bold text-l md:text-base">
                 Staging: L{shipment.staging_lane}
               </div>
             )}
-            <div className={`px-2 md:px-4 py-1 md:py-2 rounded-lg font-bold text-xs md:text-base ${statusConfig[shipment.status].color}`}>
-              {statusConfig[shipment.status].label}
+            <div className="relative inline-flex mt-1 sm:mt-0">
+              <div className={`px-2 md:px-4 py-1 md:py-2 rounded-lg font-bold text-xs md:text-base ${headerStatus.color}`}>
+                {headerStatus.label}
+              </div>
+              {isReadyToShipLoad && (
+                <div className="absolute -top-1.5 -right-1 md:-top-2 md:-right-1 bg-blue-600 text-white px-1.5 md:px-2 py-[1px] rounded-full font-extrabold text-[8px] md:text-[10px] leading-none tracking-tight shadow-[0_0_10px_rgba(59,130,246,0.65)] ring-1 ring-blue-300/70 whitespace-nowrap pointer-events-none">
+                  <span className="md:hidden">READY ✈️</span>
+                  <span className="hidden md:inline">READY TO SHIP ✈️</span>
+                </div>
+              )}
             </div>
           </div>
         </button>
@@ -946,7 +1007,7 @@ export default function ShipmentCard({
                 const isUnassigned = laneKey === 'unassigned';
 
                 // Check if this group has any shipped PTs
-                const hasShippedPTs = ptsByLane[laneKey].some(pt => pt.status === 'shipped');
+                const hasShippedPTs = sortedPtsByLane[laneKey].some(pt => pt.status === 'shipped');
 
                 return (
                   <div key={laneKey} className="space-y-2 md:space-y-3">
@@ -965,7 +1026,7 @@ export default function ShipmentCard({
                       </>
                     )}
 
-                    {ptsByLane[laneKey].map(pt => {
+                    {sortedPtsByLane[laneKey].map(pt => {
                       const isShipped = pt.status === 'shipped';
                       const isArchived = isPTArchived(pt, mostRecentSync);
                       const isCompiled = pt.compiled_with && pt.compiled_with.length > 0;
@@ -977,6 +1038,7 @@ export default function ShipmentCard({
                       const hasLaneAssigned = pt.assigned_lane && pt.assigned_lane !== shipment.staging_lane;
                       const isCurrentlyStaged = pt.moved_to_staging && !pt.removed_from_staging;
                       const canMoveToStaging = hasLaneAssigned && !isCurrentlyStaged && shipment.staging_lane && shipment.status !== 'finalized';
+                      const isStagingInProgress = stagingPTIds.includes(pt.id);
 
                       return (
                         <div
@@ -1064,9 +1126,10 @@ export default function ShipmentCard({
                                   {canMoveToStaging && (
                                     <button
                                       onClick={() => handleMovePT(pt)}
-                                      className="bg-green-600 hover:bg-green-700 px-2 md:px-4 py-1.5 md:py-2 rounded-lg font-semibold text-xs md:text-base whitespace-nowrap"
+                                      disabled={isStagingInProgress}
+                                      className="bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed px-2 md:px-4 py-1.5 md:py-2 rounded-lg font-semibold text-xs md:text-base whitespace-nowrap"
                                     >
-                                      ✓ Stage
+                                      {isStagingInProgress ? '⏳ Staging...' : '✓ Stage'}
                                     </button>
                                   )}
                                   {!pt.assigned_lane && (
