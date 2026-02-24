@@ -56,7 +56,7 @@ export async function syncGoogleSheetData() {
 
     console.log(`📊 Syncing from sheet: ${firstSheetName}`);
 
-    // Fetch columns A through S (18 columns)
+    // Fetch columns A through S (19 columns)
     const response = await sheets.spreadsheets.values.get({
       spreadsheetId,
       range: `${firstSheetName}!A:S`,
@@ -136,7 +136,7 @@ export async function syncGoogleSheetData() {
             container_number: container_number || null,
             routing_number: routing_number || null,
             pu_number: pu_number || null,
-            carrier: carrier || null,
+            carrier: carrier?.trim() || null,
             pu_date: parseDate(pu_date),
             last_synced_at: new Date().toISOString(),
           },

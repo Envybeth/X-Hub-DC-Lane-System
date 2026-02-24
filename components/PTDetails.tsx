@@ -2,7 +2,7 @@
 
 import { useState } from 'react';
 import { Pickticket } from '@/types/pickticket';
-import { isPTDefunct } from '@/lib/utils';
+import { isPTArchived } from '@/lib/utils';
 
 interface PTDetailsProps {
     pt: Omit<Pickticket, 'id'> | any;
@@ -16,8 +16,8 @@ export default function PTDetails({ pt, onClose, mostRecentSync }: PTDetailsProp
     const [selectedTabIndex, setSelectedTabIndex] = useState(0);
     const displayPT = allPTs[selectedTabIndex];
     const statusInfo = getStatusInfo(displayPT);
-    const isDefunct = isPTDefunct(displayPT, mostRecentSync);
-    const showDefunct = isDefunct && !displayPT.assigned_lane;
+    const isArchived = isPTArchived(displayPT, mostRecentSync);
+    const showArchived = isArchived && !displayPT.assigned_lane && displayPT.status !== 'shipped';
 
 
 
@@ -83,14 +83,14 @@ export default function PTDetails({ pt, onClose, mostRecentSync }: PTDetailsProp
                         <div className="text-base md:text-lg break-all">{displayPT.container_number}</div>
                     </div>
 
-                    {/* Location OR DEFUNCT */}
+                    {/* Location OR ARCHIVED */}
                     <div className="col-span-2">
                         <div className="text-xs md:text-sm text-gray-400">
-                            {showDefunct ? 'Status' : 'Location'}
+                            {showArchived ? 'Status' : 'Location'}
                         </div>
-                        {showDefunct ? (
-                            <div className="bg-red-600 px-4 py-2 rounded-lg font-bold text-white inline-block text-xl">
-                                DEFUNCT
+                        {showArchived ? (
+                            <div className="bg-gray-700 px-4 py-2 rounded-lg font-bold text-white inline-block text-xl">
+                                ARCHIVED
                             </div>
                         ) : (
                             <div className="text-base md:text-lg font-bold">
@@ -110,7 +110,7 @@ export default function PTDetails({ pt, onClose, mostRecentSync }: PTDetailsProp
                     )}
 
                     {/* Status */}
-                    {!isDefunct &&
+                    {!isArchived &&
                         <div className="col-span-2">
                             <div className="text-xs md:text-sm text-gray-400">Status</div>
                             <div className={`inline-block px-3 py-1 rounded-lg font-bold text-sm ${statusInfo.color}`}>
@@ -161,7 +161,7 @@ export default function PTDetails({ pt, onClose, mostRecentSync }: PTDetailsProp
                             <div className="text-xs md:text-sm text-gray-400">Last Synced</div>
                             <div className="text-sm md:text-base text-gray-300">
                                 {new Date(displayPT.last_synced_at).toLocaleString()}
-                                {isArchived(displayPT.last_synced_at) && (
+                                {isLastSyncedOver7Days(displayPT.last_synced_at) && (
                                     <span className="ml-2 bg-yellow-600 px-2 py-0.5 rounded text-xs font-bold">
                                         ARCHIVED
                                     </span>
@@ -198,7 +198,7 @@ function getStatusInfo(pt: any): { label: string; color: string } {
     return statusMap[pt.status] || { label: pt.status, color: 'bg-gray-600' };
 }
 
-function isArchived(lastSyncedAt: string): boolean {
+function isLastSyncedOver7Days(lastSyncedAt: string): boolean {
     const syncDate = new Date(lastSyncedAt);
     const daysSinceSync = (Date.now() - syncDate.getTime()) / (1000 * 60 * 60 * 24);
     return daysSinceSync > 7;

@@ -4,8 +4,9 @@ import { useState, useEffect } from 'react';
 import { supabase } from '@/lib/supabase';
 import ConfirmModal from './ConfirmModal';
 import PTDetails from './PTDetails';
-import { isPTDefunct } from '@/lib/utils';
+import { isPTArchived } from '@/lib/utils';
 import { fetchCompiledPTInfo } from '@/lib/compiledPallets';
+import { exportShipmentSummaryPdf, ShipmentPdfLoad } from '@/lib/shipmentPdf';
 
 import OCRCamera from './OCRCamera';
 
@@ -38,6 +39,7 @@ export interface Shipment {
   staging_lane: string | null;
   status: 'not_started' | 'in_process' | 'finalized';
   archived?: boolean;
+  shipped_at?: string | null;
 }
 
 export interface ShipmentCardProps {
@@ -46,6 +48,7 @@ export interface ShipmentCardProps {
   mostRecentSync?: Date | null;
   isExpanded?: boolean;
   onToggleExpand?: (isExpanded: boolean) => void;
+  readOnly?: boolean;
 }
 
 
@@ -54,7 +57,8 @@ export default function ShipmentCard({
   onUpdate,
   mostRecentSync,
   isExpanded = false,
-  onToggleExpand
+  onToggleExpand,
+  readOnly = false
 }: ShipmentCardProps) {
   const [expanded, setExpanded] = useState(isExpanded);
   const [selectingLane, setSelectingLane] = useState(false);
@@ -116,6 +120,8 @@ export default function ShipmentCard({
 
   // THE WATCHDOG: Automatically syncs any PT placed into the staging lane into a "ready_to_ship" state.
   useEffect(() => {
+    if (readOnly) return;
+
     const unsyncedPTs = shipment.pts.filter(pt =>
       pt.assigned_lane === shipment.staging_lane &&
       (!pt.moved_to_staging || pt.removed_from_staging)
@@ -124,7 +130,7 @@ export default function ShipmentCard({
     if (unsyncedPTs.length > 0 && shipment.staging_lane) {
       autoSyncPTs(unsyncedPTs);
     }
-  }, [shipment.pts, shipment.staging_lane]);
+  }, [readOnly, shipment.pts, shipment.staging_lane]);
 
   //OCR move PT
   async function performMovePT(pt: ShipmentPT) {
@@ -635,6 +641,33 @@ export default function ShipmentCard({
     }
   }
 
+  function exportShipmentPDF() {
+    try {
+      const load: ShipmentPdfLoad = {
+        puNumber: shipment.pu_number || '',
+        carrier: shipment.carrier || '',
+        rows: shipment.pts.map(pt => ({
+          puDate: shipment.pu_date || '',
+          customer: pt.customer || '',
+          dc: pt.store_dc || '',
+          pickticket: pt.pt_number || '',
+          po: pt.po_number || '',
+          ctn: pt.ctn || '',
+          palletQty: pt.actual_pallet_count !== null && pt.actual_pallet_count !== undefined ? String(pt.actual_pallet_count) : '',
+          container: pt.container_number || '',
+          location: shipment.staging_lane ? `L${shipment.staging_lane}` : (pt.assigned_lane ? `L${pt.assigned_lane}` : ''),
+          notes: ''
+        }))
+      };
+
+      exportShipmentSummaryPdf([load], `shipment-summary-PU-${shipment.pu_number}`);
+      showToast('Shipment PDF exported', 'success');
+    } catch (error) {
+      console.error('Error exporting shipment PDF:', error);
+      showToast('Failed to export PDF', 'error');
+    }
+  }
+
   return (
     <>
       <div className="bg-gray-800 rounded-lg border-2 border-gray-600">
@@ -672,7 +705,7 @@ export default function ShipmentCard({
           <div className="p-3 md:p-6 border-t-2 border-gray-600 space-y-4 md:space-y-6">
             {/* Action buttons - wrap on mobile */}
             {/* Only show action buttons if NOT archived */}
-            {!shipment.archived && shipment.staging_lane && (
+            {!readOnly && !shipment.archived && shipment.staging_lane && (
               <>
                 {/* Change Lane Button */}
                 {shipment.staging_lane && !changingStagingLane && (
@@ -769,7 +802,7 @@ export default function ShipmentCard({
             )}
 
             {/* Staging lane selection - TEXT INPUT */}
-            {!shipment.staging_lane && !shipment.archived ? (
+            {!readOnly && !shipment.staging_lane && !shipment.archived ? (
               <div className="bg-yellow-900 border-2 border-yellow-600 p-3 md:p-4 rounded-lg">
                 <div className="font-bold text-base md:text-xl mb-2 md:mb-3">⚠️ Select Staging Lane</div>
                 <p className="text-xs md:text-sm mb-3 md:mb-4">Enter a lane number to consolidate all PTs</p>
@@ -810,7 +843,7 @@ export default function ShipmentCard({
                   </div>
                 )}
               </div>
-            ) : shipment.staging_lane && !shipment.archived ? (
+            ) : !readOnly && shipment.staging_lane && !shipment.archived ? (
               <div className="bg-gray-700 p-3 md:p-4 rounded-lg">
                 <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
                   <div>
@@ -830,67 +863,75 @@ export default function ShipmentCard({
                     </button>
                   )}
                   {shipment.status === 'finalized' && !shipment.archived && (
-                    <button
-                      onClick={() => showConfirm(
-                        'Mark as Shipped',
-                        'This will clear the staging lane and archive this shipment. Continue?',
-                        async () => {
-                          try {
-                            // Archive shipment AND clear staging lane
-                            await supabase
-                              .from('shipments')
-                              .update({
-                                archived: true,
-                                staging_lane: null,
-                                updated_at: new Date().toISOString()
-                              })
-                              .eq('pu_number', shipment.pu_number)
-                              .eq('pu_date', shipment.pu_date);
+                    <div className="flex flex-col sm:flex-row gap-2 w-full sm:w-auto">
+                      <button
+                        onClick={exportShipmentPDF}
+                        className="bg-blue-600 hover:bg-blue-700 px-3 md:px-6 py-2 md:py-3 rounded-lg font-bold text-sm md:text-base whitespace-nowrap"
+                      >
+                        Export Shipment PDF
+                      </button>
+                      <button
+                        onClick={() => showConfirm(
+                          'Mark as Shipped',
+                          'This will clear the staging lane and archive this shipment. Continue?',
+                          async () => {
+                            try {
+                              // Archive shipment AND clear staging lane
+                              await supabase
+                                .from('shipments')
+                                .update({
+                                  archived: true,
+                                  staging_lane: null,
+                                  updated_at: new Date().toISOString()
+                                })
+                                .eq('pu_number', shipment.pu_number)
+                                .eq('pu_date', shipment.pu_date);
 
-                            // Get PT IDs directly from picktickets by pu_number and pu_date
-                            const { data: ptsToShip } = await supabase
-                              .from('picktickets')
-                              .select('id')
-                              .eq('pu_number', shipment.pu_number)
-                              .eq('pu_date', shipment.pu_date);
+                              // Get PT IDs directly from picktickets by pu_number and pu_date
+                              const { data: ptsToShip } = await supabase
+                                .from('picktickets')
+                                .select('id')
+                                .eq('pu_number', shipment.pu_number)
+                                .eq('pu_date', shipment.pu_date);
 
-                            const ptIds = ptsToShip?.map(pt => pt.id) || [];
+                              const ptIds = ptsToShip?.map(pt => pt.id) || [];
 
-                            if (ptIds.length === 0) {
-                              showToast('No PTs found to ship', 'error');
-                              return;
+                              if (ptIds.length === 0) {
+                                showToast('No PTs found to ship', 'error');
+                                return;
+                              }
+
+                              // Clear lane assignments
+                              await supabase
+                                .from('lane_assignments')
+                                .delete()
+                                .in('pt_id', ptIds);
+
+                              // This is ARCHIVING - CHANGE this one
+                              await supabase
+                                .from('picktickets')
+                                .update({
+                                  status: 'shipped'
+                                  // ✅ REMOVE the lines that clear assigned_lane and actual_pallet_count
+                                })
+                                .in('id', ptIds);
+
+                              console.log(`✅ Marked ${ptIds.length} PTs as shipped`);
+
+                              showToast('Shipment marked as shipped!', 'success');
+                              onUpdate();
+                            } catch (error) {
+                              console.error('Error marking as shipped:', error);
+                              showToast('Failed to mark as shipped', 'error');
                             }
-
-                            // Clear lane assignments
-                            await supabase
-                              .from('lane_assignments')
-                              .delete()
-                              .in('pt_id', ptIds);
-
-                            // This is ARCHIVING - CHANGE this one
-                            await supabase
-                              .from('picktickets')
-                              .update({
-                                status: 'shipped'
-                                // ✅ REMOVE the lines that clear assigned_lane and actual_pallet_count
-                              })
-                              .in('id', ptIds);
-
-                            console.log(`✅ Marked ${ptIds.length} PTs as shipped`);
-
-                            showToast('Shipment marked as shipped!', 'success');
-                            onUpdate();
-                          } catch (error) {
-                            console.error('Error marking as shipped:', error);
-                            showToast('Failed to mark as shipped', 'error');
+                            setConfirmModal({ ...confirmModal, isOpen: false });
                           }
-                          setConfirmModal({ ...confirmModal, isOpen: false });
-                        }
-                      )}
-                      className="bg-green-600 hover:bg-green-700 px-3 md:px-6 py-2 md:py-3 rounded-lg font-bold text-sm md:text-base whitespace-nowrap"
-                    >
-                      ✈️ Mark as Shipped
-                    </button>
+                        )}
+                        className="bg-green-600 hover:bg-green-700 px-3 md:px-6 py-2 md:py-3 rounded-lg font-bold text-sm md:text-base whitespace-nowrap"
+                      >
+                        ✈️ Mark as Shipped
+                      </button>
+                    </div>
                   )}
                 </div>
               </div>
@@ -926,7 +967,7 @@ export default function ShipmentCard({
 
                     {ptsByLane[laneKey].map(pt => {
                       const isShipped = pt.status === 'shipped';
-                      const isDefunct = isPTDefunct(pt, mostRecentSync);
+                      const isArchived = isPTArchived(pt, mostRecentSync);
                       const isCompiled = pt.compiled_with && pt.compiled_with.length > 0;
                       const depthInfo = ptDepthInfo[pt.id];
                       const depthColor = depthInfo
@@ -984,13 +1025,13 @@ export default function ShipmentCard({
                                   )}
 
                                   {/* Show location/status */}
-                                  {isDefunct ? (
-                                    <div className="bg-red-600 px-3 py-1 rounded-lg font-bold text-white inline-block mt-1">
-                                      DEFUNCT
-                                    </div>
-                                  ) : isShipped ? (
+                                  {isShipped ? (
                                     <div className="text-base md:text-xl font-bold text-green-400 mt-1">
                                       ✈️ Shipped
+                                    </div>
+                                  ) : isArchived ? (
+                                    <div className="bg-gray-700 px-3 py-1 rounded-lg font-bold text-white inline-block mt-1">
+                                      ARCHIVED
                                     </div>
                                   ) : pt.assigned_lane ? (
                                     <div className="flex flex-wrap items-center gap-2 mt-1 md:mt-2">
@@ -1018,7 +1059,7 @@ export default function ShipmentCard({
                               >
                                 Details
                               </button>
-                              {!isShipped && (
+                              {!isShipped && !readOnly && (
                                 <>
                                   {canMoveToStaging && (
                                     <button

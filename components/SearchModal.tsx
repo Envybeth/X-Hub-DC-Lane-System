@@ -1,10 +1,10 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { supabase } from '@/lib/supabase';
 import PTDetails from './PTDetails';
 import { Pickticket } from '@/types/pickticket';
-import { isPTDefunct } from '@/lib/utils';
+import { isPTArchived } from '@/lib/utils';
 import { fetchCompiledPTInfo } from '@/lib/compiledPallets';
 import { useRouter } from 'next/navigation';
 
@@ -27,7 +27,34 @@ export default function SearchModal({ onClose, mostRecentSync }: SearchModalProp
   const [searching, setSearching] = useState(false);
   const [searched, setSearched] = useState(false);
   const [viewingPTDetails, setViewingPTDetails] = useState<Pickticket | null>(null);
+  const [fallbackMostRecentSync, setFallbackMostRecentSync] = useState<Date | null>(null);
   const router = useRouter();
+  const effectiveMostRecentSync = mostRecentSync || fallbackMostRecentSync;
+
+  useEffect(() => {
+    if (mostRecentSync) return;
+
+    let cancelled = false;
+
+    async function fetchMostRecentSync() {
+      const { data } = await supabase
+        .from('picktickets')
+        .select('last_synced_at')
+        .order('last_synced_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (!cancelled && data?.last_synced_at) {
+        setFallbackMostRecentSync(new Date(data.last_synced_at));
+      }
+    }
+
+    fetchMostRecentSync();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [mostRecentSync]);
 
   async function handleSearch() {
     if (!searchQuery.trim()) return;
@@ -116,8 +143,8 @@ export default function SearchModal({ onClose, mostRecentSync }: SearchModalProp
   }
 
   function PTResultCard({ pt, mostRecentSync }: { pt: Pickticket; mostRecentSync?: Date | null }) {
-    const isDefunct = isPTDefunct(pt, mostRecentSync);
-    const showDefunct = isDefunct && !pt.assigned_lane; // ADD THIS
+    const isArchived = isPTArchived(pt, mostRecentSync);
+    const showArchived = isArchived && !pt.assigned_lane; // ADD THIS
     const isCompiled = pt.compiled_with && pt.compiled_with.length > 0;
 
     return (
@@ -142,10 +169,10 @@ export default function SearchModal({ onClose, mostRecentSync }: SearchModalProp
               <div className="text-lg">{pt.customer}</div>
             </div>
             <div>
-              <div className="text-sm text-gray-400">{showDefunct ? 'Status' : 'Location'}</div>
-              {showDefunct ? (
-                <div className="bg-red-600 px-3 py-1 rounded-lg font-bold text-white inline-block">
-                  DEFUNCT
+              <div className="text-sm text-gray-400">{showArchived ? 'Status' : 'Location'}</div>
+              {showArchived ? (
+                <div className="bg-gray-600 px-3 py-1 rounded-lg font-bold text-white inline-block">
+                  ARCHIVED
                 </div>
               ) : (
                 <div
@@ -191,8 +218,8 @@ export default function SearchModal({ onClose, mostRecentSync }: SearchModalProp
   }
 
   function PTCompactCard({ pt, mostRecentSync }: { pt: Pickticket; mostRecentSync?: Date | null }) {
-    const isDefunct = isPTDefunct(pt, mostRecentSync);
-    const showDefunct = isDefunct && !pt.assigned_lane; // ADD THIS
+    const isArchived = isPTArchived(pt, mostRecentSync);
+    const showArchived = isArchived && !pt.assigned_lane; // ADD THIS
     const isCompiled = pt.compiled_with && pt.compiled_with.length > 0;
 
     return (
@@ -206,9 +233,9 @@ export default function SearchModal({ onClose, mostRecentSync }: SearchModalProp
           <div className="flex-1">
             <div className="font-bold">PT #{pt.pt_number}</div>
             <div className="text-xs text-gray-300">PO: {pt.po_number}</div>
-            {showDefunct ? (
+            {showArchived ? (
               <div className="bg-red-600 px-2 py-1 rounded text-xs font-bold text-white inline-block mt-1">
-                DEFUNCT
+                ARCHIVED
               </div>
             ) : (
               <>
@@ -316,7 +343,7 @@ export default function SearchModal({ onClose, mostRecentSync }: SearchModalProp
             ) : (
               <div className="space-y-4">
                 {results.map((result) => (
-                  <PTResultCard key={result.id} pt={result} />
+                  <PTResultCard key={result.id} pt={result} mostRecentSync={effectiveMostRecentSync} />
                 ))}
               </div>
             )}
@@ -336,7 +363,7 @@ export default function SearchModal({ onClose, mostRecentSync }: SearchModalProp
               <div className="space-y-4">
                 {containerGroups.map((group) => {
                   const isExpanded = expandedContainers.has(group.container_number);
-                  const allDefunct = group.pts.every(pt => isPTDefunct(pt, mostRecentSync));
+                  const allArchived = group.pts.every(pt => isPTArchived(pt, effectiveMostRecentSync));
 
                   // Group PTs by customer for multi-column layout
                   const ptsByCustomer = group.pts.reduce((acc, pt) => {
@@ -349,7 +376,7 @@ export default function SearchModal({ onClose, mostRecentSync }: SearchModalProp
                   const customers = Object.keys(ptsByCustomer).sort();
 
                   return (
-                    <div key={group.container_number} className={`bg-gray-800 rounded-lg border-2 ${allDefunct ? 'border-red-500' : 'border-purple-500'}`}>
+                    <div key={group.container_number} className={`bg-gray-800 rounded-lg border-2 ${allArchived ? 'border-red-500' : 'border-purple-500'}`}>
                       {/* Container Header - Clickable */}
                       <button
                         onClick={() => toggleContainer(group.container_number)}
@@ -368,9 +395,9 @@ export default function SearchModal({ onClose, mostRecentSync }: SearchModalProp
                             </div>
                           </div>
                         </div>
-                        {allDefunct && (
+                        {allArchived && (
                           <div className="bg-red-600 px-4 py-2 rounded-lg font-bold text-white">
-                            ALL DEFUNCT
+                            ALL ARCHIVED
                           </div>
                         )}
                       </button>
@@ -386,7 +413,7 @@ export default function SearchModal({ onClose, mostRecentSync }: SearchModalProp
                                 </h4>
                                 <div className="space-y-3">
                                   {ptsByCustomer[customer].map((pt) => (
-                                    <PTCompactCard key={pt.id} pt={pt} />
+                                    <PTCompactCard key={pt.id} pt={pt} mostRecentSync={effectiveMostRecentSync} />
                                   ))}
                                 </div>
                               </div>
@@ -408,7 +435,7 @@ export default function SearchModal({ onClose, mostRecentSync }: SearchModalProp
         <PTDetails
           pt={viewingPTDetails}
           onClose={() => setViewingPTDetails(null)}
-          mostRecentSync={mostRecentSync}
+          mostRecentSync={effectiveMostRecentSync}
         />
       )}
     </div>

@@ -1,10 +1,20 @@
-export function isPTDefunct(pt: { last_synced_at?: string }, mostRecentSyncDate?: Date | null): boolean {
-  if (!pt.last_synced_at) return true; // No sync date = defunct
-  if (!mostRecentSyncDate) return false; // Can't determine without reference date
-  
+function getSyncAgeInDays(pt: { last_synced_at?: string }, mostRecentSyncDate?: Date | null): number | null {
+  if (!pt.last_synced_at || !mostRecentSyncDate) return null;
+
   const ptSyncDate = new Date(pt.last_synced_at);
-  const daysDifference = Math.abs(mostRecentSyncDate.getTime() - ptSyncDate.getTime()) / (1000 * 60 * 60 * 24);
-  
-  // PT is defunct if it's more than 2 days behind the most recent sync
+  return Math.abs(mostRecentSyncDate.getTime() - ptSyncDate.getTime()) / (1000 * 60 * 60 * 24);
+}
+
+export function isPTArchived(pt: { last_synced_at?: string }, mostRecentSyncDate?: Date | null): boolean {
+  if (!pt.last_synced_at) return true;
+  const daysDifference = getSyncAgeInDays(pt, mostRecentSyncDate);
+  if (daysDifference === null) return false;
   return daysDifference > 1;
+}
+
+export function isPTArchivedOver60Days(pt: { last_synced_at?: string }, mostRecentSyncDate?: Date | null): boolean {
+  if (!pt.last_synced_at) return true;
+  const daysDifference = getSyncAgeInDays(pt, mostRecentSyncDate);
+  if (daysDifference === null) return false;
+  return daysDifference > 60;
 }

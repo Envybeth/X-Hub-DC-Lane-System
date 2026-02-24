@@ -9,7 +9,7 @@ import { Pickticket } from '@/types/pickticket';
 import { createCompiledPallet } from '@/lib/compiledPallets';
 import { fetchCompiledPTInfo } from '@/lib/compiledPallets';
 
-import { isPTDefunct } from '@/lib/utils';
+import { isPTArchived, isPTArchivedOver60Days } from '@/lib/utils';
 
 
 interface Lane {
@@ -63,7 +63,7 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
 
   const [viewingSearchPTDetails, setViewingSearchPTDetails] = useState<Pickticket | null>(null);
 
-  //defunct pts
+  // archived pts
   const [mostRecentSync, setMostRecentSync] = useState<Date | null>(null);
 
   //compiling PTs
@@ -294,10 +294,6 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
       ? new Date(recentPT.last_synced_at)
       : null;
 
-    const oneDayAgo = mostRecentSync
-      ? new Date(mostRecentSync.getTime() - 1 * 24 * 60 * 60 * 1000).toISOString()  // CHANGED from 2 days to 1 day
-      : null;
-
     const { data } = await supabase
       .from('picktickets')
       .select('*')
@@ -307,8 +303,9 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
       .order('pt_number');
 
     if (data) {
-      setAllPicktickets(data);
-      setAllUnassignedPTs(data);
+      const visibleForAssign = data.filter(pt => !isPTArchivedOver60Days(pt, mostRecentSync));
+      setAllPicktickets(visibleForAssign);
+      setAllUnassignedPTs(visibleForAssign);
     }
   }
 
@@ -325,10 +322,6 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
       ? new Date(recentPT.last_synced_at)
       : null;
 
-    const oneDayAgo = mostRecentSync
-      ? new Date(mostRecentSync.getTime() - 1 * 24 * 60 * 60 * 1000).toISOString()  // CHANGED from 2 days to 1 day
-      : null;
-
     const { data } = await supabase
       .from('picktickets')
       .select('*')
@@ -338,7 +331,10 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
       .neq('customer', 'PAPER')
       .order('pt_number');
 
-    if (data) setPicktickets(data);
+    if (data) {
+      const visibleForAssign = data.filter(pt => !isPTArchivedOver60Days(pt, mostRecentSync));
+      setPicktickets(visibleForAssign);
+    }
   }
 
   //fetch most recent sync
@@ -636,19 +632,10 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
       const ptToMove = existingPTs.find(pt => pt.id === movingPT.assignmentId);
       if (!ptToMove) return;
 
-      // Calculate current capacity of target lane
       const { data: targetAssignments } = await supabase
         .from('lane_assignments')
         .select('pallet_count, order_position')
         .eq('lane_number', String(targetLane.lane_number));
-
-      const targetCurrentPallets = targetAssignments?.reduce((sum, a) => sum + a.pallet_count, 0) || 0;
-
-      if (targetCurrentPallets + ptToMove.pallet_count > targetLane.max_capacity) {
-        setMoveLaneError('Target lane full');
-        setTimeout(() => setMoveLaneError(''), 3000);
-        return;
-      }
 
       const newPosition = targetAssignments && targetAssignments.length > 0
         ? Math.max(...targetAssignments.map(a => a.order_position)) + 1
@@ -1135,7 +1122,7 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                       <div className="space-y-2 md:space-y-3">
                         {ptsByCustomer[customer].map(pt => {
                           const isSelected = selectedPTs[pt.id] !== undefined;
-                          const isDefunct = isPTDefunct(pt, mostRecentSync); // ADD THIS
+                          const isArchived = isPTArchived(pt, mostRecentSync); // ADD THIS
 
                           return (
                             <div
@@ -1156,10 +1143,10 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                                 <div className="flex-1 min-w-0">
                                   <div className="flex items-center gap-2 flex-wrap">
                                     <div className="font-bold text-sm md:text-base break-all">PT #{pt.pt_number}</div>
-                                    {/* ADD DEFUNCT BADGE */}
-                                    {isDefunct && (
-                                      <span className="bg-red-600 px-1.5 py-0.5 rounded text-[8px] md:text-[10px] font-bold text-white">
-                                        DEFUNCT
+                                    {/* ADD ARCHIVED BADGE */}
+                                    {isArchived && (
+                                      <span className="bg-gray-700 px-1.5 py-0.5 rounded text-[8px] md:text-[10px] font-bold text-white">
+                                        ARCHIVED
                                       </span>
                                     )}
                                   </div>
@@ -1237,7 +1224,7 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                                 <div className="space-y-2">
                                   {groupPTs.map((item, idx) => {
                                     if (!item) return null;
-                                    const isDefunct = isPTDefunct(item.pt, mostRecentSync);
+                                    const isArchived = isPTArchived(item.pt, mostRecentSync);
 
                                     return (
                                       <div key={item.pt.id} className={`${idx > 0 ? 'border-t border-orange-400 pt-2' : ''}`}>
@@ -1245,9 +1232,9 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                                           <div className="text-xs md:text-sm min-w-0 flex-1">
                                             <div className="flex items-center gap-2 flex-wrap">
                                               <div className="font-bold break-all">PT #{item.pt.pt_number}</div>
-                                              {isDefunct && (
-                                                <span className="bg-red-600 px-1.5 py-0.5 rounded text-[8px] font-bold text-white">
-                                                  DEFUNCT
+                                              {isArchived && (
+                                                <span className="bg-gray-700 px-1.5 py-0.5 rounded text-[8px] font-bold text-white">
+                                                  ARCHIVED
                                                 </span>
                                               )}
                                             </div>
@@ -1294,7 +1281,7 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                           selectedPTDetails_summary.forEach((item, idx) => {
                             if (!item || renderedPTIds.has(item.pt.id)) return;
 
-                            const isDefunct = isPTDefunct(item.pt, mostRecentSync);
+                            const isArchived = isPTArchived(item.pt, mostRecentSync);
                             const isInCompilingSet = compilingPTs.has(item.pt.id);
 
                             elements.push(
@@ -1302,9 +1289,9 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                                 <div className="text-xs md:text-sm min-w-0 flex-1">
                                   <div className="flex items-center gap-2 flex-wrap">
                                     <div className="font-bold break-all">PT #{item.pt.pt_number}</div>
-                                    {isDefunct && (
-                                      <span className="bg-red-600 px-1.5 py-0.5 rounded text-[8px] font-bold text-white">
-                                        DEFUNCT
+                                    {isArchived && (
+                                      <span className="bg-gray-700 px-1.5 py-0.5 rounded text-[8px] font-bold text-white">
+                                        ARCHIVED
                                       </span>
                                     )}
                                   </div>
@@ -1426,7 +1413,7 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                     <span>Pallets: {totalNewPallets} / {availableCapacity} available</span>
                   </div>
                   {totalNewPallets > availableCapacity && (
-                    <div className="text-red-500 mt-2 text-xs md:text-base">⚠️ Exceeds capacity!</div>
+                    <div className="text-yellow-400 mt-2 text-xs md:text-base">⚠️ Over lane max (allowed)</div>
                   )}
                 </div>
               )}
@@ -1434,7 +1421,7 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
               {/* Assign button */}
               <button
                 onClick={handleAssign}
-                disabled={loading || Object.keys(selectedPTs).length === 0 || totalNewPallets > availableCapacity}
+                disabled={loading || Object.keys(selectedPTs).length === 0}
                 className="w-full bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed py-3 md:py-4 rounded-lg font-bold text-base md:text-xl"
               >
                 {loading ? 'Assigning...' : `Assign ${Object.keys(selectedPTs).length} PTs`}
