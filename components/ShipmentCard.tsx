@@ -126,7 +126,7 @@ export default function ShipmentCard({
     }
   }, [toast]);
 
-  // THE WATCHDOG: Automatically syncs any PT placed into the staging lane into a "ready_to_ship" state.
+  // THE WATCHDOG: Automatically syncs PTs in the staging lane to staged/ready_to_ship based on shipment status.
   useEffect(() => {
     if (readOnly) return;
 
@@ -236,12 +236,13 @@ export default function ShipmentCard({
     try {
       const { data: shipmentData } = await supabase
         .from('shipments')
-        .select('id')
+        .select('id, status')
         .eq('pu_number', shipment.pu_number)
         .eq('pu_date', shipment.pu_date)
         .single();
 
       if (!shipmentData) return;
+      const ptStatus = shipmentData.status === 'finalized' ? 'ready_to_ship' : 'staged';
 
       let syncedCount = 0;
       for (const pt of ptsToSync) {
@@ -256,7 +257,7 @@ export default function ShipmentCard({
 
         await supabase
           .from('picktickets')
-          .update({ status: 'ready_to_ship' })
+          .update({ status: ptStatus })
           .eq('id', pt.id);
 
         syncedCount++;
@@ -267,6 +268,44 @@ export default function ShipmentCard({
       }
     } catch (error) {
       console.error('Auto-sync failed:', error);
+    }
+  }
+
+  function handleUnfinalizeShipment() {
+    showConfirm(
+      'Un-Finalize Shipment',
+      'Move this PU load back to In Process? Ready to Ship PTs will return to Staged so you can continue adding PTs.',
+      async () => {
+        await unfinalizeShipmentAction();
+        setConfirmModal((prev) => ({ ...prev, isOpen: false }));
+      }
+    );
+  }
+
+  async function unfinalizeShipmentAction() {
+    try {
+      await supabase
+        .from('shipments')
+        .update({ status: 'in_process', updated_at: new Date().toISOString() })
+        .eq('pu_number', shipment.pu_number)
+        .eq('pu_date', shipment.pu_date);
+
+      const readyPTIds = shipment.pts
+        .filter((pt) => pt.status === 'ready_to_ship')
+        .map((pt) => pt.id);
+
+      if (readyPTIds.length > 0) {
+        await supabase
+          .from('picktickets')
+          .update({ status: 'staged' })
+          .in('id', readyPTIds);
+      }
+
+      showToast('Shipment moved back to In Process', 'success');
+      onUpdate();
+    } catch (error) {
+      console.error('Error un-finalizing shipment:', error);
+      showToast('Failed to un-finalize shipment', 'error');
     }
   }
 
@@ -924,6 +963,12 @@ export default function ShipmentCard({
                   )}
                   {shipment.status === 'finalized' && !shipment.archived && (
                     <div className="flex flex-col sm:flex-row gap-2 w-full sm:w-auto">
+                      <button
+                        onClick={handleUnfinalizeShipment}
+                        className="bg-orange-600 hover:bg-orange-700 px-3 md:px-6 py-2 md:py-3 rounded-lg font-bold text-sm md:text-base whitespace-nowrap"
+                      >
+                        Un-Finalize
+                      </button>
                       <button
                         onClick={exportShipmentPDF}
                         className="bg-blue-600 hover:bg-blue-700 px-3 md:px-6 py-2 md:py-3 rounded-lg font-bold text-sm md:text-base whitespace-nowrap"
