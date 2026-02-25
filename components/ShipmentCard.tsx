@@ -652,19 +652,18 @@ export default function ShipmentCard({
 
   async function handleFinalizeShipment() {
     const allMoved = shipment.pts.every(pt => pt.moved_to_staging && !pt.removed_from_staging);
+    const message = allMoved
+      ? 'Finalize this PU load now? This will set staged PTs to Ready to Ship.'
+      : 'Not all PTs are moved to staging. Finalize this PU load anyway? This will set currently staged PTs to Ready to Ship.';
 
-    if (!allMoved) {
-      showConfirm(
-        'Finalize Shipment',
-        'Not all PTs moved to staging. Finalize anyway?',
-        async () => {
-          await finalizeShipmentAction();
-          setConfirmModal({ ...confirmModal, isOpen: false });
-        }
-      );
-    } else {
-      await finalizeShipmentAction();
-    }
+    showConfirm(
+      'Finalize Shipment',
+      message,
+      async () => {
+        await finalizeShipmentAction();
+        setConfirmModal((prev) => ({ ...prev, isOpen: false }));
+      }
+    );
   }
 
   async function finalizeShipmentAction() {

@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { supabase } from '@/lib/supabase';
 import Link from 'next/link';
 
@@ -27,6 +27,138 @@ export default function PrinterPage() {
   const [statusMsg, setStatusMsg] = useState('');
   const [showPasswordPrompt, setShowPasswordPrompt] = useState(false);
   const [passwordInput, setPasswordInput] = useState('');
+  const [showAnnieModal, setShowAnnieModal] = useState(false);
+  const [annieProcessing, setAnnieProcessing] = useState(false);
+  const [annieMessage, setAnnieMessage] = useState('');
+  const [annieDragActive, setAnnieDragActive] = useState(false);
+  const annieFileInputRef = useRef<HTMLInputElement | null>(null);
+
+  function normalizeKey(value: unknown): string {
+    if (value === null || value === undefined) return '';
+    if (typeof value === 'number') return Number.isInteger(value) ? String(value) : String(value);
+    if (typeof value === 'string') return value.trim();
+    if (typeof value === 'object') {
+      const maybeText = value as { text?: unknown; result?: unknown };
+      if (typeof maybeText.text === 'string') return maybeText.text.trim();
+      if (maybeText.result !== undefined) return normalizeKey(maybeText.result);
+    }
+    return String(value).trim();
+  }
+
+  function isBlankValue(value: unknown): boolean {
+    if (value === null || value === undefined) return true;
+    if (typeof value === 'string') return value.trim().length === 0;
+    if (typeof value === 'object') {
+      const maybeFormula = value as { result?: unknown; text?: unknown };
+      if (maybeFormula.result !== undefined) return isBlankValue(maybeFormula.result);
+      if (typeof maybeFormula.text === 'string') return maybeFormula.text.trim().length === 0;
+    }
+    return false;
+  }
+
+  function getOutputFileName(originalName: string): string {
+    const dotIndex = originalName.lastIndexOf('.');
+    if (dotIndex <= 0) return `${originalName}-annie-utd.xlsx`;
+    const nameOnly = originalName.slice(0, dotIndex);
+    const ext = originalName.slice(dotIndex);
+    return `${nameOnly}-annie-utd${ext}`;
+  }
+
+  async function handleAnnieFile(file: File) {
+    if (!file) return;
+    const lowerName = file.name.toLowerCase();
+    if (!lowerName.endsWith('.xlsx')) {
+      setAnnieMessage('❌ Please upload an .xlsx file.');
+      return;
+    }
+
+    setAnnieProcessing(true);
+    setAnnieMessage('Reading file and matching PT/PO rows...');
+
+    try {
+      const { default: ExcelJS } = await import('exceljs');
+      const workbook = new ExcelJS.Workbook();
+      const buffer = await file.arrayBuffer();
+      await workbook.xlsx.load(buffer);
+
+      const sheet = workbook.worksheets[0];
+      if (!sheet) {
+        setAnnieMessage('❌ No worksheet found in the uploaded file.');
+        return;
+      }
+
+      const { data: palletRows, error } = await supabase
+        .from('picktickets')
+        .select('pt_number, po_number, actual_pallet_count')
+        .not('actual_pallet_count', 'is', null);
+
+      if (error) {
+        setAnnieMessage('❌ Failed to load pallet data from Supabase.');
+        return;
+      }
+
+      const palletMap = new Map<string, number>();
+      (palletRows || []).forEach((row) => {
+        const pt = normalizeKey(row.pt_number);
+        const po = normalizeKey(row.po_number);
+        const pallets = typeof row.actual_pallet_count === 'number'
+          ? row.actual_pallet_count
+          : Number.parseInt(String(row.actual_pallet_count ?? ''), 10);
+
+        if (!pt || !po || Number.isNaN(pallets)) return;
+        palletMap.set(`${pt}::${po}`, pallets);
+      });
+
+      let filledCount = 0;
+      const lastRowNumber = sheet.rowCount;
+
+      for (let rowNumber = 2; rowNumber <= lastRowNumber; rowNumber++) {
+        const row = sheet.getRow(rowNumber);
+        const ptValue = normalizeKey(row.getCell(4).value);
+        const poValue = normalizeKey(row.getCell(5).value);
+        if (!ptValue || !poValue) continue;
+
+        const palletsCell = row.getCell(7);
+        if (!isBlankValue(palletsCell.value)) continue;
+
+        const mapKey = `${ptValue}::${poValue}`;
+        const pallets = palletMap.get(mapKey);
+        if (pallets === undefined) continue;
+
+        palletsCell.value = pallets;
+        palletsCell.font = {
+          ...(palletsCell.font || {}),
+          name: 'Calibri',
+          size: 18,
+          bold: true,
+          color: { argb: 'FFFF0000' }
+        };
+        filledCount++;
+      }
+
+      const updatedBuffer = await workbook.xlsx.writeBuffer();
+      const blob = new Blob(
+        [updatedBuffer],
+        { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }
+      );
+      const downloadUrl = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = downloadUrl;
+      anchor.download = getOutputFileName(file.name);
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.setTimeout(() => URL.revokeObjectURL(downloadUrl), 2000);
+
+      setAnnieMessage(`✅ Done. Filled ${filledCount} pallet cell${filledCount === 1 ? '' : 's'} and downloaded.`);
+      setShowAnnieModal(false);
+    } catch (processError) {
+      console.error('Annie UTD processing failed:', processError);
+      setAnnieMessage('❌ Failed to process the file.');
+    } finally {
+      setAnnieProcessing(false);
+    }
+  }
 
   async function handleSearch(e: React.FormEvent) {
     e.preventDefault();
@@ -157,12 +289,23 @@ export default function PrinterPage() {
 
         <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between mb-6 md:mb-8 gap-3">
           <h1 className="text-xl md:text-3xl font-bold">🖨️ Pallet Label Printer</h1>
-          <Link
-            href="/"
-            className="bg-gray-700 hover:bg-gray-600 px-3 md:px-4 py-2 rounded text-sm md:text-base"
-          >
-            ← Back
-          </Link>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => {
+                setAnnieMessage('');
+                setShowAnnieModal(true);
+              }}
+              className="hidden md:inline-block bg-pink-600 hover:bg-pink-700 px-3 md:px-4 py-2 rounded text-sm md:text-base font-bold"
+            >
+              Annie UTD
+            </button>
+            <Link
+              href="/"
+              className="bg-gray-700 hover:bg-gray-600 px-3 md:px-4 py-2 rounded text-sm md:text-base"
+            >
+              ← Back
+            </Link>
+          </div>
         </div>
 
         <div className="bg-gray-800 p-4 md:p-6 rounded-lg border border-gray-700 mb-6">
@@ -194,6 +337,12 @@ export default function PrinterPage() {
             </div>
           )}
         </div>
+
+        {annieMessage && (
+          <div className={`mb-6 text-center font-bold text-sm md:text-base ${annieMessage.startsWith('✅') ? 'text-green-400' : annieMessage.startsWith('❌') ? 'text-red-400' : 'text-blue-400'}`}>
+            {annieMessage}
+          </div>
+        )}
 
         {printData && (
           <div className="bg-gray-800 p-4 md:p-6 rounded-lg border-2 border-blue-500 animate-fade-in relative">
@@ -297,6 +446,77 @@ export default function PrinterPage() {
                       Cancel
                     </button>
                   </div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {showAnnieModal && (
+          <div className="fixed inset-0 bg-black/75 z-[70] flex items-center justify-center p-4">
+            <div className="w-full max-w-2xl bg-gray-800 border border-gray-600 rounded-xl p-4 md:p-6">
+              <div className="flex items-center justify-between mb-3">
+                <h2 className="text-lg md:text-2xl font-bold text-pink-300">Annie UTD</h2>
+                <button
+                  onClick={() => setShowAnnieModal(false)}
+                  className="text-2xl md:text-3xl hover:text-red-400"
+                >
+                  &times;
+                </button>
+              </div>
+
+              <p className="text-xs md:text-sm text-gray-300 mb-4">
+                Upload Annie&apos;s .xlsx file. Missing Column G pallet values will be filled from PT/PO matches in your system, then downloaded immediately.
+              </p>
+
+              <input
+                ref={annieFileInputRef}
+                type="file"
+                accept=".xlsx"
+                className="hidden"
+                onChange={(e) => {
+                  const selected = e.target.files?.[0];
+                  if (selected) {
+                    void handleAnnieFile(selected);
+                  }
+                  e.currentTarget.value = '';
+                }}
+              />
+
+              <div
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  setAnnieDragActive(true);
+                }}
+                onDragLeave={(e) => {
+                  e.preventDefault();
+                  setAnnieDragActive(false);
+                }}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  setAnnieDragActive(false);
+                  const dropped = e.dataTransfer.files?.[0];
+                  if (dropped) {
+                    void handleAnnieFile(dropped);
+                  }
+                }}
+                className={`border-2 border-dashed rounded-lg p-8 text-center transition-colors ${annieDragActive ? 'border-pink-400 bg-pink-900/20' : 'border-gray-500 bg-gray-900/40'}`}
+              >
+                <div className="text-sm md:text-lg font-semibold mb-2">
+                  Drag and drop Annie&apos;s .xlsx here
+                </div>
+                <button
+                  disabled={annieProcessing}
+                  onClick={() => annieFileInputRef.current?.click()}
+                  className="bg-pink-600 hover:bg-pink-700 disabled:bg-gray-600 px-4 py-2 rounded-lg font-bold text-sm md:text-base"
+                >
+                  {annieProcessing ? 'Processing...' : 'Browse File'}
+                </button>
+              </div>
+
+              {annieProcessing && (
+                <div className="mt-3 text-blue-300 text-sm font-semibold">
+                  Processing file...
                 </div>
               )}
             </div>

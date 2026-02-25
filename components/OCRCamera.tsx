@@ -100,13 +100,12 @@ export default function OCRCamera({ expectedPT, expectedPO, onSuccess, onCancel 
 
             console.log('Detected text:', detectedText);
 
-            const { ptNumber, poNumber } = parseLabel(detectedText);
+            const expectedPTClean = normalizeDigits(expectedPT);
+            const expectedPOClean = normalizeDigits(expectedPO);
+            const { ptNumber, poNumber } = parseLabel(detectedText, expectedPTClean, expectedPOClean);
 
             console.log('Parsed PT:', ptNumber, 'PO:', poNumber);
             console.log('Expected PT:', expectedPT, 'PO:', expectedPO);
-
-            const expectedPTClean = expectedPT.replace(/\s/g, '');
-            const expectedPOClean = expectedPO.replace(/\s/g, '');
 
             const ptMatch = ptNumber === expectedPTClean;
             const poMatch = poNumber === expectedPOClean;
@@ -136,33 +135,58 @@ export default function OCRCamera({ expectedPT, expectedPO, onSuccess, onCancel 
         setScanning(false);
     }
 
-    function parseLabel(text: string): { ptNumber: string; poNumber: string } {
+    function normalizeDigits(value: string): string {
+        return (value || '').replace(/\D/g, '');
+    }
+
+    function parseLabel(text: string, expectedPTDigits: string, expectedPODigits: string): { ptNumber: string; poNumber: string } {
         // Remove all whitespace and newlines
         const cleaned = text.replace(/\s+/g, '');
+        const ptLength = expectedPTDigits.length;
+        const poLength = expectedPODigits.length;
 
         // Extract all digit sequences
         const allNumbers = cleaned.match(/\d+/g) || [];
 
         console.log('All numbers found:', allNumbers);
 
-        // Look for a 14-15 digit sequence (PT+PO concatenated)
-        const concatenated = allNumbers.find(n => n.length >= 14 && n.length <= 15);
+        // Prefer a sequence that clearly includes PT followed by the full PO length.
+        const concatenated = allNumbers
+            .filter(n => n.length >= ptLength + poLength)
+            .sort((a, b) => b.length - a.length)
+            .find((value) => {
+                const ptIndex = value.indexOf(expectedPTDigits);
+                return ptIndex !== -1 && (ptIndex + ptLength + poLength) <= value.length;
+            });
 
         if (concatenated) {
-            // PT is always first 7 digits, PO is next 7 digits
-            const ptNumber = concatenated.substring(0, 7);
-            const poNumber = concatenated.substring(7, 14);
+            const ptIndex = concatenated.indexOf(expectedPTDigits);
+            const ptNumber = concatenated.substring(ptIndex, ptIndex + ptLength);
+            const poNumber = concatenated.substring(ptIndex + ptLength, ptIndex + ptLength + poLength);
             console.log('Split concatenated number - PT:', ptNumber, 'PO:', poNumber);
             return { ptNumber, poNumber };
         }
 
-        // Fallback: Look for separate 7-8 digit numbers
-        const validNumbers = allNumbers.filter(n => n.length === 7 || n.length === 8);
-        console.log('Valid 7-8 digit numbers:', validNumbers);
+        // Fallback: PT has fixed digits, PO can vary so we respect expected PO length.
+        const ptExact = allNumbers.find((n) => n === expectedPTDigits);
+        if (ptExact) {
+            const ptIndex = allNumbers.indexOf(ptExact);
+            const nextNumber = allNumbers[ptIndex + 1] || '';
+            const poFromNext = nextNumber.includes(expectedPODigits)
+                ? expectedPODigits
+                : (nextNumber.length >= poLength ? nextNumber.substring(0, poLength) : nextNumber);
+            return { ptNumber: ptExact, poNumber: poFromNext };
+        }
+
+        const ptCandidate = allNumbers.find((n) => n.length >= ptLength)?.substring(0, ptLength) || '';
+        const poExact = allNumbers.find((n) => n.includes(expectedPODigits));
+        const poCandidate = poExact
+            ? expectedPODigits
+            : (allNumbers.find((n) => n.length >= poLength)?.substring(0, poLength) || '');
 
         return {
-            ptNumber: validNumbers[0] || '',
-            poNumber: validNumbers[1] || ''
+            ptNumber: ptCandidate,
+            poNumber: poCandidate
         };
     }
 

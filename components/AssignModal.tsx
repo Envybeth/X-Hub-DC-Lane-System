@@ -49,6 +49,8 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
   const [stagingPUs, setStagingPUs] = useState<string[]>([]);
   const [allUnassignedPTs, setAllUnassignedPTs] = useState<Pickticket[]>([]);
   const [isTouchDevice, setIsTouchDevice] = useState(false);
+  const [mobileControlsIndex, setMobileControlsIndex] = useState<number | null>(null);
+  const [savingMobileOrder, setSavingMobileOrder] = useState(false);
 
   const [containers, setContainers] = useState<Container[]>([]);
   const [selectedContainer, setSelectedContainer] = useState('');
@@ -131,6 +133,12 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
       return () => clearTimeout(timer);
     }
   }, [toast]);
+
+  useEffect(() => {
+    if (mobileControlsIndex !== null && mobileControlsIndex >= existingPTs.length) {
+      setMobileControlsIndex(null);
+    }
+  }, [existingPTs, mobileControlsIndex]);
 
   useEffect(() => {
     // Refresh capacity display when existingPTs changes
@@ -693,14 +701,35 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
     setDraggedItem(index);
   }
 
-  function reorderPTs(targetIndex: number) {
-    if (draggedItem === null || draggedItem === targetIndex) return;
+  function getReorderedPTs(sourceIndex: number, targetIndex: number) {
+    if (
+      sourceIndex < 0 ||
+      targetIndex < 0 ||
+      sourceIndex >= existingPTs.length ||
+      targetIndex >= existingPTs.length ||
+      sourceIndex === targetIndex
+    ) {
+      return existingPTs;
+    }
 
     const newPTs = [...existingPTs];
-    const draggedPT = newPTs[draggedItem];
-    newPTs.splice(draggedItem, 1);
+    const [draggedPT] = newPTs.splice(sourceIndex, 1);
     newPTs.splice(targetIndex, 0, draggedPT);
+    return newPTs;
+  }
 
+  async function persistPTOrder(updatedPTs: LaneAssignment[]) {
+    for (let i = 0; i < updatedPTs.length; i++) {
+      await supabase
+        .from('lane_assignments')
+        .update({ order_position: i + 1 })
+        .eq('id', updatedPTs[i].id);
+    }
+  }
+
+  function reorderPTs(targetIndex: number) {
+    if (draggedItem === null || draggedItem === targetIndex) return;
+    const newPTs = getReorderedPTs(draggedItem, targetIndex);
     setExistingPTs(newPTs);
     setDraggedItem(targetIndex);
   }
@@ -710,41 +739,57 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
     reorderPTs(index);
   }
 
-  function handleTouchStart(index: number) {
-    setDraggedItem(index);
+  function maybeHideMobileControls(target: EventTarget | null) {
+    if (!isTouchDevice || mobileControlsIndex === null) return;
+    const element = target as HTMLElement | null;
+    if (!element) return;
+    if (
+      element.closest('[data-mobile-reorder-trigger]') ||
+      element.closest('[data-mobile-reorder-controls]')
+    ) {
+      return;
+    }
+    setMobileControlsIndex(null);
   }
 
-  function handleTouchMove(e: React.TouchEvent) {
-    if (draggedItem === null) return;
-    e.preventDefault();
+  async function handleMobileMove(sourceIndex: number, targetIndex: number) {
+    if (!isTouchDevice || savingMobileOrder) return;
+    if (sourceIndex === targetIndex) return;
+    if (sourceIndex < 0 || targetIndex < 0) return;
+    if (sourceIndex >= existingPTs.length || targetIndex >= existingPTs.length) return;
 
-    const touch = e.touches[0];
-    const element = document.elementFromPoint(touch.clientX, touch.clientY) as HTMLElement | null;
-    const card = element?.closest('[data-assignment-index]') as HTMLElement | null;
-    if (!card) return;
+    const reordered = getReorderedPTs(sourceIndex, targetIndex);
+    if (reordered === existingPTs) {
+      return;
+    }
 
-    const indexValue = card.dataset.assignmentIndex;
-    if (!indexValue) return;
+    setExistingPTs(reordered);
+    setSavingMobileOrder(true);
 
-    const targetIndex = parseInt(indexValue, 10);
-    if (Number.isNaN(targetIndex)) return;
-    reorderPTs(targetIndex);
+    try {
+      await persistPTOrder(reordered);
+      setMobileControlsIndex(targetIndex);
+      await fetchExistingPTs();
+      showToast('Order updated', 'success');
+    } catch (error) {
+      console.error('Error updating order:', error);
+      showToast('Failed to update order', 'error');
+    } finally {
+      setSavingMobileOrder(false);
+      setDraggedItem(null);
+    }
   }
 
-  function handleTouchEnd() {
-    void handleDragEnd();
+  function toggleMobileControls(index: number) {
+    if (!isTouchDevice || savingMobileOrder) return;
+    setMobileControlsIndex((prev) => (prev === index ? null : index));
   }
 
   async function handleDragEnd() {
     if (draggedItem === null) return;
 
     try {
-      for (let i = 0; i < existingPTs.length; i++) {
-        await supabase
-          .from('lane_assignments')
-          .update({ order_position: i + 1 })
-          .eq('id', existingPTs[i].id);
-      }
+      await persistPTOrder(existingPTs);
 
       setDraggedItem(null);
       await fetchExistingPTs();
@@ -804,7 +849,11 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
 
   return (
     <>
-      <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50 p-2 md:p-4">
+      <div
+        className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50 p-2 md:p-4"
+        onClickCapture={(e) => maybeHideMobileControls(e.target)}
+        onTouchStartCapture={(e) => maybeHideMobileControls(e.target)}
+      >
         <div className="bg-gray-800 rounded-lg p-3 md:p-6 max-w-7xl w-full max-h-[90vh] overflow-y-auto">
           {/* Header - mobile optimized */}
           <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 mb-4 md:mb-6">
@@ -863,6 +912,12 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                 <div className="text-sm md:text-lg">
                   <span className="font-bold">Capacity:</span> {currentPallets} / {lane.max_capacity} pallets                </div>
               </div>
+
+              {isTouchDevice && (
+                <div className="bg-blue-900 border border-blue-600 text-blue-100 p-2 md:p-3 rounded-lg mb-3 text-xs md:text-sm">
+                  Tap a handle to open move controls for that row: ⏫ top, ▲ up, ▼ down, ⏬ bottom.
+                </div>
+              )}
 
               <div className="space-y-2 md:space-y-3">
                 {existingPTs.map((assignment, index) => {
@@ -1050,16 +1105,60 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                         </div>
 
                         {/* Drag handle */}
-                        <div
-                          onTouchStart={() => handleTouchStart(index)}
-                          onTouchMove={handleTouchMove}
-                          onTouchEnd={handleTouchEnd}
-                          onTouchCancel={handleTouchEnd}
-                          className="flex flex-col justify-center items-center flex-shrink-0 bg-gray-600 cursor-move touch-none px-3 md:px-2 min-w-[40px] md:min-w-0 rounded"
-                        >
-                          <div className="text-gray-300 text-2xl leading-none">⋮</div>
-                          <div className="text-gray-300 text-2xl leading-none">⋮</div>
-                          <div className="text-gray-300 text-2xl leading-none">⋮</div>
+                        <div className="flex flex-col items-center gap-1.5">
+                          <div
+                            data-mobile-reorder-trigger={isTouchDevice ? 'true' : undefined}
+                            onClick={isTouchDevice ? () => toggleMobileControls(index) : undefined}
+                            className={`flex flex-col justify-center items-center flex-shrink-0 px-3 md:px-2 min-w-[40px] md:min-w-0 rounded ${isTouchDevice ? 'cursor-pointer touch-manipulation' : 'bg-gray-600 cursor-move touch-none'
+                              } ${isTouchDevice && mobileControlsIndex === index ? 'bg-blue-600 ring-2 ring-blue-300' : 'bg-gray-600'} ${savingMobileOrder ? 'opacity-60 pointer-events-none' : ''}`}
+                          >
+                            {savingMobileOrder ? (
+                              <div className="text-white text-[10px] font-bold">Saving...</div>
+                            ) : (
+                              <>
+                                <div className="text-gray-300 text-2xl leading-none">⋮</div>
+                                <div className="text-gray-300 text-2xl leading-none">⋮</div>
+                                <div className="text-gray-300 text-2xl leading-none">⋮</div>
+                              </>
+                            )}
+                          </div>
+
+                          {isTouchDevice && mobileControlsIndex === index && (
+                            <div data-mobile-reorder-controls="true" className="grid grid-cols-2 gap-1">
+                              <button
+                                onClick={() => void handleMobileMove(index, 0)}
+                                disabled={savingMobileOrder || index === 0}
+                                className="bg-blue-700 hover:bg-blue-600 disabled:bg-gray-600 px-2 py-1 rounded text-[10px] font-bold"
+                                title="Move to top"
+                              >
+                                ⏫
+                              </button>
+                              <button
+                                onClick={() => void handleMobileMove(index, index - 1)}
+                                disabled={savingMobileOrder || index === 0}
+                                className="bg-blue-700 hover:bg-blue-600 disabled:bg-gray-600 px-2 py-1 rounded text-[10px] font-bold"
+                                title="Move up"
+                              >
+                                ▲
+                              </button>
+                              <button
+                                onClick={() => void handleMobileMove(index, index + 1)}
+                                disabled={savingMobileOrder || index === existingPTs.length - 1}
+                                className="bg-blue-700 hover:bg-blue-600 disabled:bg-gray-600 px-2 py-1 rounded text-[10px] font-bold"
+                                title="Move down"
+                              >
+                                ▼
+                              </button>
+                              <button
+                                onClick={() => void handleMobileMove(index, existingPTs.length - 1)}
+                                disabled={savingMobileOrder || index === existingPTs.length - 1}
+                                className="bg-blue-700 hover:bg-blue-600 disabled:bg-gray-600 px-2 py-1 rounded text-[10px] font-bold"
+                                title="Move to bottom"
+                              >
+                                ⏬
+                              </button>
+                            </div>
+                          )}
                         </div>
                       </div>
                     </div>

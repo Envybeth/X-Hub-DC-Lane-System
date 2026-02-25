@@ -42,8 +42,55 @@ const MIN_ROW_HEIGHT = 3.8;
 const CELL_TEXT_INSET = 1.2;
 const HEADER_HEIGHT = 6;
 
-function formatToday() {
-  return new Date().toLocaleDateString('en-US');
+function formatMonthDay(date: Date) {
+  return `${date.getUTCMonth() + 1}/${date.getUTCDate()}`;
+}
+
+function parsePuDateForRange(value: string): Date | null {
+  if (!value) return null;
+
+  const isoDateMatch = value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (isoDateMatch) {
+    const year = Number(isoDateMatch[1]);
+    const month = Number(isoDateMatch[2]);
+    const day = Number(isoDateMatch[3]);
+    return new Date(Date.UTC(year, month - 1, day));
+  }
+
+  const monthDayMatch = value.match(/^(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?$/);
+  if (monthDayMatch) {
+    const month = Number(monthDayMatch[1]);
+    const day = Number(monthDayMatch[2]);
+    const yearRaw = monthDayMatch[3];
+    const year = yearRaw
+      ? (yearRaw.length === 2 ? 2000 + Number(yearRaw) : Number(yearRaw))
+      : new Date().getUTCFullYear();
+    return new Date(Date.UTC(year, month - 1, day));
+  }
+
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return new Date(Date.UTC(parsed.getUTCFullYear(), parsed.getUTCMonth(), parsed.getUTCDate()));
+}
+
+function getPuDateRangeLabel(loads: ShipmentPdfLoad[]) {
+  const parsedDates: Date[] = [];
+
+  loads.forEach((load) => {
+    load.rows.forEach((row) => {
+      const parsed = parsePuDateForRange(row.puDate || '');
+      if (parsed) parsedDates.push(parsed);
+    });
+  });
+
+  if (parsedDates.length === 0) {
+    return formatMonthDay(new Date());
+  }
+
+  const sorted = [...parsedDates].sort((a, b) => a.getTime() - b.getTime());
+  const start = formatMonthDay(sorted[0]);
+  const end = formatMonthDay(sorted[sorted.length - 1]);
+  return start === end ? start : `${start} - ${end}`;
 }
 
 function formatPuDate(value: string) {
@@ -144,6 +191,7 @@ export function exportShipmentSummaryPdf(loads: ShipmentPdfLoad[], fileBaseName:
 
   const totalWeight = COL_WEIGHTS.reduce((sum, value) => sum + value, 0);
   const colWidths = COL_WEIGHTS.map(value => (tableWidth * value) / totalWeight);
+  const puDateRangeLabel = getPuDateRangeLabel(loads);
 
   const drawTitleAndHeader = () => {
     const titleHeight = 10;
@@ -157,7 +205,7 @@ export function exportShipmentSummaryPdf(loads: ShipmentPdfLoad[], fileBaseName:
     doc.setTextColor(0, 0, 0);
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(14);
-    doc.text(`Shipment Summary - ${formatToday()}`, pageWidth / 2, titleY, { align: 'center' });
+    doc.text(`Shipment Summary ${puDateRangeLabel}`, pageWidth / 2, titleY, { align: 'center' });
 
     doc.setFontSize(9);
     let currentX = marginX;
@@ -277,6 +325,6 @@ export function exportShipmentSummaryPdf(loads: ShipmentPdfLoad[], fileBaseName:
     doc.text(`Page ${page} of ${pageCount}`, pageWidth - 10, 6, { align: 'right' });
   }
 
-  const safeDate = formatToday().replace(/\//g, '-');
+  const safeDate = puDateRangeLabel.replace(' - ', '_to_').replace(/\s+/g, '').replace(/\//g, '-');
   doc.save(`${fileBaseName}-${safeDate}.pdf`);
 }
