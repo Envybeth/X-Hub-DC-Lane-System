@@ -847,6 +847,31 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
     return pt ? { pt, pallets: parseInt(selectedPTs[parseInt(ptId)]) || 1 } : null;
   }).filter(Boolean);
 
+  function toggleEditForAssignment(assignmentId: number, currentCount: number) {
+    if (editingPT && editingPT.id === assignmentId) {
+      setEditingPT(null);
+      return;
+    }
+
+    setMovingPT(null);
+    setMoveLaneInput('');
+    setMoveLaneError('');
+    setEditingPT({ id: assignmentId, count: currentCount.toString(), assignmentId });
+  }
+
+  function toggleMoveForAssignment(assignment: LaneAssignment) {
+    if (movingPT && movingPT.id === assignment.id) {
+      setMovingPT(null);
+      setMoveLaneInput('');
+      setMoveLaneError('');
+      return;
+    }
+
+    setEditingPT(null);
+    setMovingPT({ id: assignment.id, assignmentId: assignment.id, ptId: assignment.pickticket.id, ptNumber: assignment.pickticket.pt_number });
+    fetchAllLanes();
+  }
+
   return (
     <>
       <div
@@ -995,7 +1020,8 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                               </button>
                             </div>
                           ) : movingPT && movingPT.id === assignment.id ? (
-                            <div className="flex items-center gap-2 mt-2 relative">
+                            <div className="mt-2">
+                              <div className="flex items-center gap-2">
                               <input
                                 type="text"
                                 value={moveLaneInput}
@@ -1004,13 +1030,13 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                                   setMoveLaneError('');
                                 }}
                                 placeholder="Lane #"
-                                className={`bg-gray-900 text-white p-1 md:p-2 rounded flex-1 text-sm ${moveLaneError ? 'border-2 border-red-500' : ''}`}
+                                  className={`bg-gray-900 text-white p-1 md:p-2 rounded w-16 md:w-20 text-center text-sm ${moveLaneError ? 'border-2 border-red-500' : ''}`}
                               />
                               <button
                                 onClick={handleMoveLane}
-                                className="bg-green-600 hover:bg-green-700 px-2 md:px-4 py-1 md:py-2 rounded text-xs md:text-sm font-semibold"
+                                  className="bg-green-600 hover:bg-green-700 px-2 md:px-3 py-1 rounded text-xs md:text-sm font-semibold"
                               >
-                                Move
+                                  Save
                               </button>
                               <button
                                 onClick={() => {
@@ -1018,12 +1044,13 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                                   setMoveLaneInput('');
                                   setMoveLaneError('');
                                 }}
-                                className="bg-gray-600 hover:bg-gray-700 px-2 md:px-3 py-1 md:py-2 rounded text-xs md:text-sm"
+                                  className="bg-gray-600 hover:bg-gray-700 px-2 md:px-3 py-1 rounded text-xs md:text-sm"
                               >
-                                ✕
+                                  Cancel
                               </button>
+                            </div>
                               {moveLaneError && (
-                                <div className="absolute -bottom-6 left-0 text-red-500 text-xs md:text-sm animate-fade-in">
+                                <div className="mt-1 text-red-500 text-xs md:text-sm animate-fade-in">
                                   {moveLaneError}
                                 </div>
                               )}
@@ -1047,17 +1074,20 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                         {/* Action buttons - ONE SET for entire compiled group */}
                         <div className="grid grid-cols-2 md:flex gap-1 md:gap-2">
                           <button
-                            onClick={() => setEditingPT({ id: assignment.id, count: assignment.pallet_count.toString(), assignmentId: assignment.id })}
-                            className="bg-orange-600 hover:bg-orange-700 px-2 md:px-4 py-1.5 md:py-2 rounded-lg font-semibold text-xs md:text-base whitespace-nowrap"
+                            onClick={() => toggleEditForAssignment(assignment.id, assignment.pallet_count)}
+                            className={`px-2 md:px-4 py-1.5 md:py-2 rounded-lg font-semibold text-xs md:text-base whitespace-nowrap ${editingPT && editingPT.id === assignment.id
+                              ? 'bg-orange-800 border-2 border-gray-300'
+                              : 'bg-orange-600 hover:bg-orange-700'
+                              }`}
                           >
                             Edit
                           </button>
                           <button
-                            onClick={() => {
-                              setMovingPT({ id: assignment.id, assignmentId: assignment.id, ptId: assignment.pickticket.id, ptNumber: assignment.pickticket.pt_number });
-                              fetchAllLanes();
-                            }}
-                            className="bg-yellow-600 hover:bg-yellow-700 px-2 md:px-4 py-1.5 md:py-2 rounded-lg font-semibold text-xs md:text-base whitespace-nowrap"
+                            onClick={() => toggleMoveForAssignment(assignment)}
+                            className={`px-2 md:px-4 py-1.5 md:py-2 rounded-lg font-semibold text-xs md:text-base whitespace-nowrap ${movingPT && movingPT.id === assignment.id
+                              ? 'bg-yellow-800 border-2 border-gray-300'
+                              : 'bg-yellow-600 hover:bg-yellow-700'
+                              }`}
                           >
                             Move
                           </button>
@@ -1105,17 +1135,17 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                         </div>
 
                         {/* Drag handle */}
-                        <div className="flex flex-col items-center self-stretch w-[38px] flex-shrink-0">
+                        <div className="relative self-stretch w-[40px] flex-shrink-0">
                           {isTouchDevice && mobileControlsIndex === index ? (
-                            <div className={`flex items-stretch self-stretch w-full ${savingMobileOrder ? 'opacity-60 pointer-events-none' : ''}`}>
+                            <div className={`absolute inset-0 grid grid-cols-[1fr_6px] items-stretch ${savingMobileOrder ? 'opacity-60 pointer-events-none' : ''}`}>
                               <div
                                 data-mobile-reorder-controls="true"
-                                className="flex flex-col items-center justify-center w-[36px] py-0.5"
+                                className="h-full grid grid-rows-4 items-stretch gap-0.5 pr-0.5 py-0.5"
                               >
                                 <button
                                   onClick={() => void handleMobileMove(index, 0)}
                                   disabled={savingMobileOrder || index === 0}
-                                  className="text-[11px] leading-none py-[1px] text-gray-200 hover:text-white disabled:text-gray-500"
+                                  className="w-full h-full min-h-0 flex items-center justify-center text-[10px] leading-none bg-gray-700 border border-white/80 rounded-md text-gray-100 hover:bg-gray-600 disabled:text-gray-500 disabled:border-white/35"
                                   title="Move to top"
                                 >
                                   ⏫
@@ -1123,7 +1153,7 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                                 <button
                                   onClick={() => void handleMobileMove(index, index - 1)}
                                   disabled={savingMobileOrder || index === 0}
-                                  className="text-[11px] leading-none py-[1px] text-gray-200 hover:text-white disabled:text-gray-500"
+                                  className="w-full h-full min-h-0 flex items-center justify-center text-[10px] leading-none bg-gray-700 border border-white/80 rounded-md text-gray-100 hover:bg-gray-600 disabled:text-gray-500 disabled:border-white/35"
                                   title="Move up"
                                 >
                                   ▲
@@ -1131,7 +1161,7 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                                 <button
                                   onClick={() => void handleMobileMove(index, index + 1)}
                                   disabled={savingMobileOrder || index === existingPTs.length - 1}
-                                  className="text-[11px] leading-none py-[1px] text-gray-200 hover:text-white disabled:text-gray-500"
+                                  className="w-full h-full min-h-0 flex items-center justify-center text-[10px] leading-none bg-gray-700 border border-white/80 rounded-md text-gray-100 hover:bg-gray-600 disabled:text-gray-500 disabled:border-white/35"
                                   title="Move down"
                                 >
                                   ▼
@@ -1139,7 +1169,7 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                                 <button
                                   onClick={() => void handleMobileMove(index, existingPTs.length - 1)}
                                   disabled={savingMobileOrder || index === existingPTs.length - 1}
-                                  className="text-[11px] leading-none py-[1px] text-gray-200 hover:text-white disabled:text-gray-500"
+                                  className="w-full h-full min-h-0 flex items-center justify-center text-[10px] leading-none bg-gray-700 border border-white/80 rounded-md text-gray-100 hover:bg-gray-600 disabled:text-gray-500 disabled:border-white/35"
                                   title="Move to bottom"
                                 >
                                   ⏬
@@ -1147,16 +1177,17 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                               </div>
                               <div
                                 data-mobile-reorder-trigger="true"
-                                onClick={() => toggleMobileControls(index)}
-                                className="w-[2px] h-full bg-gray-500/90 rounded-sm cursor-pointer"
+                                onClick={() => setMobileControlsIndex(null)}
+                                className="h-full cursor-pointer border-l-2 border-dotted border-gray-400/90"
                                 title="Close move controls"
                               />
                             </div>
                           ) : (
-                            <div
+                            <button
+                              type="button"
                               data-mobile-reorder-trigger={isTouchDevice ? 'true' : undefined}
                               onClick={isTouchDevice ? () => toggleMobileControls(index) : undefined}
-                              className={`flex flex-col justify-center items-center w-full h-full rounded ${isTouchDevice ? 'cursor-pointer touch-manipulation bg-gray-600' : 'bg-gray-600 cursor-move touch-none'
+                              className={`absolute inset-0 flex flex-col justify-center items-center rounded ${isTouchDevice ? 'cursor-pointer touch-manipulation bg-gray-600' : 'bg-gray-600 cursor-move touch-none'
                                 } ${savingMobileOrder ? 'opacity-60 pointer-events-none' : ''}`}
                             >
                               {savingMobileOrder ? (
@@ -1168,7 +1199,7 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                                   <div className="text-gray-300 text-2xl leading-none">⋮</div>
                                 </>
                               )}
-                            </div>
+                            </button>
                           )}
                         </div>
                       </div>
