@@ -7,14 +7,18 @@ function parseDate(dateStr: string | undefined): string | null {
   // Handle 4-digit year: "02/09/2026" or "1/30/2026"
   let dateMatch = dateStr.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
   if (dateMatch) {
-    const [_, month, day, year] = dateMatch;
+    const month = dateMatch[1];
+    const day = dateMatch[2];
+    const year = dateMatch[3];
     return `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
   }
 
   // Handle 2-digit year: "1/30/26" or "2/4/26"
   dateMatch = dateStr.match(/(\d{1,2})\/(\d{1,2})\/(\d{2})/);
   if (dateMatch) {
-    const [_, month, day, yearShort] = dateMatch;
+    const month = dateMatch[1];
+    const day = dateMatch[2];
+    const yearShort = dateMatch[3];
     const year = `20${yearShort}`;
     return `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
   }

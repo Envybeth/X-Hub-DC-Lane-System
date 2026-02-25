@@ -63,7 +63,7 @@ export async function createCompiledPallet(
 }
 
 export async function fetchCompiledPTInfo(ptIds: number[]): Promise<{ [key: number]: Pickticket[] }> {
-    if (ptIds.length === 0) return {};
+  if (ptIds.length === 0) return {};
 
     // Get all compiled pallet IDs for these PTs
     const { data: links } = await supabase
@@ -107,13 +107,20 @@ export async function fetchCompiledPTInfo(ptIds: number[]): Promise<{ [key: numb
     // Group by PT ID
     const result: { [key: number]: Pickticket[] } = {};
 
+    type CompiledPalletLinkRow = {
+        compiled_pallet_id: number;
+        pt_id: number;
+        picktickets: Pickticket | Pickticket[] | null;
+    };
+    const typedAllLinks = allLinks as CompiledPalletLinkRow[];
+
     ptIds.forEach(ptId => {
         const link = links.find(l => l.pt_id === ptId);
         if (!link) return;
 
-        const groupPTs = allLinks
+        const groupPTs = typedAllLinks
             .filter(l => l.compiled_pallet_id === link.compiled_pallet_id && l.pt_id !== ptId)
-            .map(l => l.picktickets as any) // Cast to any first
+            .map((linkRow) => Array.isArray(linkRow.picktickets) ? linkRow.picktickets[0] : linkRow.picktickets)
             .filter(Boolean) as Pickticket[];
 
         if (groupPTs.length > 0) {

@@ -1,25 +1,22 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { supabase } from '@/lib/supabase';
 import LaneGrid from '@/components/LaneGrid';
 import SearchModal from '@/components/SearchModal';
 import Link from 'next/link';
 import PTDetails from '@/components/PTDetails';
 import { Suspense } from 'react';
+import { Pickticket } from '@/types/pickticket';
 export const dynamic = 'force-dynamic';
 
 export default function Home() {
   const [showSearch, setShowSearch] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [lastSync, setLastSync] = useState<Date | null>(null);
-  const [viewingPTDetails, setViewingPTDetails] = useState<any>(null);
+  const [viewingPTDetails, setViewingPTDetails] = useState<Pickticket | null>(null);
 
-  useEffect(() => {
-    checkLastSync();
-  }, []);
-
-  async function checkLastSync() {
+  const checkLastSync = useCallback(async () => {
     const { data } = await supabase
       .from('picktickets')
       .select('last_synced_at')  // CHANGE from 'created_at' to 'last_synced_at'
@@ -30,7 +27,15 @@ export default function Home() {
     if (data) {
       setLastSync(new Date(data.last_synced_at));  // CHANGE to last_synced_at
     }
-  }
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      void checkLastSync();
+    }, 0);
+
+    return () => window.clearTimeout(timer);
+  }, [checkLastSync]);
 
   async function handleSync() {
     // Add confirmation

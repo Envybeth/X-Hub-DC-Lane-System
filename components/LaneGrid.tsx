@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabase';
 import AssignModal from './AssignModal';
@@ -37,6 +37,11 @@ function sortLaneNumbers(values: string[]) {
   });
 }
 
+function isUnlabeledStatus(status?: string | null) {
+  const normalized = (status || '').trim().toLowerCase();
+  return normalized === '' || normalized === 'unlabeled';
+}
+
 export default function LaneGrid() {
   const [lanes, setLanes] = useState<Lane[]>([]);
   const [selectedLane, setSelectedLane] = useState<Lane | null>(null);
@@ -54,6 +59,7 @@ export default function LaneGrid() {
 
   const searchParams = useSearchParams();
   const router = useRouter();
+  const laneRefreshTimerRef = useRef<number | null>(null);
 
   const fetchLanes = useCallback(async () => {
     const { data: laneRows } = await supabase
@@ -86,9 +92,65 @@ export default function LaneGrid() {
       );
     } else {
       activeStorageAssignments = (storageRows || []) as StorageAssignment[];
-      setStorageAssignments(activeStorageAssignments);
       setStorageTableAvailable(true);
       setStorageWarning('');
+
+      if (activeStorageAssignments.length > 0) {
+        const containerNumbers = Array.from(new Set(activeStorageAssignments.map((row) => row.container_number)));
+        const { data: storagePTs, error: storagePTError } = await supabase
+          .from('picktickets')
+          .select('container_number, status')
+          .in('container_number', containerNumbers)
+          .neq('customer', 'PAPER');
+
+        if (storagePTError) {
+          console.error('Failed to evaluate storage auto-organize:', storagePTError);
+        } else if (storagePTs) {
+          const statusByContainer = new Map<string, { total: number; unlabeled: number }>();
+
+          storagePTs.forEach((pt) => {
+            const key = String(pt.container_number || '').trim();
+            if (!key) return;
+
+            const current = statusByContainer.get(key) || { total: 0, unlabeled: 0 };
+            current.total += 1;
+            if (isUnlabeledStatus(pt.status)) {
+              current.unlabeled += 1;
+            }
+            statusByContainer.set(key, current);
+          });
+
+          const completedContainers = new Set(
+            Array.from(statusByContainer.entries())
+              .filter(([, counts]) => counts.total > 0 && counts.unlabeled === 0)
+              .map(([containerNumber]) => containerNumber)
+          );
+
+          const autoOrganizeIds = activeStorageAssignments
+            .filter((assignment) => completedContainers.has(assignment.container_number))
+            .map((assignment) => assignment.id);
+
+          if (autoOrganizeIds.length > 0) {
+            const { error: autoOrganizeError } = await supabase
+              .from('container_storage_assignments')
+              .update({
+                active: false,
+                organized_to_label: true,
+                organized_at: new Date().toISOString()
+              })
+              .in('id', autoOrganizeIds);
+
+            if (autoOrganizeError) {
+              console.error('Failed to auto-organize storage assignments:', autoOrganizeError);
+            } else {
+              const autoOrganizedIdSet = new Set(autoOrganizeIds);
+              activeStorageAssignments = activeStorageAssignments.filter((assignment) => !autoOrganizedIdSet.has(assignment.id));
+            }
+          }
+        }
+      }
+
+      setStorageAssignments(activeStorageAssignments);
     }
 
     const storageByLane = new Map<string, StorageAssignment[]>();
@@ -149,6 +211,16 @@ export default function LaneGrid() {
     setLanes(lanesWithCapacity);
   }, []);
 
+  const scheduleLaneRefresh = useCallback(() => {
+    if (laneRefreshTimerRef.current) {
+      window.clearTimeout(laneRefreshTimerRef.current);
+    }
+    laneRefreshTimerRef.current = window.setTimeout(() => {
+      void fetchLanes();
+      laneRefreshTimerRef.current = null;
+    }, 120);
+  }, [fetchLanes]);
+
   useEffect(() => {
     const timer = window.setTimeout(() => {
       void fetchLanes();
@@ -156,6 +228,26 @@ export default function LaneGrid() {
 
     return () => window.clearTimeout(timer);
   }, [fetchLanes]);
+
+  useEffect(() => {
+    const channel = supabase
+      .channel('lane-grid-realtime')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'lanes' }, scheduleLaneRefresh)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'lane_assignments' }, scheduleLaneRefresh)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'picktickets' }, scheduleLaneRefresh)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'shipments' }, scheduleLaneRefresh)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'shipment_pts' }, scheduleLaneRefresh)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'container_storage_assignments' }, scheduleLaneRefresh)
+      .subscribe();
+
+    return () => {
+      if (laneRefreshTimerRef.current) {
+        window.clearTimeout(laneRefreshTimerRef.current);
+        laneRefreshTimerRef.current = null;
+      }
+      void supabase.removeChannel(channel);
+    };
+  }, [scheduleLaneRefresh]);
 
   useEffect(() => {
     const laneQuery = searchParams.get('lane');

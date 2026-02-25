@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import Link from 'next/link';
 import { supabase } from '@/lib/supabase';
 import ShipmentCard, { Shipment } from '@/components/ShipmentCard';
@@ -52,6 +52,7 @@ export default function ShipmentsPage() {
   const [searchSelectedShipmentKey, setSearchSelectedShipmentKey] = useState<string | null>(null);
   const [staleSnapshots, setStaleSnapshots] = useState<ShipmentSnapshotMap>({});
   const [staleSnapshotStoreAvailable, setStaleSnapshotStoreAvailable] = useState(true);
+  const shipmentRefreshTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     fetchMostRecentSync();
@@ -59,6 +60,38 @@ export default function ShipmentsPage() {
 
     fetchStaleSnapshotsFromSupabase();
   }, []);
+
+  const scheduleShipmentRefresh = useCallback(() => {
+    if (shipmentRefreshTimerRef.current) {
+      window.clearTimeout(shipmentRefreshTimerRef.current);
+    }
+    shipmentRefreshTimerRef.current = window.setTimeout(() => {
+      void fetchMostRecentSync();
+      void fetchShipments();
+      if (staleSnapshotStoreAvailable) {
+        void fetchStaleSnapshotsFromSupabase();
+      }
+      shipmentRefreshTimerRef.current = null;
+    }, 120);
+  }, [staleSnapshotStoreAvailable]);
+
+  useEffect(() => {
+    const channel = supabase
+      .channel('shipments-page-realtime')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'shipments' }, scheduleShipmentRefresh)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'shipment_pts' }, scheduleShipmentRefresh)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'picktickets' }, scheduleShipmentRefresh)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'stale_shipment_snapshots' }, scheduleShipmentRefresh)
+      .subscribe();
+
+    return () => {
+      if (shipmentRefreshTimerRef.current) {
+        window.clearTimeout(shipmentRefreshTimerRef.current);
+        shipmentRefreshTimerRef.current = null;
+      }
+      void supabase.removeChannel(channel);
+    };
+  }, [scheduleShipmentRefresh]);
 
   async function fetchMostRecentSync() {
     const { data } = await supabase

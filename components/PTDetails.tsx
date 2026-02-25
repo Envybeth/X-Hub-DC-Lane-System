@@ -4,8 +4,10 @@ import { useState } from 'react';
 import { Pickticket } from '@/types/pickticket';
 import { isPTArchived } from '@/lib/utils';
 
+type PTDetailsTicket = Pickticket;
+
 interface PTDetailsProps {
-    pt: Omit<Pickticket, 'id'> | any;
+    pt: PTDetailsTicket;
     onClose: () => void;
     mostRecentSync?: Date | null;
 }
@@ -47,7 +49,7 @@ export default function PTDetails({ pt, onClose, mostRecentSync }: PTDetailsProp
                 {isCompiled && (
                     <div className="mb-4 border-b-2 border-orange-500">
                         <div className="flex gap-2 overflow-x-auto pb-2">
-                            {allPTs.map((tabPT: any, index: number) => (
+                            {allPTs.map((tabPT, index) => (
                                 <button
                                     key={index}
                                     onClick={() => setSelectedTabIndex(index)}
@@ -175,7 +177,7 @@ export default function PTDetails({ pt, onClose, mostRecentSync }: PTDetailsProp
     );
 }
 
-function getStatusInfo(pt: any): { label: string; color: string } {
+function getStatusInfo(pt: PTDetailsTicket): { label: string; color: string } {
     if (!pt.status) return { label: 'Unknown', color: 'bg-gray-600' };
 
     // Sample workflow statuses

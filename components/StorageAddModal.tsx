@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { supabase } from '@/lib/supabase';
 
 interface LaneOption {
@@ -33,8 +33,15 @@ export default function StorageAddModal({ lanes, onClose, onSaved }: StorageAddM
   const [laneInputs, setLaneInputs] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
   const [errorText, setErrorText] = useState('');
+  const [toastMessage, setToastMessage] = useState('');
 
   const validLaneNumbers = useMemo(() => new Set(lanes.map((lane) => String(lane.lane_number))), [lanes]);
+
+  useEffect(() => {
+    if (!toastMessage) return;
+    const timer = window.setTimeout(() => setToastMessage(''), 2200);
+    return () => window.clearTimeout(timer);
+  }, [toastMessage]);
 
   async function handleSearchContainers() {
     const term = searchInput.trim();
@@ -60,10 +67,85 @@ export default function StorageAddModal({ lanes, onClose, onSaved }: StorageAddM
       }
 
       const uniqueMatches = Array.from(new Set((data || []).map((row) => row.container_number).filter(Boolean))).sort();
-      setContainerMatches(uniqueMatches);
 
       if (uniqueMatches.length === 0) {
+        setContainerMatches([]);
         setErrorText('No containers found for that search.');
+        return;
+      }
+
+      const { data: activeStorageRows, error: activeStorageError } = await supabase
+        .from('container_storage_assignments')
+        .select('container_number')
+        .in('container_number', uniqueMatches)
+        .eq('active', true);
+
+      if (activeStorageError) {
+        setErrorText(`Search failed. ${describeSupabaseError(activeStorageError)}`);
+        return;
+      }
+
+      const activeStorageSet = new Set(
+        (activeStorageRows || [])
+          .map((row) => String(row.container_number || '').trim().toLowerCase())
+          .filter(Boolean)
+      );
+
+      const matchesNotInActiveStorage = uniqueMatches.filter(
+        (container) => !activeStorageSet.has(container.toLowerCase())
+      );
+
+      if (matchesNotInActiveStorage.length === 0 && activeStorageSet.size > 0) {
+        setContainerMatches([]);
+        setErrorText('That container is already in storage.');
+        setToastMessage('Already in storage');
+        return;
+      }
+
+      const { data: statusRows, error: statusError } = await supabase
+        .from('picktickets')
+        .select('container_number, status')
+        .in('container_number', matchesNotInActiveStorage)
+        .neq('customer', 'PAPER');
+
+      if (statusError) {
+        setErrorText(`Search failed. ${describeSupabaseError(statusError)}`);
+        return;
+      }
+
+      const statusByContainer = new Map<string, { total: number; unlabeled: number }>();
+      (statusRows || []).forEach((row) => {
+        const container = String(row.container_number || '').trim().toLowerCase();
+        if (!container) return;
+
+        const current = statusByContainer.get(container) || { total: 0, unlabeled: 0 };
+        current.total += 1;
+        const normalizedStatus = String(row.status || '').trim().toLowerCase();
+        if (!normalizedStatus || normalizedStatus === 'unlabeled') {
+          current.unlabeled += 1;
+        }
+        statusByContainer.set(container, current);
+      });
+
+      const organizedSet = new Set(
+        Array.from(statusByContainer.entries())
+          .filter(([, counts]) => counts.total > 0 && counts.unlabeled === 0)
+          .map(([container]) => container)
+      );
+
+      const unorganizedMatches = matchesNotInActiveStorage.filter((container) => !organizedSet.has(container.toLowerCase()));
+      setContainerMatches(unorganizedMatches);
+
+      if (unorganizedMatches.length === 0 && organizedSet.size > 0) {
+        setErrorText('That container is already organized.');
+        setToastMessage("Already organized");
+        return;
+      }
+
+      if (activeStorageSet.size > 0 && unorganizedMatches.length > 0) {
+        setToastMessage('Some results are already in storage and were hidden.');
+      } else if (unorganizedMatches.length < matchesNotInActiveStorage.length) {
+        setToastMessage('Some results were hidden because they are already organized.');
       }
     } catch (error) {
       console.error('Container search failed:', error);
@@ -170,6 +252,59 @@ export default function StorageAddModal({ lanes, onClose, onSaved }: StorageAddM
       }
     }
 
+    const requestedLaneNumbers = Array.from(new Set(payload.map((row) => String(row.lane_number))));
+    if (requestedLaneNumbers.length === 0) {
+      setErrorText('No lanes were selected.');
+      return;
+    }
+
+    try {
+      const [{ data: laneAssignments, error: laneAssignmentError }, { data: stagingLanes, error: stagingError }, { data: activeStorageLanes, error: activeStorageError }] = await Promise.all([
+        supabase
+          .from('lane_assignments')
+          .select('lane_number')
+          .in('lane_number', requestedLaneNumbers),
+        supabase
+          .from('shipments')
+          .select('staging_lane')
+          .in('staging_lane', requestedLaneNumbers)
+          .eq('archived', false),
+        supabase
+          .from('container_storage_assignments')
+          .select('lane_number')
+          .in('lane_number', requestedLaneNumbers)
+          .eq('active', true)
+      ]);
+
+      if (laneAssignmentError || stagingError || activeStorageError) {
+        const combinedError = laneAssignmentError || stagingError || activeStorageError;
+        setErrorText(`Failed to validate lane availability. ${describeSupabaseError(combinedError)}`);
+        return;
+      }
+
+      const unavailableLanes = new Set<string>();
+      (laneAssignments || []).forEach((row) => unavailableLanes.add(String(row.lane_number)));
+      (stagingLanes || []).forEach((row) => {
+        if (row.staging_lane) unavailableLanes.add(String(row.staging_lane));
+      });
+      (activeStorageLanes || []).forEach((row) => unavailableLanes.add(String(row.lane_number)));
+
+      if (unavailableLanes.size > 0) {
+        const sortedUnavailable = Array.from(unavailableLanes).sort((a, b) => {
+          const aNum = Number(a);
+          const bNum = Number(b);
+          if (!Number.isNaN(aNum) && !Number.isNaN(bNum)) return aNum - bNum;
+          return a.localeCompare(b);
+        });
+        setErrorText(`Lane(s) ${sortedUnavailable.join(', ')} are not empty. Storage can only use empty lanes.`);
+        return;
+      }
+    } catch (error) {
+      console.error('Failed to validate lane availability:', error);
+      setErrorText('Failed to validate lane availability.');
+      return;
+    }
+
     setSaving(true);
     setErrorText('');
 
@@ -208,6 +343,12 @@ export default function StorageAddModal({ lanes, onClose, onSaved }: StorageAddM
               type="text"
               value={searchInput}
               onChange={(e) => setSearchInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  void handleSearchContainers();
+                }
+              }}
               placeholder="Enter full container or last digits"
               className="flex-1 bg-gray-700 border border-gray-600 text-white p-2 md:p-3 rounded-lg"
             />
@@ -292,6 +433,12 @@ export default function StorageAddModal({ lanes, onClose, onSaved }: StorageAddM
           </button>
         </div>
       </div>
+
+      {toastMessage && (
+        <div className="fixed bottom-6 right-6 z-[90] bg-gray-900 border border-gray-600 text-gray-100 px-4 py-2 rounded-lg shadow-lg text-sm animate-fade-in">
+          {toastMessage}
+        </div>
+      )}
     </div>
   );
 }

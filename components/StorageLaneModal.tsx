@@ -23,6 +23,23 @@ interface ConfirmState {
   onConfirm: () => void;
 }
 
+interface UrgencyMeta {
+  label: string;
+  badgeClass: string;
+  detail: string;
+  detailClass: string;
+  order: number;
+}
+
+interface UrgencyOverviewItem {
+  label: string;
+  count: number;
+  badgeClass: string;
+  order: number;
+}
+
+type UrgencyOverviewRow = Pick<Pickticket, 'status' | 'pu_number' | 'pu_date' | 'start_date' | 'cancel_date'>;
+
 function describeSupabaseError(error: { code?: string; message?: string; details?: string; hint?: string } | null) {
   if (!error) return 'Unknown Supabase error';
   return [error.code, error.message, error.details, error.hint].filter(Boolean).join(' | ') || 'Unknown Supabase error';
@@ -37,12 +54,200 @@ function sortLaneNumbers(lanes: string[]) {
   });
 }
 
+function parseFlexibleDate(value?: string | null): Date | null {
+  if (!value) return null;
+  const raw = String(value).trim();
+  if (!raw) return null;
+
+  const isoMatch = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (isoMatch) {
+    const year = Number(isoMatch[1]);
+    const month = Number(isoMatch[2]);
+    const day = Number(isoMatch[3]);
+    const date = new Date(year, month - 1, day);
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+
+  const usMatch = raw.match(/^(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?$/);
+  if (usMatch) {
+    const month = Number(usMatch[1]);
+    const day = Number(usMatch[2]);
+    const yearPart = usMatch[3];
+    const year = yearPart
+      ? (yearPart.length === 2 ? 2000 + Number(yearPart) : Number(yearPart))
+      : new Date().getFullYear();
+    const date = new Date(year, month - 1, day);
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+
+  const parsed = new Date(raw);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function daysUntilDate(date: Date | null): number | null {
+  if (!date) return null;
+  const now = new Date();
+  now.setHours(0, 0, 0, 0);
+  const target = new Date(date);
+  target.setHours(0, 0, 0, 0);
+  return Math.ceil((target.getTime() - now.getTime()) / (24 * 60 * 60 * 1000));
+}
+
+function daysSinceDate(date: Date | null): number | null {
+  if (!date) return null;
+  const now = new Date();
+  now.setHours(0, 0, 0, 0);
+  const target = new Date(date);
+  target.setHours(0, 0, 0, 0);
+  return Math.floor((now.getTime() - target.getTime()) / (24 * 60 * 60 * 1000));
+}
+
+function normalizeStatus(status?: string | null) {
+  const normalized = (status || '').trim().toLowerCase();
+  return normalized || 'unlabeled';
+}
+
+function statusBadgeMeta(status: string): UrgencyMeta | null {
+  switch (status) {
+    case 'labeled':
+      return {
+        label: 'Labeled',
+        badgeClass: 'bg-yellow-600 text-yellow-50 border border-yellow-300',
+        detail: 'Status: Labeled',
+        detailClass: 'text-yellow-300 text-[10px] md:text-xs',
+        order: 90
+      };
+    case 'staged':
+      return {
+        label: 'Staged',
+        badgeClass: 'bg-blue-700 text-white border border-blue-300',
+        detail: 'Status: Staged',
+        detailClass: 'text-blue-300 text-[10px] md:text-xs',
+        order: 91
+      };
+    case 'ready_to_ship':
+      return {
+        label: 'Ready to Ship',
+        badgeClass: 'bg-green-700 text-white border border-green-300',
+        detail: 'Status: Ready to Ship',
+        detailClass: 'text-green-300 text-[10px] md:text-xs',
+        order: 92
+      };
+    case 'shipped':
+      return {
+        label: 'Shipped',
+        badgeClass: 'bg-emerald-700 text-white border border-emerald-300',
+        detail: 'Status: Shipped',
+        detailClass: 'text-emerald-300 text-[10px] md:text-xs',
+        order: 93
+      };
+    default:
+      return null;
+  }
+}
+
+function getUrgencyMeta(pt: UrgencyOverviewRow): UrgencyMeta {
+  const workflowMeta = statusBadgeMeta(normalizeStatus(pt.status));
+  if (workflowMeta) return workflowMeta;
+
+  const hasPuUrgent = Boolean(pt.pu_number && pt.pu_date);
+  const cancelDate = parseFlexibleDate(pt.cancel_date);
+  const startDate = parseFlexibleDate(pt.start_date);
+  const daysUntilCancel = daysUntilDate(cancelDate);
+  const daysSinceStart = daysSinceDate(startDate);
+
+  if (hasPuUrgent) {
+    return {
+      label: 'URGENT',
+      badgeClass: 'bg-red-700 text-white border border-red-300 text-xs md:text-sm font-extrabold',
+      detail: `PU #${pt.pu_number} • ${pt.pu_date}`,
+      detailClass: 'text-red-300 text-[10px] md:text-xs font-semibold',
+      order: 0
+    };
+  }
+
+  if (daysUntilCancel !== null) {
+    if (daysUntilCancel <= 0) {
+      return {
+        label: 'Critical',
+        badgeClass: 'bg-red-700 text-white border border-red-300',
+        detail: `Days until cancel: ${daysUntilCancel}`,
+        detailClass: 'text-red-300 text-[10px] md:text-xs',
+        order: 1
+      };
+    }
+    if (daysUntilCancel <= 2) {
+      return {
+        label: 'Rush',
+        badgeClass: 'bg-red-600 text-white border border-red-300',
+        detail: `Days until cancel: ${daysUntilCancel}`,
+        detailClass: 'text-red-300 text-[10px] md:text-xs',
+        order: 2
+      };
+    }
+    if (daysUntilCancel <= 5) {
+      return {
+        label: 'Soon',
+        badgeClass: 'bg-orange-600 text-white border border-orange-300',
+        detail: `Days until cancel: ${daysUntilCancel}`,
+        detailClass: 'text-orange-300 text-[10px] md:text-xs',
+        order: 3
+      };
+    }
+    if (daysUntilCancel <= 10) {
+      return {
+        label: 'Watch',
+        badgeClass: 'bg-yellow-600 text-yellow-100 border border-yellow-300',
+        detail: `Days until cancel: ${daysUntilCancel}`,
+        detailClass: 'text-yellow-300 text-[10px] md:text-xs',
+        order: 4
+      };
+    }
+  }
+
+  const neutralDetailPieces: string[] = [];
+  neutralDetailPieces.push(daysUntilCancel === null ? 'Days until cancel: N/A' : `Days until cancel: ${daysUntilCancel}`);
+  if (daysSinceStart !== null) neutralDetailPieces.push(`Start +${daysSinceStart}d`);
+
+  return {
+    label: 'Normal',
+    badgeClass: 'bg-gray-600 text-white border border-gray-400',
+    detail: neutralDetailPieces.join(' • '),
+    detailClass: 'text-gray-300 text-[10px] md:text-xs',
+    order: 5
+  };
+}
+
+function buildUrgencyOverview(rows: UrgencyOverviewRow[]): UrgencyOverviewItem[] {
+  const overviewMap = new Map<string, UrgencyOverviewItem>();
+
+  rows.forEach((row) => {
+    const meta = getUrgencyMeta(row);
+    const existing = overviewMap.get(meta.label);
+    if (existing) {
+      existing.count += 1;
+      return;
+    }
+
+    overviewMap.set(meta.label, {
+      label: meta.label,
+      count: 1,
+      badgeClass: meta.badgeClass,
+      order: meta.order
+    });
+  });
+
+  return Array.from(overviewMap.values()).sort((a, b) => a.order - b.order || a.label.localeCompare(b.label));
+}
+
 export default function StorageLaneModal({ mode, title, assignments, onClose, onUpdated }: StorageLaneModalProps) {
   const [localAssignments, setLocalAssignments] = useState<StorageAssignment[]>(assignments);
   const [selectedLane, setSelectedLane] = useState<string | null>(null);
   const [expandedAssignmentIds, setExpandedAssignmentIds] = useState<Set<number>>(new Set());
   const [ptRowsByAssignmentId, setPtRowsByAssignmentId] = useState<Record<number, Pickticket[]>>({});
   const [loadingAssignmentIds, setLoadingAssignmentIds] = useState<number[]>([]);
+  const [urgencyOverviewByAssignmentId, setUrgencyOverviewByAssignmentId] = useState<Record<number, UrgencyOverviewItem[]>>({});
+  const [loadingOverviewIds, setLoadingOverviewIds] = useState<number[]>([]);
   const [markingAssignmentId, setMarkingAssignmentId] = useState<number | null>(null);
   const [isBulkOrganizing, setIsBulkOrganizing] = useState(false);
   const [errorText, setErrorText] = useState('');
@@ -86,6 +291,44 @@ export default function StorageLaneModal({ mode, title, assignments, onClose, on
     return localAssignments.filter((assignment) => assignment.lane_number === selectedLane);
   }, [mode, localAssignments, selectedLane]);
 
+  useEffect(() => {
+    const assignmentsNeedingOverview = visibleAssignments.filter(
+      (assignment) => !urgencyOverviewByAssignmentId[assignment.id] && !loadingOverviewIds.includes(assignment.id)
+    );
+
+    assignmentsNeedingOverview.forEach((assignment) => {
+      void fetchUrgencyOverviewForAssignment(assignment);
+    });
+  }, [visibleAssignments, urgencyOverviewByAssignmentId, loadingOverviewIds]);
+
+  async function fetchUrgencyOverviewForAssignment(assignment: StorageAssignment) {
+    setLoadingOverviewIds((prev) => (prev.includes(assignment.id) ? prev : [...prev, assignment.id]));
+
+    try {
+      const { data, error } = await supabase
+        .from('picktickets')
+        .select('status, pu_number, pu_date, start_date, cancel_date')
+        .eq('container_number', assignment.container_number)
+        .eq('customer', assignment.customer);
+
+      if (error) {
+        setErrorText(`Failed to load urgency overview. ${describeSupabaseError(error)}`);
+        return;
+      }
+
+      const rows = (data || []) as UrgencyOverviewRow[];
+      setUrgencyOverviewByAssignmentId((prev) => ({
+        ...prev,
+        [assignment.id]: buildUrgencyOverview(rows)
+      }));
+    } catch (error) {
+      console.error('Failed to load storage urgency overview:', error);
+      setErrorText('Failed to load urgency overview for this assignment.');
+    } finally {
+      setLoadingOverviewIds((prev) => prev.filter((id) => id !== assignment.id));
+    }
+  }
+
   async function fetchPTsForAssignment(assignment: StorageAssignment) {
     setLoadingAssignmentIds((prev) => (prev.includes(assignment.id) ? prev : [...prev, assignment.id]));
     setErrorText('');
@@ -93,7 +336,7 @@ export default function StorageLaneModal({ mode, title, assignments, onClose, on
     try {
       const { data, error } = await supabase
         .from('picktickets')
-        .select('id, pt_number, po_number, customer, container_number, assigned_lane, store_dc, start_date, cancel_date, actual_pallet_count, ctn, status, pu_number, qty, last_synced_at, compiled_pallet_id')
+        .select('id, pt_number, po_number, customer, container_number, assigned_lane, store_dc, start_date, cancel_date, actual_pallet_count, ctn, status, pu_number, pu_date, qty, last_synced_at, compiled_pallet_id')
         .eq('container_number', assignment.container_number)
         .eq('customer', assignment.customer)
         .order('pt_number');
@@ -103,7 +346,13 @@ export default function StorageLaneModal({ mode, title, assignments, onClose, on
         return;
       }
 
-      setPtRowsByAssignmentId((prev) => ({ ...prev, [assignment.id]: data || [] }));
+      const rows = (data || []) as Pickticket[];
+      setPtRowsByAssignmentId((prev) => ({ ...prev, [assignment.id]: rows }));
+      setUrgencyOverviewByAssignmentId((prev) => (
+        prev[assignment.id]
+          ? prev
+          : { ...prev, [assignment.id]: buildUrgencyOverview(rows) }
+      ));
     } catch (error) {
       console.error('Failed to load storage PT rows:', error);
       setErrorText('Failed to load PT rows for this storage assignment.');
@@ -151,6 +400,13 @@ export default function StorageLaneModal({ mode, title, assignments, onClose, on
       const assignmentIdSet = new Set(assignmentIds);
       const remaining = localAssignments.filter((row) => !assignmentIdSet.has(row.id));
       setLocalAssignments(remaining);
+      setUrgencyOverviewByAssignmentId((prev) => {
+        const next = { ...prev };
+        assignmentIds.forEach((id) => {
+          delete next[id];
+        });
+        return next;
+      });
       onUpdated();
 
       if (remaining.length === 0) {
@@ -304,6 +560,8 @@ export default function StorageLaneModal({ mode, title, assignments, onClose, on
               const rows = ptRowsByAssignmentId[assignment.id] || [];
               const isExpanded = expandedAssignmentIds.has(assignment.id);
               const isLoadingRows = loadingAssignmentIds.includes(assignment.id);
+              const isLoadingOverview = loadingOverviewIds.includes(assignment.id);
+              const urgencyOverview = urgencyOverviewByAssignmentId[assignment.id] || [];
 
               return (
                 <div key={assignment.id} className="bg-gray-900 border border-gray-700 rounded-lg p-3 md:p-4">
@@ -331,6 +589,25 @@ export default function StorageLaneModal({ mode, title, assignments, onClose, on
                     </div>
                   </div>
 
+                  <div className="mt-2">
+                    {isLoadingOverview ? (
+                      <div className="text-[11px] md:text-xs text-gray-400">Calculating urgency overview...</div>
+                    ) : urgencyOverview.length > 0 ? (
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        {urgencyOverview.map((overview) => (
+                          <span
+                            key={`${assignment.id}-${overview.label}`}
+                            className={`px-2 py-0.5 rounded text-[11px] md:text-xs font-bold ${overview.badgeClass}`}
+                          >
+                            {overview.label}: {overview.count}
+                          </span>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="text-[11px] md:text-xs text-gray-400">No PT urgency data.</div>
+                    )}
+                  </div>
+
                   {isExpanded && (
                     <div className="mt-3 border-t border-gray-700 pt-3">
                       {isLoadingRows ? (
@@ -346,6 +623,19 @@ export default function StorageLaneModal({ mode, title, assignments, onClose, on
                                 <div className="text-xs md:text-sm text-gray-300 break-all">
                                   {pt.customer} | Lane {pt.assigned_lane || 'Unassigned'} | {pt.actual_pallet_count || 0}p
                                 </div>
+                                {(() => {
+                                  const urgency = getUrgencyMeta(pt);
+                                  return (
+                                    <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                                      <span className={`px-2 py-0.5 rounded font-bold ${urgency.badgeClass}`}>
+                                        {urgency.label}
+                                      </span>
+                                      <span className={urgency.detailClass}>
+                                        {urgency.detail}
+                                      </span>
+                                    </div>
+                                  );
+                                })()}
                               </div>
                               <button
                                 onClick={() => setSelectedPTDetails(pt)}

@@ -11,6 +11,7 @@ export interface Pickticket {
   actual_pallet_count: number | null;
   status?: string;
   pu_number?: string;
+  pu_date?: string;
   carrier?: string;
   ctn?: string;
   sample_checked?: boolean;

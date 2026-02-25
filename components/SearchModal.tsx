@@ -85,20 +85,18 @@ export default function SearchModal({ onClose, mostRecentSync }: SearchModalProp
       if (error) {
         console.error('Search error:', error);
       } else if (data) {
+        const typedData = data as Pickticket[];
         // Fetch compiled info for all PTs
-        const ptIds = data.map(pt => pt.id);
+        const ptIds = typedData.map((pt) => pt.id);
         const compiledInfo = await fetchCompiledPTInfo(ptIds);
 
-        // Attach compiled_with to each PT
-        // Attach compiled_with to each PT
-        data.forEach(pt => {
-          if (compiledInfo[pt.id]) {
-            (pt as any).compiled_with = compiledInfo[pt.id];
-          }
-        });
+        const decorated = typedData.map((pt) => ({
+          ...pt,
+          compiled_with: compiledInfo[pt.id] || pt.compiled_with
+        }));
 
         if (searchType === 'CONTAINER') {
-          const grouped = data.reduce((acc, pt) => {
+          const grouped = decorated.reduce((acc, pt) => {
             const containerNum = pt.container_number;
             const existing = acc.find(g => g.container_number === containerNum);
             if (existing) {
@@ -114,7 +112,7 @@ export default function SearchModal({ onClose, mostRecentSync }: SearchModalProp
 
           setContainerGroups(grouped);
         } else {
-          setResults(data);
+          setResults(decorated);
         }
       }
     } catch (error) {
@@ -205,7 +203,7 @@ export default function SearchModal({ onClose, mostRecentSync }: SearchModalProp
           <div className="mt-3 pt-3 border-t border-gray-600">
             <div className="text-xs text-gray-400 mb-2">Compiled with:</div>
             <div className="space-y-1">
-              {pt.compiled_with!.map((cpt: any) => (
+              {pt.compiled_with!.map((cpt) => (
                 <div key={cpt.id} className="text-sm text-gray-300">
                   • PT #{cpt.pt_number} ({cpt.customer})
                 </div>

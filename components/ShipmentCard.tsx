@@ -138,6 +138,7 @@ export default function ShipmentCard({
     if (unsyncedPTs.length > 0 && shipment.staging_lane) {
       autoSyncPTs(unsyncedPTs);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [readOnly, shipment.pts, shipment.staging_lane]);
 
   //OCR move PT
@@ -355,6 +356,7 @@ export default function ShipmentCard({
       fetchDepthInfo();
       fetchLaneOrderMap();
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [expanded, shipment.pts]);
 
   async function fetchLaneOrderMap() {
@@ -391,7 +393,7 @@ export default function ShipmentCard({
     // Attach compiled_with info to each PT
     shipment.pts.forEach(pt => {
       if (compiledInfo[pt.id]) {
-        (pt as any).compiled_with = compiledInfo[pt.id];
+        pt.compiled_with = compiledInfo[pt.id] as ShipmentPT[];
       }
     });
 
@@ -1198,7 +1200,7 @@ export default function ShipmentCard({
         {/* PT Details Modal */}
         {selectedPTDetails && (
           <PTDetails
-            pt={selectedPTDetails as any}
+            pt={selectedPTDetails}
             onClose={() => setSelectedPTDetails(null)}
             mostRecentSync={mostRecentSync}
           />

@@ -33,9 +33,10 @@ interface LaneAssignment {
 interface AssignModalProps {
   lane: Lane;
   onClose: () => void;
+  onUpdated?: () => void;
 }
 
-export default function AssignModal({ lane, onClose }: AssignModalProps) {
+export default function AssignModal({ lane, onClose, onUpdated }: AssignModalProps) {
   const [view, setView] = useState<'existing' | 'add'>('existing');
   const [searchMode, setSearchMode] = useState<'container' | 'pt'>('pt');
   const [existingPTs, setExistingPTs] = useState<LaneAssignment[]>([]);
@@ -100,6 +101,7 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
     fetchAllUnassignedPTs();
     fetchAllLanes();
     fetchMostRecentSync();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -119,6 +121,7 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
     if (searchMode === 'pt') {
       filterPickticketsBySearch();
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ptSearchQuery, searchMode]);
 
   useEffect(() => {
@@ -143,6 +146,7 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
   useEffect(() => {
     // Refresh capacity display when existingPTs changes
     fetchExistingPTs();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedPTs]);
 
   async function handleCompile() {
@@ -262,13 +266,31 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
       .order('order_position', { ascending: true });
 
     if (assignments) {
-      const formattedAssignments = assignments.map(a => ({
-        id: a.id,
-        pallet_count: a.pallet_count,
-        order_position: a.order_position || 1,
-        compiled_pallet_id: a.compiled_pallet_id,
-        pickticket: (Array.isArray(a.picktickets) ? a.picktickets[0] : a.picktickets) as any
-      })).filter(a => a.pickticket);
+      const rawAssignments = assignments as Array<{
+        id: number;
+        pallet_count: number;
+        order_position: number | null;
+        compiled_pallet_id?: number | null;
+        picktickets: Pickticket | Pickticket[] | null;
+      }>;
+
+      const formattedAssignments = rawAssignments
+        .map((assignment) => {
+          const pickticket = Array.isArray(assignment.picktickets)
+            ? assignment.picktickets[0]
+            : assignment.picktickets;
+
+          if (!pickticket) return null;
+
+          return {
+            id: assignment.id,
+            pallet_count: assignment.pallet_count,
+            order_position: assignment.order_position || 1,
+            compiled_pallet_id: assignment.compiled_pallet_id,
+            pickticket
+          } as LaneAssignment;
+        })
+        .filter((assignment): assignment is LaneAssignment => Boolean(assignment));
 
       // Fetch compiled PT info
       const ptIds = formattedAssignments.map(a => a.pickticket.id);
@@ -277,11 +299,11 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
       // Attach compiled_with info to each PT
       formattedAssignments.forEach(assignment => {
         if (compiledInfo[assignment.pickticket.id]) {
-          (assignment.pickticket as any).compiled_with = compiledInfo[assignment.pickticket.id];
+          assignment.pickticket.compiled_with = compiledInfo[assignment.pickticket.id];
         }
       });
 
-      setExistingPTs(formattedAssignments as LaneAssignment[]);
+      setExistingPTs(formattedAssignments);
     }
   }
 
@@ -538,6 +560,7 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
       await fetchExistingPTs();
       await fetchAllUnassignedPTs();
       setView('existing');
+      onUpdated?.();
 
     } catch (error) {
       console.error('Error assigning PTs:', error);
@@ -577,6 +600,7 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
           showToast('PT removed from lane', 'success');
           await fetchExistingPTs();
           await checkIfStagingLane();
+          onUpdated?.();
 
         } catch (error) {
           console.error('Error removing PT:', error);
@@ -607,6 +631,7 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
       showToast('Pallet count updated', 'success');
       setEditingPT(null);
       await fetchExistingPTs();
+      onUpdated?.();
 
     } catch (error) {
       console.error('Error updating pallet count:', error);
@@ -690,6 +715,7 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
       setMoveLaneError('');
       await fetchExistingPTs();
       await checkIfStagingLane();
+      onUpdated?.();
 
     } catch (error) {
       console.error('Error moving PT:', error);
@@ -770,6 +796,7 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
       await persistPTOrder(reordered);
       setMobileControlsIndex(targetIndex);
       await fetchExistingPTs();
+      onUpdated?.();
       showToast('Order updated', 'success');
     } catch (error) {
       console.error('Error updating order:', error);
@@ -793,6 +820,7 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
 
       setDraggedItem(null);
       await fetchExistingPTs();
+      onUpdated?.();
     } catch (error) {
       console.error('Error updating order:', error);
       showToast('Failed to update order', 'error');
@@ -1113,6 +1141,7 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                                         showToast('Compiled pallet removed', 'success');
                                         await fetchExistingPTs();
                                         await checkIfStagingLane();
+                                        onUpdated?.();
                                       } else {
                                         showToast('Failed to remove', 'error');
                                       }
