@@ -146,7 +146,7 @@ export default function OCRCamera({ expectedPT, expectedPO, onSuccess, onCancel 
         const poLength = expectedPODigits.length;
 
         // Extract all digit sequences
-        const allNumbers = cleaned.match(/\d+/g) || [];
+        const allNumbers: string[] = cleaned.match(/\d+/g) ?? [];
 
         console.log('All numbers found:', allNumbers);
 
