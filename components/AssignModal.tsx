@@ -1105,58 +1105,69 @@ export default function AssignModal({ lane, onClose }: AssignModalProps) {
                         </div>
 
                         {/* Drag handle */}
-                        <div className="flex flex-col items-center gap-1.5">
-                          <div
-                            data-mobile-reorder-trigger={isTouchDevice ? 'true' : undefined}
-                            onClick={isTouchDevice ? () => toggleMobileControls(index) : undefined}
-                            className={`flex flex-col justify-center items-center flex-shrink-0 px-3 md:px-2 min-w-[40px] md:min-w-0 rounded ${isTouchDevice ? 'cursor-pointer touch-manipulation' : 'bg-gray-600 cursor-move touch-none'
-                              } ${isTouchDevice && mobileControlsIndex === index ? 'bg-blue-600 ring-2 ring-blue-300' : 'bg-gray-600'} ${savingMobileOrder ? 'opacity-60 pointer-events-none' : ''}`}
-                          >
-                            {savingMobileOrder ? (
-                              <div className="text-white text-[10px] font-bold">Saving...</div>
-                            ) : (
-                              <>
-                                <div className="text-gray-300 text-2xl leading-none">⋮</div>
-                                <div className="text-gray-300 text-2xl leading-none">⋮</div>
-                                <div className="text-gray-300 text-2xl leading-none">⋮</div>
-                              </>
-                            )}
-                          </div>
-
-                          {isTouchDevice && mobileControlsIndex === index && (
-                            <div data-mobile-reorder-controls="true" className="grid grid-cols-2 gap-1">
-                              <button
-                                onClick={() => void handleMobileMove(index, 0)}
-                                disabled={savingMobileOrder || index === 0}
-                                className="bg-blue-700 hover:bg-blue-600 disabled:bg-gray-600 px-2 py-1 rounded text-[10px] font-bold"
-                                title="Move to top"
+                        <div className="flex flex-col items-center self-stretch w-[38px] flex-shrink-0">
+                          {isTouchDevice && mobileControlsIndex === index ? (
+                            <div className={`flex items-stretch self-stretch w-full ${savingMobileOrder ? 'opacity-60 pointer-events-none' : ''}`}>
+                              <div
+                                data-mobile-reorder-controls="true"
+                                className="flex flex-col items-center justify-center w-[36px] py-0.5"
                               >
-                                ⏫
-                              </button>
-                              <button
-                                onClick={() => void handleMobileMove(index, index - 1)}
-                                disabled={savingMobileOrder || index === 0}
-                                className="bg-blue-700 hover:bg-blue-600 disabled:bg-gray-600 px-2 py-1 rounded text-[10px] font-bold"
-                                title="Move up"
-                              >
-                                ▲
-                              </button>
-                              <button
-                                onClick={() => void handleMobileMove(index, index + 1)}
-                                disabled={savingMobileOrder || index === existingPTs.length - 1}
-                                className="bg-blue-700 hover:bg-blue-600 disabled:bg-gray-600 px-2 py-1 rounded text-[10px] font-bold"
-                                title="Move down"
-                              >
-                                ▼
-                              </button>
-                              <button
-                                onClick={() => void handleMobileMove(index, existingPTs.length - 1)}
-                                disabled={savingMobileOrder || index === existingPTs.length - 1}
-                                className="bg-blue-700 hover:bg-blue-600 disabled:bg-gray-600 px-2 py-1 rounded text-[10px] font-bold"
-                                title="Move to bottom"
-                              >
-                                ⏬
-                              </button>
+                                <button
+                                  onClick={() => void handleMobileMove(index, 0)}
+                                  disabled={savingMobileOrder || index === 0}
+                                  className="text-[11px] leading-none py-[1px] text-gray-200 hover:text-white disabled:text-gray-500"
+                                  title="Move to top"
+                                >
+                                  ⏫
+                                </button>
+                                <button
+                                  onClick={() => void handleMobileMove(index, index - 1)}
+                                  disabled={savingMobileOrder || index === 0}
+                                  className="text-[11px] leading-none py-[1px] text-gray-200 hover:text-white disabled:text-gray-500"
+                                  title="Move up"
+                                >
+                                  ▲
+                                </button>
+                                <button
+                                  onClick={() => void handleMobileMove(index, index + 1)}
+                                  disabled={savingMobileOrder || index === existingPTs.length - 1}
+                                  className="text-[11px] leading-none py-[1px] text-gray-200 hover:text-white disabled:text-gray-500"
+                                  title="Move down"
+                                >
+                                  ▼
+                                </button>
+                                <button
+                                  onClick={() => void handleMobileMove(index, existingPTs.length - 1)}
+                                  disabled={savingMobileOrder || index === existingPTs.length - 1}
+                                  className="text-[11px] leading-none py-[1px] text-gray-200 hover:text-white disabled:text-gray-500"
+                                  title="Move to bottom"
+                                >
+                                  ⏬
+                                </button>
+                              </div>
+                              <div
+                                data-mobile-reorder-trigger="true"
+                                onClick={() => toggleMobileControls(index)}
+                                className="w-[2px] h-full bg-gray-500/90 rounded-sm cursor-pointer"
+                                title="Close move controls"
+                              />
+                            </div>
+                          ) : (
+                            <div
+                              data-mobile-reorder-trigger={isTouchDevice ? 'true' : undefined}
+                              onClick={isTouchDevice ? () => toggleMobileControls(index) : undefined}
+                              className={`flex flex-col justify-center items-center w-full h-full rounded ${isTouchDevice ? 'cursor-pointer touch-manipulation bg-gray-600' : 'bg-gray-600 cursor-move touch-none'
+                                } ${savingMobileOrder ? 'opacity-60 pointer-events-none' : ''}`}
+                            >
+                              {savingMobileOrder ? (
+                                <div className="text-white text-[10px] font-bold">Saving...</div>
+                              ) : (
+                                <>
+                                  <div className="text-gray-300 text-2xl leading-none">⋮</div>
+                                  <div className="text-gray-300 text-2xl leading-none">⋮</div>
+                                  <div className="text-gray-300 text-2xl leading-none">⋮</div>
+                                </>
+                              )}
                             </div>
                           )}
                         </div>
