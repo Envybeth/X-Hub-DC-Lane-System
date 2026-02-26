@@ -13,8 +13,9 @@ interface PTDetailsProps {
 }
 
 export default function PTDetails({ pt, onClose, mostRecentSync }: PTDetailsProps) {
-    const isCompiled = pt.compiled_with && pt.compiled_with.length > 0;
-    const allPTs = isCompiled ? [pt, ...pt.compiled_with] : [pt];
+    const compiledWith = pt.compiled_with ?? [];
+    const isCompiled = compiledWith.length > 0;
+    const allPTs = isCompiled ? [pt, ...compiledWith] : [pt];
     const [selectedTabIndex, setSelectedTabIndex] = useState(0);
     const displayPT = allPTs[selectedTabIndex];
     const statusInfo = getStatusInfo(displayPT);

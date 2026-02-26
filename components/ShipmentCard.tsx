@@ -49,6 +49,7 @@ export interface ShipmentCardProps {
   isExpanded?: boolean;
   onToggleExpand?: (isExpanded: boolean) => void;
   readOnly?: boolean;
+  requireOCRForStaging?: boolean;
 }
 
 
@@ -58,7 +59,8 @@ export default function ShipmentCard({
   mostRecentSync,
   isExpanded = false,
   onToggleExpand,
-  readOnly = false
+  readOnly = false,
+  requireOCRForStaging = true
 }: ShipmentCardProps) {
   const [expanded, setExpanded] = useState(isExpanded);
   const [selectingLane, setSelectingLane] = useState(false);
@@ -687,8 +689,13 @@ export default function ShipmentCard({
       return;
     }
 
-    // ONLY trigger OCR scan - don't move yet!
-    setScanningPT(pt);
+    if (requireOCRForStaging) {
+      // Trigger OCR flow before allowing stage.
+      setScanningPT(pt);
+      return;
+    }
+
+    await performMovePT(pt);
   }
 
   async function handleFinalizeShipment() {

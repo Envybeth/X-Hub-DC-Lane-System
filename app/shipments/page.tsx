@@ -10,6 +10,7 @@ import { exportShipmentSummaryPdf, ShipmentPdfLoad } from '@/lib/shipmentPdf';
 const DAY_MS = 24 * 60 * 60 * 1000;
 const SHIPPED_TO_ARCHIVED_DAYS = 7;
 const HIDE_ARCHIVED_AFTER_DAYS = 21;
+const OCR_TOGGLE_STORAGE_KEY = 'shipments_ocr_required';
 
 type ShipmentSnapshotMap = Record<string, Shipment>;
 type StaleSnapshotRow = {
@@ -52,6 +53,9 @@ export default function ShipmentsPage() {
   const [searchSelectedShipmentKey, setSearchSelectedShipmentKey] = useState<string | null>(null);
   const [staleSnapshots, setStaleSnapshots] = useState<ShipmentSnapshotMap>({});
   const [staleSnapshotStoreAvailable, setStaleSnapshotStoreAvailable] = useState(true);
+  const [requireOCRForStaging, setRequireOCRForStaging] = useState(true);
+  const [verifyingOCRTogglePassword, setVerifyingOCRTogglePassword] = useState(false);
+  const [ocrToggleToast, setOcrToggleToast] = useState('');
   const shipmentRefreshTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
@@ -60,6 +64,62 @@ export default function ShipmentsPage() {
 
     fetchStaleSnapshotsFromSupabase();
   }, []);
+
+  useEffect(() => {
+    const saved = window.localStorage.getItem(OCR_TOGGLE_STORAGE_KEY);
+    if (saved === '0') {
+      setRequireOCRForStaging(false);
+    } else {
+      setRequireOCRForStaging(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!ocrToggleToast) return;
+    const timer = window.setTimeout(() => setOcrToggleToast(''), 2500);
+    return () => window.clearTimeout(timer);
+  }, [ocrToggleToast]);
+
+  async function handleToggleOCRRequirement() {
+    if (verifyingOCRTogglePassword) return;
+
+    const input = window.prompt('Enter password to change OCR requirement for staging:');
+    if (input === null) return;
+    const password = input.trim();
+    if (!password) {
+      setOcrToggleToast('Password required');
+      return;
+    }
+
+    setVerifyingOCRTogglePassword(true);
+    try {
+      const response = await fetch('/api/shipments/ocr-toggle-auth', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ password })
+      });
+
+      type AuthResponse = { authorized?: boolean; message?: string };
+      const payload = (await response.json().catch(() => ({}))) as AuthResponse;
+
+      if (!response.ok || !payload.authorized) {
+        setOcrToggleToast(payload.message || 'Incorrect password');
+        return;
+      }
+
+      const nextValue = !requireOCRForStaging;
+      setRequireOCRForStaging(nextValue);
+      window.localStorage.setItem(OCR_TOGGLE_STORAGE_KEY, nextValue ? '1' : '0');
+      setOcrToggleToast(nextValue ? 'OCR required for staging' : 'OCR bypass enabled');
+    } catch (error) {
+      console.error('Failed to verify OCR toggle password:', error);
+      setOcrToggleToast('Failed to verify password');
+    } finally {
+      setVerifyingOCRTogglePassword(false);
+    }
+  }
 
   const scheduleShipmentRefresh = useCallback(() => {
     if (shipmentRefreshTimerRef.current) {
@@ -496,6 +556,16 @@ export default function ShipmentsPage() {
           </div>
 
           <div className="flex flex-col md:flex-row gap-2 w-full md:w-auto">
+            <button
+              onClick={handleToggleOCRRequirement}
+              disabled={verifyingOCRTogglePassword}
+              className={`w-full md:w-auto text-center px-6 py-3 rounded-lg font-semibold transition-colors ${requireOCRForStaging
+                ? 'bg-indigo-600 hover:bg-indigo-700'
+                : 'bg-amber-600 hover:bg-amber-700'
+                }`}
+            >
+              {verifyingOCRTogglePassword ? 'Checking...' : `OCR: ${requireOCRForStaging ? 'ON' : 'OFF'}`}
+            </button>
             {readyToShipCount > 0 && (
               <button
                 onClick={exportAllReadyToShipPDF}
@@ -542,6 +612,7 @@ export default function ShipmentsPage() {
             onToggleExpand={(isExpanded) => {
               setExpandedShipmentKey(isExpanded ? `${shipment.pu_number}-${shipment.pu_date}` : null);
             }}
+            requireOCRForStaging={requireOCRForStaging}
           />
         ))}
       </div>
@@ -567,6 +638,7 @@ export default function ShipmentsPage() {
             onToggleExpand={(isExpanded) => {
               setExpandedShipmentKey(isExpanded ? `${shipment.pu_number}-${shipment.pu_date}` : null);
             }}
+            requireOCRForStaging={requireOCRForStaging}
           />
         ))}
       </div>
@@ -592,6 +664,7 @@ export default function ShipmentsPage() {
             onToggleExpand={(isExpanded) => {
               setExpandedShipmentKey(isExpanded ? `${shipment.pu_number}-${shipment.pu_date}` : null);
             }}
+            requireOCRForStaging={requireOCRForStaging}
           />
         ))}
       </div>
@@ -625,6 +698,7 @@ export default function ShipmentsPage() {
                 onToggleExpand={(isExpanded) => {
                   setExpandedShipmentKey(isExpanded ? `stale-${shipmentKey(shipment)}` : null);
                 }}
+                requireOCRForStaging={requireOCRForStaging}
               />
             ))}
           </div>
@@ -660,9 +734,16 @@ export default function ShipmentsPage() {
                 }}
                 mostRecentSync={mostRecentSync}
                 isExpanded={true}
+                requireOCRForStaging={requireOCRForStaging}
               />
             </div>
           </div>
+        </div>
+      )}
+
+      {ocrToggleToast && (
+        <div className="fixed top-4 right-4 z-[120] bg-gray-900 border border-gray-600 px-4 py-2 rounded-lg text-sm text-white shadow-lg animate-fade-in">
+          {ocrToggleToast}
         </div>
       )}
     </div>

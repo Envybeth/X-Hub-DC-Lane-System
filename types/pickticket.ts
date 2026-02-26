@@ -19,6 +19,6 @@ export interface Pickticket {
   sample_shipped?: boolean;
   last_synced_at?: string;
   qty?: number | null;
-  compiled_pallet_id?: number; 
+  compiled_pallet_id?: number | null;
   compiled_with?: Pickticket[]; 
 }
