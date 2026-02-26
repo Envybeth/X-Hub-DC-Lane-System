@@ -18,6 +18,20 @@ interface ContainerGroup {
   pts: Pickticket[];
 }
 
+interface QuickAssignRow {
+  lane_number: string;
+  pallet_count: string;
+}
+
+function sortLaneNumbers(values: string[]): string[] {
+  return [...values].sort((a, b) => {
+    const aNum = Number(a);
+    const bNum = Number(b);
+    if (!Number.isNaN(aNum) && !Number.isNaN(bNum)) return aNum - bNum;
+    return a.localeCompare(b);
+  });
+}
+
 export default function SearchModal({ onClose, mostRecentSync }: SearchModalProps) {
   const [searchType, setSearchType] = useState<'PT' | 'PO' | 'CONTAINER'>('PT');
   const [searchQuery, setSearchQuery] = useState('');
@@ -28,6 +42,12 @@ export default function SearchModal({ onClose, mostRecentSync }: SearchModalProp
   const [searched, setSearched] = useState(false);
   const [viewingPTDetails, setViewingPTDetails] = useState<Pickticket | null>(null);
   const [fallbackMostRecentSync, setFallbackMostRecentSync] = useState<Date | null>(null);
+  const [laneLocationsByPt, setLaneLocationsByPt] = useState<Record<number, string[]>>({});
+  const [availableLanes, setAvailableLanes] = useState<string[]>([]);
+  const [quickAssignPT, setQuickAssignPT] = useState<Pickticket | null>(null);
+  const [quickAssignRows, setQuickAssignRows] = useState<QuickAssignRow[]>([{ lane_number: '', pallet_count: '1' }]);
+  const [quickAssignSubmitting, setQuickAssignSubmitting] = useState(false);
+  const [quickAssignError, setQuickAssignError] = useState('');
   const router = useRouter();
   const effectiveMostRecentSync = mostRecentSync || fallbackMostRecentSync;
 
@@ -64,6 +84,7 @@ export default function SearchModal({ onClose, mostRecentSync }: SearchModalProp
     setResults([]);
     setContainerGroups([]);
     setExpandedContainers(new Set());
+    setLaneLocationsByPt({});
 
     try {
       let query = supabase
@@ -95,8 +116,42 @@ export default function SearchModal({ onClose, mostRecentSync }: SearchModalProp
           compiled_with: compiledInfo[pt.id] || pt.compiled_with
         }));
 
+        const { data: laneRows, error: laneError } = await supabase
+          .from('lane_assignments')
+          .select('pt_id, lane_number, order_position')
+          .in('pt_id', ptIds)
+          .order('order_position', { ascending: true });
+
+        if (laneError) {
+          console.error('Failed to fetch lane locations for search results:', laneError);
+        }
+
+        const laneMap: Record<number, string[]> = {};
+        (laneRows || []).forEach((row) => {
+          const ptId = Number(row.pt_id);
+          const lane = String(row.lane_number || '').trim();
+          if (!lane) return;
+          if (!laneMap[ptId]) laneMap[ptId] = [];
+          if (!laneMap[ptId].includes(lane)) laneMap[ptId].push(lane);
+        });
+        decorated.forEach((pt) => {
+          if ((!laneMap[pt.id] || laneMap[pt.id].length === 0) && pt.assigned_lane) {
+            laneMap[pt.id] = [pt.assigned_lane];
+          }
+        });
+        Object.keys(laneMap).forEach((ptIdKey) => {
+          const ptId = Number(ptIdKey);
+          laneMap[ptId] = sortLaneNumbers(laneMap[ptId] || []);
+        });
+        setLaneLocationsByPt(laneMap);
+
+        const decoratedWithLocations = decorated.map((pt) => ({
+          ...pt,
+          lane_locations: laneMap[pt.id] || []
+        }));
+
         if (searchType === 'CONTAINER') {
-          const grouped = decorated.reduce((acc, pt) => {
+          const grouped = decoratedWithLocations.reduce((acc, pt) => {
             const containerNum = pt.container_number;
             const existing = acc.find(g => g.container_number === containerNum);
             if (existing) {
@@ -112,7 +167,7 @@ export default function SearchModal({ onClose, mostRecentSync }: SearchModalProp
 
           setContainerGroups(grouped);
         } else {
-          setResults(decorated);
+          setResults(decoratedWithLocations);
         }
       }
     } catch (error) {
@@ -140,9 +195,205 @@ export default function SearchModal({ onClose, mostRecentSync }: SearchModalProp
     });
   }
 
+  function getPTLaneLocations(pt: Pickticket): string[] {
+    const mapped = laneLocationsByPt[pt.id];
+    if (mapped && mapped.length > 0) return sortLaneNumbers(mapped);
+    if (pt.lane_locations && pt.lane_locations.length > 0) return sortLaneNumbers(pt.lane_locations);
+    if (pt.assigned_lane) return [pt.assigned_lane];
+    return [];
+  }
+
+  async function ensureAvailableLanesLoaded() {
+    if (availableLanes.length > 0) return;
+    const { data, error } = await supabase
+      .from('lanes')
+      .select('lane_number')
+      .order('lane_number', { ascending: true });
+    if (error) {
+      console.error('Failed to load lanes for quick assign:', error);
+      return;
+    }
+    const lanes = sortLaneNumbers((data || []).map((row) => String(row.lane_number)));
+    setAvailableLanes(lanes);
+  }
+
+  async function openQuickAssign(pt: Pickticket) {
+    await ensureAvailableLanesLoaded();
+    const defaultPallets = pt.actual_pallet_count && pt.actual_pallet_count > 0
+      ? String(pt.actual_pallet_count)
+      : '1';
+    setQuickAssignRows([{ lane_number: '', pallet_count: defaultPallets }]);
+    setQuickAssignError('');
+    setQuickAssignPT(pt);
+  }
+
+  function updateQuickAssignRow(index: number, field: keyof QuickAssignRow, value: string) {
+    setQuickAssignRows((prev) => prev.map((row, rowIndex) => (
+      rowIndex === index ? { ...row, [field]: value } : row
+    )));
+  }
+
+  function addQuickAssignRow() {
+    setQuickAssignRows((prev) => [...prev, { lane_number: '', pallet_count: '1' }]);
+  }
+
+  function removeQuickAssignRow(index: number) {
+    setQuickAssignRows((prev) => (prev.length <= 1 ? prev : prev.filter((_, rowIndex) => rowIndex !== index)));
+  }
+
+  async function submitQuickAssign() {
+    if (!quickAssignPT) return;
+    setQuickAssignSubmitting(true);
+    setQuickAssignError('');
+
+    try {
+      const laneTotals = new Map<string, number>();
+      const laneOrder: string[] = [];
+
+      for (const row of quickAssignRows) {
+        const laneNumber = row.lane_number.trim();
+        if (!laneNumber) continue;
+        const palletCount = Number.parseInt(row.pallet_count.trim(), 10);
+        if (!Number.isFinite(palletCount) || palletCount <= 0) {
+          setQuickAssignError('Each selected lane must have a pallet count greater than 0.');
+          setQuickAssignSubmitting(false);
+          return;
+        }
+        if (!laneTotals.has(laneNumber)) laneOrder.push(laneNumber);
+        laneTotals.set(laneNumber, (laneTotals.get(laneNumber) || 0) + palletCount);
+      }
+
+      if (laneTotals.size === 0) {
+        setQuickAssignError('Add at least one lane and pallet quantity.');
+        return;
+      }
+
+      await ensureAvailableLanesLoaded();
+      const missingLanes = laneOrder.filter((lane) => !availableLanes.includes(lane));
+      if (missingLanes.length > 0) {
+        setQuickAssignError(`Unknown lane(s): ${missingLanes.join(', ')}`);
+        return;
+      }
+
+      const { data: stagingRows, error: stagingError } = await supabase
+        .from('shipments')
+        .select('staging_lane')
+        .in('staging_lane', laneOrder)
+        .eq('archived', false);
+      if (stagingError) {
+        setQuickAssignError(`Could not validate staging lanes: ${stagingError.message}`);
+        return;
+      }
+      const blockedStagingLanes = Array.from(new Set((stagingRows || []).map((row) => String(row.staging_lane))));
+      if (blockedStagingLanes.length > 0) {
+        setQuickAssignError(`Quick assign cannot target active staging lane(s): ${blockedStagingLanes.join(', ')}`);
+        return;
+      }
+
+      const { data: existingPtAssignments, error: existingAssignmentError } = await supabase
+        .from('lane_assignments')
+        .select('id')
+        .eq('pt_id', quickAssignPT.id);
+      if (existingAssignmentError) {
+        setQuickAssignError(`Failed to check current PT assignments: ${existingAssignmentError.message}`);
+        return;
+      }
+      if ((existingPtAssignments || []).length > 0) {
+        setQuickAssignError('PT already has lane assignments. Refresh search and use lane controls.');
+        return;
+      }
+
+      for (const laneNumber of laneOrder) {
+        const { data: laneAssignments, error: laneAssignmentsError } = await supabase
+          .from('lane_assignments')
+          .select('id, order_position')
+          .eq('lane_number', laneNumber);
+
+        if (laneAssignmentsError) {
+          setQuickAssignError(`Failed loading lane ${laneNumber}: ${laneAssignmentsError.message}`);
+          return;
+        }
+
+        for (const assignment of laneAssignments || []) {
+          const { error: shiftError } = await supabase
+            .from('lane_assignments')
+            .update({ order_position: (assignment.order_position || 0) + 1 })
+            .eq('id', assignment.id);
+          if (shiftError) {
+            setQuickAssignError(`Failed to shift lane ${laneNumber}: ${shiftError.message}`);
+            return;
+          }
+        }
+
+        const { error: insertError } = await supabase
+          .from('lane_assignments')
+          .insert({
+            lane_number: laneNumber,
+            pt_id: quickAssignPT.id,
+            pallet_count: laneTotals.get(laneNumber),
+            order_position: 1
+          });
+        if (insertError) {
+          setQuickAssignError(`Failed assigning lane ${laneNumber}: ${insertError.message}`);
+          return;
+        }
+      }
+
+      const totalPallets = Array.from(laneTotals.values()).reduce((sum, value) => sum + value, 0);
+      const primaryLane = laneOrder[0];
+
+      const { error: pickticketUpdateError } = await supabase
+        .from('picktickets')
+        .update({
+          assigned_lane: primaryLane,
+          actual_pallet_count: totalPallets,
+          status: 'labeled'
+        })
+        .eq('id', quickAssignPT.id);
+
+      if (pickticketUpdateError) {
+        setQuickAssignError(`Failed updating PT record: ${pickticketUpdateError.message}`);
+        return;
+      }
+
+      const updatedLanes = sortLaneNumbers(laneOrder);
+      setLaneLocationsByPt((prev) => ({ ...prev, [quickAssignPT.id]: updatedLanes }));
+      setResults((prev) => prev.map((result) => (
+        result.id === quickAssignPT.id
+          ? {
+            ...result,
+            assigned_lane: primaryLane,
+            actual_pallet_count: totalPallets,
+            lane_locations: updatedLanes,
+            status: 'labeled'
+          }
+          : result
+      )));
+      setContainerGroups((prev) => prev.map((group) => ({
+        ...group,
+        pts: group.pts.map((pt) => (
+          pt.id === quickAssignPT.id
+            ? {
+              ...pt,
+              assigned_lane: primaryLane,
+              actual_pallet_count: totalPallets,
+              lane_locations: updatedLanes,
+              status: 'labeled'
+            }
+            : pt
+        ))
+      })));
+      setQuickAssignPT(null);
+    } finally {
+      setQuickAssignSubmitting(false);
+    }
+  }
+
   function PTResultCard({ pt, mostRecentSync }: { pt: Pickticket; mostRecentSync?: Date | null }) {
     const isArchived = isPTArchived(pt, mostRecentSync);
-    const showArchived = isArchived && !pt.assigned_lane; // ADD THIS
+    const laneLocations = getPTLaneLocations(pt);
+    const primaryLane = laneLocations[0] || null;
+    const showArchived = isArchived && laneLocations.length === 0; // ADD THIS
     const isCompiled = pt.compiled_with && pt.compiled_with.length > 0;
 
     return (
@@ -175,19 +426,21 @@ export default function SearchModal({ onClose, mostRecentSync }: SearchModalProp
               ) : (
                 <div
                   onClick={() => {
-                    if (pt.assigned_lane) {
+                    if (primaryLane) {
                       // Close the search modal immediately
                       onClose();
                       // Navigate to the main page with the lane query
-                      router.push(`/?lane=${pt.assigned_lane}`);
+                      router.push(`/?lane=${primaryLane}`);
+                    } else {
+                      void openQuickAssign(pt);
                     }
                   }}
-                  className={`text-xl md:text-3xl font-bold transition-all ${pt.assigned_lane
+                  className={`text-xl md:text-3xl font-bold transition-all cursor-pointer hover:underline ${primaryLane
                     ? 'text-green-400 cursor-pointer hover:text-green-300 hover:underline'
-                    : 'text-yellow-400'
+                    : 'text-yellow-400 hover:text-yellow-300'
                     }`}
                 >
-                  {pt.assigned_lane ? `Lane ${pt.assigned_lane}` : 'Not assigned'}
+                  {laneLocations.length > 0 ? `Lane ${laneLocations.join('/')}` : 'Not assigned (click to assign)'}
                 </div>
               )}
             </div>
@@ -217,7 +470,9 @@ export default function SearchModal({ onClose, mostRecentSync }: SearchModalProp
 
   function PTCompactCard({ pt, mostRecentSync }: { pt: Pickticket; mostRecentSync?: Date | null }) {
     const isArchived = isPTArchived(pt, mostRecentSync);
-    const showArchived = isArchived && !pt.assigned_lane; // ADD THIS
+    const laneLocations = getPTLaneLocations(pt);
+    const primaryLane = laneLocations[0] || null;
+    const showArchived = isArchived && laneLocations.length === 0; // ADD THIS
     const isCompiled = pt.compiled_with && pt.compiled_with.length > 0;
 
     return (
@@ -240,8 +495,18 @@ export default function SearchModal({ onClose, mostRecentSync }: SearchModalProp
                 <div className="text-sm text-blue-400 mt-1">
                   {pt.actual_pallet_count || 'TBD'} pallets
                 </div>
-                <div className={`text-sm font-semibold mt-1 ${pt.assigned_lane ? 'text-green-400' : 'text-yellow-400'}`}>
-                  {pt.assigned_lane ? `Lane ${pt.assigned_lane}` : 'Unassigned'}
+                <div
+                  onClick={() => {
+                    if (primaryLane) {
+                      onClose();
+                      router.push(`/?lane=${primaryLane}`);
+                    } else {
+                      void openQuickAssign(pt);
+                    }
+                  }}
+                  className={`text-sm font-semibold mt-1 cursor-pointer hover:underline ${primaryLane ? 'text-green-400' : 'text-yellow-400'}`}
+                >
+                  {laneLocations.length > 0 ? `Lane ${laneLocations.join('/')}` : 'Unassigned (tap to assign)'}
                 </div>
               </>
             )}
@@ -427,6 +692,110 @@ export default function SearchModal({ onClose, mostRecentSync }: SearchModalProp
           </div>
         )}
       </div>
+
+      {/* PT Details Modal */}
+      {quickAssignPT && (
+        <div className="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center z-[70] p-4">
+          <div className="bg-gray-800 rounded-lg p-5 max-w-2xl w-full border-2 border-purple-600">
+            <h3 className="text-2xl font-bold mb-2">Quick Assign PT #{quickAssignPT.pt_number}</h3>
+            <p className="text-sm text-gray-300 mb-4">
+              Split this PT across one or more lanes. Each lane needs its own pallet quantity.
+            </p>
+
+            <div className="space-y-3">
+              {quickAssignRows.map((row, index) => (
+                <div key={index} className="grid grid-cols-[1fr_1fr_auto] gap-2 items-center">
+                  <div className="flex flex-col gap-1">
+                    <label htmlFor={`quick-assign-lane-${index}`} className="text-xs text-gray-300 font-semibold">
+                      Lane
+                    </label>
+                    <input
+                      id={`quick-assign-lane-${index}`}
+                      list="quick-assign-lanes"
+                      value={row.lane_number}
+                      onChange={(e) => updateQuickAssignRow(index, 'lane_number', e.target.value)}
+                      placeholder="Lane #"
+                      className="bg-gray-700 border border-gray-600 rounded px-3 py-2"
+                    />
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <label htmlFor={`quick-assign-pallet-${index}`} className="text-xs text-gray-300 font-semibold">
+                      Pallet Qty
+                    </label>
+                    <input
+                      id={`quick-assign-pallet-${index}`}
+                      type="number"
+                      min="1"
+                      value={row.pallet_count}
+                      onChange={(e) => updateQuickAssignRow(index, 'pallet_count', e.target.value)}
+                      placeholder="Pallets"
+                      className="bg-gray-700 border border-gray-600 rounded px-3 py-2"
+                    />
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <label className="text-xs text-gray-300 font-semibold invisible">
+                      Remove
+                    </label>
+                    <button
+                      onClick={() => removeQuickAssignRow(index)}
+                      disabled={quickAssignRows.length <= 1}
+                      className="bg-red-600 hover:bg-red-700 disabled:bg-gray-600 disabled:cursor-not-allowed px-3 py-2 rounded font-bold"
+                      type="button"
+                      aria-label="Remove lane row"
+                    >
+                      -
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="mt-3">
+              <button
+                onClick={addQuickAssignRow}
+                className="bg-blue-600 hover:bg-blue-700 px-3 py-2 rounded font-bold"
+                type="button"
+              >
+                + Add Lane
+              </button>
+            </div>
+
+            {quickAssignError && (
+              <div className="mt-3 bg-red-900 border border-red-600 rounded p-2 text-sm">
+                {quickAssignError}
+              </div>
+            )}
+
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                onClick={() => {
+                  setQuickAssignPT(null);
+                  setQuickAssignError('');
+                  setQuickAssignRows([{ lane_number: '', pallet_count: '1' }]);
+                }}
+                className="bg-gray-600 hover:bg-gray-700 px-4 py-2 rounded font-semibold"
+                type="button"
+                disabled={quickAssignSubmitting}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => void submitQuickAssign()}
+                className="bg-green-600 hover:bg-green-700 px-4 py-2 rounded font-semibold disabled:bg-gray-600"
+                type="button"
+                disabled={quickAssignSubmitting}
+              >
+                {quickAssignSubmitting ? 'Assigning...' : 'Assign'}
+              </button>
+            </div>
+          </div>
+          <datalist id="quick-assign-lanes">
+            {availableLanes.map((lane) => (
+              <option key={lane} value={lane} />
+            ))}
+          </datalist>
+        </div>
+      )}
 
       {/* PT Details Modal */}
       {viewingPTDetails && (

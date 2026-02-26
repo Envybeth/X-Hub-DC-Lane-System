@@ -1,8 +1,9 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Pickticket } from '@/types/pickticket';
 import { isPTArchived } from '@/lib/utils';
+import { supabase } from '@/lib/supabase';
 
 type PTDetailsTicket = Pickticket;
 
@@ -12,15 +13,83 @@ interface PTDetailsProps {
     mostRecentSync?: Date | null;
 }
 
+function sortLaneNumbers(values: string[]): string[] {
+    return [...values].sort((a, b) => {
+        const aNum = Number(a);
+        const bNum = Number(b);
+        if (!Number.isNaN(aNum) && !Number.isNaN(bNum)) return aNum - bNum;
+        return a.localeCompare(b);
+    });
+}
+
 export default function PTDetails({ pt, onClose, mostRecentSync }: PTDetailsProps) {
-    const compiledWith = pt.compiled_with ?? [];
+    const compiledWith = useMemo(() => pt.compiled_with ?? [], [pt.compiled_with]);
     const isCompiled = compiledWith.length > 0;
-    const allPTs = isCompiled ? [pt, ...compiledWith] : [pt];
+    const allPTs = useMemo(() => (isCompiled ? [pt, ...compiledWith] : [pt]), [compiledWith, isCompiled, pt]);
+    const ptIds = useMemo(() => allPTs.map((ticket) => ticket.id), [allPTs]);
+    const compiledIdsKey = compiledWith.map((ticket) => ticket.id).join(',');
+    const compiledAssignedKey = compiledWith.map((ticket) => `${ticket.id}:${ticket.assigned_lane || ''}`).join('|');
     const [selectedTabIndex, setSelectedTabIndex] = useState(0);
+    const [laneLocationsByPt, setLaneLocationsByPt] = useState<Record<number, string[]>>({});
     const displayPT = allPTs[selectedTabIndex];
     const statusInfo = getStatusInfo(displayPT);
     const isArchived = isPTArchived(displayPT, mostRecentSync);
-    const showArchived = isArchived && !displayPT.assigned_lane && displayPT.status !== 'shipped';
+
+    useEffect(() => {
+        let cancelled = false;
+
+        async function fetchLaneLocations() {
+            if (ptIds.length === 0) {
+                if (!cancelled) setLaneLocationsByPt({});
+                return;
+            }
+
+            const { data, error } = await supabase
+                .from('lane_assignments')
+                .select('pt_id, lane_number, order_position')
+                .in('pt_id', ptIds)
+                .order('order_position', { ascending: true });
+
+            if (error) {
+                console.error('Failed to load lane locations for PT details:', error);
+                return;
+            }
+
+            const byPt: Record<number, string[]> = {};
+            (data || []).forEach((row) => {
+                const ptId = Number(row.pt_id);
+                const lane = String(row.lane_number || '').trim();
+                if (!lane) return;
+                if (!byPt[ptId]) byPt[ptId] = [];
+                if (!byPt[ptId].includes(lane)) byPt[ptId].push(lane);
+            });
+
+            allPTs.forEach((ticket) => {
+                if ((!byPt[ticket.id] || byPt[ticket.id].length === 0) && ticket.assigned_lane) {
+                    byPt[ticket.id] = [ticket.assigned_lane];
+                }
+            });
+            Object.keys(byPt).forEach((ptIdKey) => {
+                const ptId = Number(ptIdKey);
+                byPt[ptId] = sortLaneNumbers(byPt[ptId] || []);
+            });
+
+            if (!cancelled) {
+                setLaneLocationsByPt(byPt);
+            }
+        }
+
+        void fetchLaneLocations();
+
+        return () => {
+            cancelled = true;
+        };
+    }, [allPTs, ptIds, pt.id, pt.assigned_lane, compiledIdsKey, compiledAssignedKey]);
+
+    const displayPTLanes = laneLocationsByPt[displayPT.id] && laneLocationsByPt[displayPT.id].length > 0
+        ? laneLocationsByPt[displayPT.id]
+        : (displayPT.assigned_lane ? [displayPT.assigned_lane] : []);
+    const showArchived = isArchived && displayPTLanes.length === 0 && displayPT.status !== 'shipped';
 
 
 
@@ -97,7 +166,7 @@ export default function PTDetails({ pt, onClose, mostRecentSync }: PTDetailsProp
                             </div>
                         ) : (
                             <div className="text-base md:text-lg font-bold">
-                                {displayPT.assigned_lane ? `Lane ${displayPT.assigned_lane}` : 'Not Assigned'}
+                                {displayPTLanes.length > 0 ? `Lane ${displayPTLanes.join('/')}` : 'Not Assigned'}
                             </div>
                         )}
                     </div>

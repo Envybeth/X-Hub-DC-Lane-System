@@ -54,10 +54,21 @@ export default function Home() {
       });
       const data = await response.json();
 
+      const skippedBreakdown = typeof data.skipped_breakdown === 'object' && data.skipped_breakdown !== null
+        ? data.skipped_breakdown as {
+          picked_up?: number;
+          paper?: number;
+          missing_pt_or_po?: number;
+        }
+        : null;
+      const skippedDetails = skippedBreakdown
+        ? `\n- picked up: ${skippedBreakdown.picked_up || 0}\n- PAPER: ${skippedBreakdown.paper || 0}\n- missing PT/PO: ${skippedBreakdown.missing_pt_or_po || 0}`
+        : '';
+
       if (data.success) {
         const sourceText = data.sourceSheet ? ` from "${data.sourceSheet}"` : '';
         const skippedText = typeof data.skipped === 'number' ? `\nSkipped: ${data.skipped}` : '';
-        alert(`✅ Synced ${data.count} picktickets${sourceText}${skippedText}`);
+        alert(`✅ Synced ${data.count} picktickets${sourceText}${skippedText}${skippedDetails ? `\nSkip reasons:${skippedDetails}` : ''}`);
         setLastSync(new Date());
         window.location.reload();
       } else {
@@ -66,7 +77,7 @@ export default function Home() {
         const syncedText = typeof data.count === 'number' ? `\nSynced: ${data.count}` : '';
         const skippedText = typeof data.skipped === 'number' ? `\nSkipped: ${data.skipped}` : '';
         const errorsText = typeof data.errors === 'number' ? `\nRow errors: ${data.errors}` : '';
-        alert(`❌ ${errorText}${sourceText}${syncedText}${skippedText}${errorsText}`);
+        alert(`❌ ${errorText}${sourceText}${syncedText}${skippedText}${errorsText}${skippedDetails ? `\nSkip reasons:${skippedDetails}` : ''}`);
       }
     } catch (error) {
       console.error('Sync error:', error);

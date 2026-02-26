@@ -36,6 +36,15 @@ interface AssignModalProps {
   onUpdated?: () => void;
 }
 
+interface PTLaneAssignmentRow {
+  id: number;
+  lane_number: string;
+  pallet_count: number;
+  order_position: number | null;
+  pt_id: number;
+  compiled_pallet_id?: number | null;
+}
+
 export default function AssignModal({ lane, onClose, onUpdated }: AssignModalProps) {
   const [view, setView] = useState<'existing' | 'add'>('existing');
   const [searchMode, setSearchMode] = useState<'container' | 'pt'>('pt');
@@ -215,6 +224,71 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
 
   function showConfirm(title: string, message: string, onConfirm: () => void) {
     setConfirmModal({ isOpen: true, title, message, onConfirm });
+  }
+
+  function compareLaneNumbers(a: string, b: string) {
+    const aNum = Number(a);
+    const bNum = Number(b);
+    if (!Number.isNaN(aNum) && !Number.isNaN(bNum)) return aNum - bNum;
+    return a.localeCompare(b);
+  }
+
+  async function syncPickticketWithAssignments(
+    ptId: number,
+    options?: { setUnlabeledIfEmpty?: boolean }
+  ) {
+    const { data: assignmentRows, error: assignmentRowsError } = await supabase
+      .from('lane_assignments')
+      .select('id, lane_number, pallet_count, order_position, pt_id, compiled_pallet_id')
+      .eq('pt_id', ptId)
+      .order('order_position', { ascending: true });
+    throwIfSupabaseError(assignmentRowsError, `Failed to load lane assignments for PT ${ptId}`);
+
+    const assignments = (assignmentRows || []) as PTLaneAssignmentRow[];
+    if (assignments.length === 0) {
+      const payload: { assigned_lane: null; actual_pallet_count: null; status?: string } = {
+        assigned_lane: null,
+        actual_pallet_count: null
+      };
+      if (options?.setUnlabeledIfEmpty) {
+        payload.status = 'unlabeled';
+      }
+
+      const { error: clearError } = await supabase
+        .from('picktickets')
+        .update(payload)
+        .eq('id', ptId);
+      throwIfSupabaseError(clearError, `Failed to clear assignment fields for PT ${ptId}`);
+
+      return {
+        hasAssignments: false,
+        totalPallets: 0,
+        laneNumbers: [] as string[],
+        primaryLane: null as string | null
+      };
+    }
+
+    const laneNumbers = Array.from(
+      new Set(assignments.map((row) => String(row.lane_number).trim()).filter(Boolean))
+    ).sort(compareLaneNumbers);
+    const totalPallets = assignments.reduce((sum, row) => sum + (row.pallet_count || 0), 0);
+    const primaryLane = laneNumbers[0] || null;
+
+    const { error: updateError } = await supabase
+      .from('picktickets')
+      .update({
+        assigned_lane: primaryLane,
+        actual_pallet_count: totalPallets
+      })
+      .eq('id', ptId);
+    throwIfSupabaseError(updateError, `Failed to sync assignment fields for PT ${ptId}`);
+
+    return {
+      hasAssignments: true,
+      totalPallets,
+      laneNumbers,
+      primaryLane
+    };
   }
 
   async function checkIfStagingLane() {
@@ -627,26 +701,19 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
       'Are you sure you want to remove this PT from the lane?',
       async () => {
         try {
-          // DELETE the shipment_pts record
-          await supabase
-            .from('shipment_pts')
-            .delete()
-            .eq('pt_id', ptId);
-
           await supabase
             .from('lane_assignments')
             .delete()
             .eq('id', assignmentId);
 
-          // RESET pallet count and status
-          await supabase
-            .from('picktickets')
-            .update({
-              assigned_lane: null,
-              actual_pallet_count: null,
-              status: 'unlabeled'
-            })
-            .eq('id', ptId);
+          const assignmentSummary = await syncPickticketWithAssignments(ptId, { setUnlabeledIfEmpty: true });
+
+          if (!assignmentSummary.hasAssignments) {
+            await supabase
+              .from('shipment_pts')
+              .delete()
+              .eq('pt_id', ptId);
+          }
 
           showToast('PT removed from lane', 'success');
           await fetchExistingPTs();
@@ -668,6 +735,7 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
 
     const count = parseInt(editingPT.count) || 1;
     let ptIdsToUpdate: number[] = [editingPT.ptId];
+    let updatedMainPalletCount = count;
 
     try {
       const { error: assignmentError } = await supabase
@@ -702,12 +770,8 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
 
         if (compiledPalletError) throw compiledPalletError;
       } else {
-        const { error: pickticketError } = await supabase
-          .from('picktickets')
-          .update({ actual_pallet_count: count })
-          .eq('id', editingPT.ptId);
-
-        if (pickticketError) throw pickticketError;
+        const summary = await syncPickticketWithAssignments(editingPT.ptId);
+        updatedMainPalletCount = summary.totalPallets || 0;
       }
 
       setSelectedPTDetails((prev) => {
@@ -728,7 +792,7 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
 
         return {
           ...prev,
-          actual_pallet_count: shouldUpdateMain ? count : prev.actual_pallet_count,
+          actual_pallet_count: shouldUpdateMain ? updatedMainPalletCount : prev.actual_pallet_count,
           compiled_with: updatedCompiled
         };
       });
@@ -777,13 +841,23 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
 
       const { data: targetAssignments, error: targetAssignmentsError } = await supabase
         .from('lane_assignments')
-        .select('id, order_position')
+        .select('id, order_position, pt_id, pallet_count, compiled_pallet_id')
         .eq('lane_number', String(targetLane.lane_number));
 
       if (targetAssignmentsError) throw targetAssignmentsError;
 
+      const typedTargetAssignments = (targetAssignments || []) as PTLaneAssignmentRow[];
+      const mergeTarget = ptToMove.compiled_pallet_id
+        ? null
+        : typedTargetAssignments.find((assignment) =>
+          !assignment.compiled_pallet_id && Number(assignment.pt_id) === Number(movingPT.ptId)
+        );
+
       // Move target lane PTs back so moved PT lands at the front.
-      for (const targetAssignment of targetAssignments || []) {
+      for (const targetAssignment of typedTargetAssignments) {
+        if (mergeTarget && targetAssignment.id === mergeTarget.id) {
+          continue;
+        }
         const { error: shiftTargetError } = await supabase
           .from('lane_assignments')
           .update({ order_position: (targetAssignment.order_position || 1) + 1 })
@@ -791,15 +865,32 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
         throwIfSupabaseError(shiftTargetError, 'Failed to shift target lane order');
       }
 
-      // Update lane assignment
-      const { error: updateAssignmentError } = await supabase
-        .from('lane_assignments')
-        .update({
-          lane_number: String(targetLane.lane_number),
-          order_position: 1
-        })
-        .eq('id', movingPT.assignmentId);
-      throwIfSupabaseError(updateAssignmentError, 'Failed to move lane assignment');
+      if (mergeTarget) {
+        const mergedPalletCount = (mergeTarget.pallet_count || 0) + (ptToMove.pallet_count || 0);
+        const { error: mergeUpdateError } = await supabase
+          .from('lane_assignments')
+          .update({
+            pallet_count: mergedPalletCount,
+            order_position: 1
+          })
+          .eq('id', mergeTarget.id);
+        throwIfSupabaseError(mergeUpdateError, 'Failed to merge PT lane assignments');
+
+        const { error: deleteMovedAssignmentError } = await supabase
+          .from('lane_assignments')
+          .delete()
+          .eq('id', movingPT.assignmentId);
+        throwIfSupabaseError(deleteMovedAssignmentError, 'Failed to delete merged lane assignment');
+      } else {
+        const { error: updateAssignmentError } = await supabase
+          .from('lane_assignments')
+          .update({
+            lane_number: String(targetLane.lane_number),
+            order_position: 1
+          })
+          .eq('id', movingPT.assignmentId);
+        throwIfSupabaseError(updateAssignmentError, 'Failed to move lane assignment');
+      }
 
       // If compiled, update ALL PTs in the group
       if (ptToMove.compiled_pallet_id) {
@@ -816,15 +907,14 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
           .in('id', ptIds);
         throwIfSupabaseError(compiledLaneUpdateError, 'Failed to move compiled PTs to target lane');
       } else {
-        // Single PT
-        const { error: singleLaneUpdateError } = await supabase
-          .from('picktickets')
-          .update({ assigned_lane: String(targetLane.lane_number) })
-          .eq('id', movingPT.ptId);
-        throwIfSupabaseError(singleLaneUpdateError, 'Failed to move PT to target lane');
+        await syncPickticketWithAssignments(movingPT.ptId);
       }
 
-      showToast(`PT moved to Lane ${targetLane.lane_number}`, 'success');
+      if (mergeTarget) {
+        showToast(`PT merged into Lane ${targetLane.lane_number}`, 'success');
+      } else {
+        showToast(`PT moved to Lane ${targetLane.lane_number}`, 'success');
+      }
       setMovingPT(null);
       setMoveLaneInput('');
       setMoveLaneError('');

@@ -21,4 +21,5 @@ export interface Pickticket {
   qty?: number | null;
   compiled_pallet_id?: number | null;
   compiled_with?: Pickticket[]; 
+  lane_locations?: string[];
 }

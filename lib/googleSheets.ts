@@ -44,6 +44,16 @@ const getGoogleAuth = () => {
 
 const auth = getGoogleAuth();
 const sheets = google.sheets({ version: 'v4', auth });
+const UPSERT_CHUNK_SIZE = 500;
+
+function chunkArray<T>(items: T[], chunkSize: number): T[][] {
+  if (chunkSize <= 0) return [items];
+  const chunks: T[][] = [];
+  for (let index = 0; index < items.length; index += chunkSize) {
+    chunks.push(items.slice(index, index + chunkSize));
+  }
+  return chunks;
+}
 
 function quoteSheetNameForRange(sheetName: string): string {
   return `'${sheetName.replace(/'/g, "''")}'`;
@@ -89,8 +99,35 @@ export async function syncGoogleSheetData() {
     const dataRows = rows.slice(1);
 
     let syncedCount = 0;
-    let skippedCount = 0;
     let errorCount = 0;
+    const skippedBreakdown = {
+      picked_up: 0,
+      paper: 0,
+      missing_pt_or_po: 0
+    };
+    const containerNumbers = new Set<string>();
+    const nowIso = new Date().toISOString();
+    type PickticketUpsertRow = {
+      customer?: string;
+      store_dc?: string;
+      pt_number: string;
+      po_number: string;
+      dept_number?: string;
+      qty: number | null;
+      ctn: string | null;
+      weight: number | null;
+      cubic_feet: number | null;
+      est_pallet: number | null;
+      start_date: string | null;
+      cancel_date: string | null;
+      container_number: string | null;
+      routing_number: string | null;
+      pu_number: string | null;
+      carrier: string | null;
+      pu_date: string | null;
+      last_synced_at: string;
+    };
+    const pickticketRows: PickticketUpsertRow[] = [];
 
     for (const row of dataRows) {
       const [
@@ -117,68 +154,92 @@ export async function syncGoogleSheetData() {
 
       // SKIP if already picked up
       if (pickup_status && pickup_status.toLowerCase().includes('picked up')) {
-        skippedCount++;
+        skippedBreakdown.picked_up += 1;
         continue;
       }
 
       // SKIP if customer is PAPER
       if (customer && customer.trim().toUpperCase() === 'PAPER') {
-        skippedCount++;
+        skippedBreakdown.paper += 1;
         continue;
       }
 
       if (!pt_number || !po_number) {
-        skippedCount++;
+        skippedBreakdown.missing_pt_or_po += 1;
         continue;
       }
 
       if (container_number) {
-        const { error: containerError } = await supabaseAdmin
-          .from('containers')
-          .upsert(
-            { container_number },
-            { onConflict: 'container_number' }
-          );
-        if (containerError) {
-          errorCount++;
-          console.error('Error upserting container:', container_number, containerError);
-        }
+        containerNumbers.add(container_number);
       }
 
-      const { error } = await supabaseAdmin
-        .from('picktickets')
-        .upsert(
-          {
-            customer,
-            store_dc,
-            pt_number,
-            po_number,
-            dept_number,
-            qty: qty ? parseInt(qty) : null,
-            ctn: ctn || null, // ADD THIS - Column G as text
-            weight: weight ? parseFloat(weight) : null,
-            cubic_feet: cubic_feet ? parseFloat(cubic_feet) : null,
-            est_pallet: est_pallet ? parseInt(est_pallet) : null,
-            start_date: parseDate(start_date),
-            cancel_date: parseDate(cancel_date),
-            container_number: container_number || null,
-            routing_number: routing_number || null,
-            pu_number: pu_number || null,
-            carrier: carrier?.trim() || null,
-            pu_date: parseDate(pu_date),
-            last_synced_at: new Date().toISOString(),
-          },
-          { onConflict: 'pt_number,po_number' }
-        );
+      pickticketRows.push({
+        customer,
+        store_dc,
+        pt_number,
+        po_number,
+        dept_number,
+        qty: qty ? parseInt(qty) : null,
+        ctn: ctn || null,
+        weight: weight ? parseFloat(weight) : null,
+        cubic_feet: cubic_feet ? parseFloat(cubic_feet) : null,
+        est_pallet: est_pallet ? parseInt(est_pallet) : null,
+        start_date: parseDate(start_date),
+        cancel_date: parseDate(cancel_date),
+        container_number: container_number || null,
+        routing_number: routing_number || null,
+        pu_number: pu_number || null,
+        carrier: carrier?.trim() || null,
+        pu_date: parseDate(pu_date),
+        last_synced_at: nowIso,
+      });
+    }
 
-      if (!error) {
-        syncedCount++;
-      } else {
-        errorCount++;
-        console.error('Error upserting PT:', pt_number, error);
+    const containerRows = Array.from(containerNumbers).map((value) => ({ container_number: value }));
+    for (const chunk of chunkArray(containerRows, UPSERT_CHUNK_SIZE)) {
+      const { error: containerBatchError } = await supabaseAdmin
+        .from('containers')
+        .upsert(chunk, { onConflict: 'container_number' });
+
+      if (!containerBatchError) continue;
+      console.error('Container batch upsert failed, falling back to per-row upsert:', containerBatchError);
+
+      for (const item of chunk) {
+        const { error: containerRowError } = await supabaseAdmin
+          .from('containers')
+          .upsert(item, { onConflict: 'container_number' });
+        if (containerRowError) {
+          errorCount += 1;
+          console.error('Error upserting container:', item.container_number, containerRowError);
+        }
       }
     }
 
+    for (const chunk of chunkArray(pickticketRows, UPSERT_CHUNK_SIZE)) {
+      const { error: ptBatchError } = await supabaseAdmin
+        .from('picktickets')
+        .upsert(chunk, { onConflict: 'pt_number,po_number' });
+
+      if (!ptBatchError) {
+        syncedCount += chunk.length;
+        continue;
+      }
+
+      console.error('Pickticket batch upsert failed, falling back to per-row upsert:', ptBatchError);
+      for (const item of chunk) {
+        const { error: ptRowError } = await supabaseAdmin
+          .from('picktickets')
+          .upsert(item, { onConflict: 'pt_number,po_number' });
+        if (ptRowError) {
+          errorCount += 1;
+          console.error('Error upserting PT:', item.pt_number, ptRowError);
+        } else {
+          syncedCount += 1;
+        }
+      }
+    }
+
+    const skippedCount = skippedBreakdown.picked_up + skippedBreakdown.paper + skippedBreakdown.missing_pt_or_po;
     const success = errorCount === 0;
     const message = success
       ? `Synced ${syncedCount} picktickets from "${sourceSheetName}"`
@@ -190,6 +251,7 @@ export async function syncGoogleSheetData() {
       message,
       count: syncedCount,
       skipped: skippedCount,
+      skipped_breakdown: skippedBreakdown,
       errors: errorCount,
       sourceSheet: sourceSheetName
     };
