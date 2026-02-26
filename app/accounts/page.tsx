@@ -26,6 +26,7 @@ interface EditableAccountState {
 export default function AccountsPage() {
   const { loading, isAdmin, session, signOut } = useAuth();
   const [accounts, setAccounts] = useState<AccountRow[]>([]);
+  const [accountSearch, setAccountSearch] = useState('');
   const [loadingAccounts, setLoadingAccounts] = useState(false);
   const [savingId, setSavingId] = useState<string | null>(null);
   const [errorText, setErrorText] = useState('');
@@ -285,6 +286,15 @@ export default function AccountsPage() {
     }
   }
 
+  const normalizedSearch = accountSearch.trim().toLowerCase();
+  const visibleAccounts = normalizedSearch
+    ? accounts.filter((account) => {
+      const username = account.username.toLowerCase();
+      const displayName = (account.display_name || '').toLowerCase();
+      return username.includes(normalizedSearch) || displayName.includes(normalizedSearch);
+    })
+    : accounts;
+
   if (loading) {
     return (
       <div className="min-h-screen bg-gray-900 text-white flex items-center justify-center">
@@ -371,16 +381,27 @@ export default function AccountsPage() {
         )}
 
         <div className="bg-gray-800 border border-gray-700 rounded-xl overflow-hidden">
-          <div className="px-4 py-3 border-b border-gray-700 font-semibold">
-            Accounts ({accounts.length})
+          <div className="px-4 py-3 border-b border-gray-700 space-y-3">
+            <div className="font-semibold">
+              Accounts ({visibleAccounts.length}{visibleAccounts.length !== accounts.length ? ` / ${accounts.length}` : ''})
+            </div>
+            <input
+              type="text"
+              value={accountSearch}
+              onChange={(e) => setAccountSearch(e.target.value)}
+              placeholder="Search username or display name"
+              className="w-full md:max-w-sm bg-gray-700 border border-gray-600 rounded px-3 py-2 text-sm"
+            />
           </div>
           {loadingAccounts ? (
             <div className="p-4 text-gray-300">Loading accounts...</div>
-          ) : accounts.length === 0 ? (
-            <div className="p-4 text-gray-400">No accounts found.</div>
+          ) : visibleAccounts.length === 0 ? (
+            <div className="p-4 text-gray-400">
+              {accounts.length === 0 ? 'No accounts found.' : 'No matching accounts.'}
+            </div>
           ) : (
             <div className="divide-y divide-gray-700">
-              {accounts.map((account) => {
+              {visibleAccounts.map((account) => {
                 const edits = editsById[account.id];
                 if (!edits) return null;
 
