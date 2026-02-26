@@ -1,10 +1,16 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { requireStaff } from '@/lib/serverAuth';
 
 type OCRToggleAuthRequest = {
   password?: string;
 };
 
 export async function POST(request: NextRequest) {
+  const authResult = await requireStaff(request);
+  if (!authResult.ok) {
+    return authResult.response;
+  }
+
   const expectedPassword = (process.env.OCR_TOGGLE_PASSWORD || '').trim();
   if (!expectedPassword) {
     return NextResponse.json(

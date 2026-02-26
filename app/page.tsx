@@ -8,9 +8,11 @@ import Link from 'next/link';
 import PTDetails from '@/components/PTDetails';
 import { Suspense } from 'react';
 import { Pickticket } from '@/types/pickticket';
+import { useAuth } from '@/components/AuthProvider';
 export const dynamic = 'force-dynamic';
 
 export default function Home() {
+  const { session, isGuest } = useAuth();
   const [showSearch, setShowSearch] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [lastSync, setLastSync] = useState<Date | null>(null);
@@ -44,7 +46,12 @@ export default function Home() {
 
     setSyncing(true);
     try {
-      const response = await fetch('/api/sync', { method: 'POST' });
+      const response = await fetch('/api/sync', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${session?.access_token || ''}`
+        }
+      });
       const data = await response.json();
 
       if (data.success) {
@@ -68,6 +75,9 @@ export default function Home() {
         <div className="max-w-7xl mx-auto">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <h1 className="text-xl md:text-3xl font-bold">Lane Management System</h1>
+            {isGuest && (
+              <div className="text-xs md:text-sm text-yellow-300">Guest mode: read-only</div>
+            )}
             <div className="flex flex-wrap gap-2">
               <button
                 onClick={() => setShowSearch(true)}
@@ -95,10 +105,10 @@ export default function Home() {
               </Link>
               <button
                 onClick={handleSync}
-                disabled={syncing}
+                disabled={syncing || isGuest}
                 className="flex-1 sm:flex-none bg-green-600 hover:bg-green-700 disabled:bg-gray-600 px-3 md:px-6 py-2 md:py-3 rounded-lg font-semibold text-sm md:text-base"
               >
-                {syncing ? '⏳ Syncing...' : '🔄 Sync'}
+                {syncing ? '⏳ Syncing...' : isGuest ? '🔒 Sync (Guest)' : '🔄 Sync'}
               </button>
             </div>
           </div>
@@ -112,7 +122,7 @@ export default function Home() {
 
       <div className="p-2 md:p-6">
         <Suspense>
-          <LaneGrid />
+          <LaneGrid readOnly={isGuest} />
         </Suspense>
       </div>
 

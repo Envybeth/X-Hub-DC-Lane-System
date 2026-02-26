@@ -23,6 +23,10 @@ interface Lane {
 
 type ViewMode = 'regular' | 'storage';
 
+interface LaneGridProps {
+  readOnly?: boolean;
+}
+
 function describeSupabaseError(error: { code?: string; message?: string; details?: string; hint?: string } | null) {
   if (!error) return 'Unknown Supabase error';
   return [error.code, error.message, error.details, error.hint].filter(Boolean).join(' | ') || 'Unknown Supabase error';
@@ -42,7 +46,7 @@ function isUnlabeledStatus(status?: string | null) {
   return normalized === '' || normalized === 'unlabeled';
 }
 
-export default function LaneGrid() {
+export default function LaneGrid({ readOnly = false }: LaneGridProps) {
   const [lanes, setLanes] = useState<Lane[]>([]);
   const [selectedLane, setSelectedLane] = useState<Lane | null>(null);
   const [showAssignModal, setShowAssignModal] = useState(false);
@@ -266,12 +270,14 @@ export default function LaneGrid() {
         return;
       }
 
+      if (readOnly) return;
+
       setSelectedLane(targetLane);
       setShowAssignModal(true);
     }, 0);
 
     return () => window.clearTimeout(timer);
-  }, [searchParams, lanes]);
+  }, [searchParams, lanes, readOnly]);
 
   const storageContainerGroups = useMemo(() => {
     const byContainer = new Map<string, { assignments: StorageAssignment[]; customers: Set<string>; laneNumbers: Set<string> }>();
@@ -338,6 +344,10 @@ export default function LaneGrid() {
   function handleLaneClick(lane: Lane) {
     if (lane.hasStorage) {
       openStorageLaneDetails(lane);
+      return;
+    }
+
+    if (readOnly) {
       return;
     }
 
@@ -464,7 +474,7 @@ export default function LaneGrid() {
           </button>
         </div>
 
-        {viewMode === 'storage' && storageTableAvailable && (
+        {viewMode === 'storage' && storageTableAvailable && !readOnly && (
           <button
             onClick={() => setShowStorageAddModal(true)}
             className="bg-green-600 hover:bg-green-700 px-4 md:px-5 py-2 rounded-lg font-bold"
@@ -567,6 +577,7 @@ export default function LaneGrid() {
           mode={storageModalData.mode}
           title={storageModalData.title}
           assignments={storageModalData.assignments}
+          readOnly={readOnly}
           onClose={() => setStorageModalData(null)}
           onUpdated={handleStorageUpdated}
         />

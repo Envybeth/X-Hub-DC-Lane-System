@@ -11,6 +11,7 @@ interface StorageLaneModalProps {
   mode: 'lane' | 'group';
   title: string;
   assignments: StorageAssignment[];
+  readOnly?: boolean;
   onClose: () => void;
   onUpdated: () => void;
 }
@@ -240,7 +241,7 @@ function buildUrgencyOverview(rows: UrgencyOverviewRow[]): UrgencyOverviewItem[]
   return Array.from(overviewMap.values()).sort((a, b) => a.order - b.order || a.label.localeCompare(b.label));
 }
 
-export default function StorageLaneModal({ mode, title, assignments, onClose, onUpdated }: StorageLaneModalProps) {
+export default function StorageLaneModal({ mode, title, assignments, readOnly = false, onClose, onUpdated }: StorageLaneModalProps) {
   const [localAssignments, setLocalAssignments] = useState<StorageAssignment[]>(assignments);
   const [selectedLane, setSelectedLane] = useState<string | null>(null);
   const [expandedAssignmentIds, setExpandedAssignmentIds] = useState<Set<number>>(new Set());
@@ -510,7 +511,7 @@ export default function StorageLaneModal({ mode, title, assignments, onClose, on
           <button onClick={onClose} className="text-3xl hover:text-red-400">&times;</button>
         </div>
 
-        {mode === 'group' && localAssignments.length > 0 && (
+        {mode === 'group' && localAssignments.length > 0 && !readOnly && (
           <div className="mb-4 bg-gray-900 border border-gray-700 rounded-lg p-3">
             <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
               <div className="text-sm text-gray-300">
@@ -579,13 +580,15 @@ export default function StorageLaneModal({ mode, title, assignments, onClose, on
                       >
                         {isExpanded ? 'Hide PTs' : 'Show PTs'}
                       </button>
-                      <button
-                        onClick={() => requestLaneOrganize(assignment)}
-                        disabled={isActionDisabled(assignment.id)}
-                        className="bg-green-600 hover:bg-green-700 disabled:bg-gray-600 px-3 py-1.5 rounded font-semibold text-sm"
-                      >
-                        {markingAssignmentId === assignment.id ? 'Saving...' : 'Organized to Label'}
-                      </button>
+                      {!readOnly && (
+                        <button
+                          onClick={() => requestLaneOrganize(assignment)}
+                          disabled={isActionDisabled(assignment.id)}
+                          className="bg-green-600 hover:bg-green-700 disabled:bg-gray-600 px-3 py-1.5 rounded font-semibold text-sm"
+                        >
+                          {markingAssignmentId === assignment.id ? 'Saving...' : 'Organized to Label'}
+                        </button>
+                      )}
                     </div>
                   </div>
 

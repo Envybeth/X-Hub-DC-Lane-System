@@ -6,6 +6,7 @@ import { supabase } from '@/lib/supabase';
 import ShipmentCard, { Shipment } from '@/components/ShipmentCard';
 import { isPTArchived } from '@/lib/utils';
 import { exportShipmentSummaryPdf, ShipmentPdfLoad } from '@/lib/shipmentPdf';
+import { useAuth } from '@/components/AuthProvider';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const SHIPPED_TO_ARCHIVED_DAYS = 7;
@@ -45,6 +46,7 @@ function getDaysSince(timestamp?: string | null, fallbackDate?: string): number 
 }
 
 export default function ShipmentsPage() {
+  const { session, isGuest } = useAuth();
   const [shipments, setShipments] = useState<Shipment[]>([]);
   const [loading, setLoading] = useState(true);
   const [mostRecentSync, setMostRecentSync] = useState<Date | null>(null);
@@ -96,7 +98,8 @@ export default function ShipmentsPage() {
       const response = await fetch('/api/shipments/ocr-toggle-auth', {
         method: 'POST',
         headers: {
-          'Content-Type': 'application/json'
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${session?.access_token || ''}`
         },
         body: JSON.stringify({ password })
       });
@@ -528,6 +531,9 @@ export default function ShipmentsPage() {
           <div>
             <h1 className="text-3xl md:text-4xl font-bold">📦 Shipment Management</h1>
             <p className="text-gray-400 mt-2 text-sm md:text-base">Manage pickup staging and consolidation</p>
+            {isGuest && (
+              <div className="text-xs md:text-sm text-yellow-300 mt-1">Guest mode: read-only</div>
+            )}
             <div className="relative mt-3 md:mt-4 max-w-xl">
               <input
                 type="text"
@@ -556,16 +562,18 @@ export default function ShipmentsPage() {
           </div>
 
           <div className="flex flex-col md:flex-row gap-2 w-full md:w-auto">
-            <button
-              onClick={handleToggleOCRRequirement}
-              disabled={verifyingOCRTogglePassword}
-              className={`w-full md:w-auto text-center px-6 py-3 rounded-lg font-semibold transition-colors ${requireOCRForStaging
-                ? 'bg-indigo-600 hover:bg-indigo-700'
-                : 'bg-amber-600 hover:bg-amber-700'
-                }`}
-            >
-              {verifyingOCRTogglePassword ? 'Checking...' : `OCR: ${requireOCRForStaging ? 'ON' : 'OFF'}`}
-            </button>
+            {!isGuest && (
+              <button
+                onClick={handleToggleOCRRequirement}
+                disabled={verifyingOCRTogglePassword}
+                className={`w-full md:w-auto text-center px-6 py-3 rounded-lg font-semibold transition-colors ${requireOCRForStaging
+                  ? 'bg-indigo-600 hover:bg-indigo-700'
+                  : 'bg-amber-600 hover:bg-amber-700'
+                  }`}
+              >
+                {verifyingOCRTogglePassword ? 'Checking...' : `OCR: ${requireOCRForStaging ? 'ON' : 'OFF'}`}
+              </button>
+            )}
             {readyToShipCount > 0 && (
               <button
                 onClick={exportAllReadyToShipPDF}
@@ -613,6 +621,7 @@ export default function ShipmentsPage() {
               setExpandedShipmentKey(isExpanded ? `${shipment.pu_number}-${shipment.pu_date}` : null);
             }}
             requireOCRForStaging={requireOCRForStaging}
+            readOnly={isGuest}
           />
         ))}
       </div>
@@ -639,6 +648,7 @@ export default function ShipmentsPage() {
               setExpandedShipmentKey(isExpanded ? `${shipment.pu_number}-${shipment.pu_date}` : null);
             }}
             requireOCRForStaging={requireOCRForStaging}
+            readOnly={isGuest}
           />
         ))}
       </div>
@@ -665,6 +675,7 @@ export default function ShipmentsPage() {
               setExpandedShipmentKey(isExpanded ? `${shipment.pu_number}-${shipment.pu_date}` : null);
             }}
             requireOCRForStaging={requireOCRForStaging}
+            readOnly={isGuest}
           />
         ))}
       </div>
@@ -735,6 +746,7 @@ export default function ShipmentsPage() {
                 mostRecentSync={mostRecentSync}
                 isExpanded={true}
                 requireOCRForStaging={requireOCRForStaging}
+                readOnly={isGuest}
               />
             </div>
           </div>
