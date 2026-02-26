@@ -23,6 +23,19 @@ interface EditableAccountState {
   active: boolean;
 }
 
+interface AuditLogEntry {
+  id: number;
+  user_id: string | null;
+  action: 'INSERT' | 'UPDATE' | 'DELETE' | string;
+  target_table: string;
+  target_id: string | null;
+  details: Record<string, unknown> | null;
+  created_at: string;
+  actor_username: string | null;
+  actor_display_name: string | null;
+  actor_role: AppRole | null;
+}
+
 export default function AccountsPage() {
   const { loading, isAdmin, session, signOut } = useAuth();
   const [accounts, setAccounts] = useState<AccountRow[]>([]);
@@ -39,10 +52,16 @@ export default function AccountsPage() {
   });
   const [creating, setCreating] = useState(false);
   const [editsById, setEditsById] = useState<Record<string, EditableAccountState>>({});
+  const [historyRows, setHistoryRows] = useState<AuditLogEntry[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState('');
+  const [historyDate, setHistoryDate] = useState('');
+  const [historyUserIdFilter, setHistoryUserIdFilter] = useState<'all' | string>('all');
 
   useEffect(() => {
     if (!loading && isAdmin) {
       void fetchAccounts();
+      void fetchHistory();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loading, isAdmin]);
@@ -134,6 +153,46 @@ export default function AccountsPage() {
       setErrorText('Failed to load accounts.');
     } finally {
       setLoadingAccounts(false);
+    }
+  }
+
+  async function fetchHistory(nextUserId: 'all' | string = historyUserIdFilter, nextDate: string = historyDate) {
+    setHistoryLoading(true);
+    setHistoryError('');
+    try {
+      const params = new URLSearchParams();
+      if (nextUserId !== 'all') params.set('userId', nextUserId);
+      if (nextDate) params.set('date', nextDate);
+      params.set('limit', '400');
+
+      const { response, payload } = await requestAdminApi(`/api/admin/audit-logs?${params.toString()}`);
+      if (!response) return;
+      if (!response.ok) {
+        const message =
+          typeof payload === 'object' &&
+          payload !== null &&
+          'error' in payload &&
+          typeof (payload as { error: unknown }).error === 'string'
+            ? (payload as { error: string }).error
+            : 'Failed to load history.';
+        setHistoryError(message);
+        return;
+      }
+
+      const rows = (
+        typeof payload === 'object' &&
+        payload !== null &&
+        'logs' in payload
+          ? (payload as { logs: AuditLogEntry[] }).logs
+          : []
+      ) as AuditLogEntry[];
+
+      setHistoryRows(rows);
+    } catch (error) {
+      console.error('Failed to fetch history:', error);
+      setHistoryError('Failed to load history.');
+    } finally {
+      setHistoryLoading(false);
     }
   }
 
@@ -294,6 +353,22 @@ export default function AccountsPage() {
       return username.includes(normalizedSearch) || displayName.includes(normalizedSearch);
     })
     : accounts;
+  const selectedHistoryAccount = historyUserIdFilter === 'all'
+    ? null
+    : accounts.find((account) => account.id === historyUserIdFilter) || null;
+
+  function getActionLabel(action: string): string {
+    if (action === 'INSERT') return 'Created';
+    if (action === 'UPDATE') return 'Updated';
+    if (action === 'DELETE') return 'Deleted';
+    return action;
+  }
+
+  function formatHistoryTarget(row: AuditLogEntry): string {
+    return row.target_id
+      ? `${row.target_table} #${row.target_id}`
+      : row.target_table;
+  }
 
   if (loading) {
     return (
@@ -373,6 +448,92 @@ export default function AccountsPage() {
             </button>
           </div>
         </form>
+
+        <div className="bg-gray-800 border border-gray-700 rounded-xl p-4 md:p-5 space-y-3">
+          <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-2">
+            <h2 className="text-lg md:text-xl font-bold">User Activity History</h2>
+            <button
+              onClick={() => void fetchHistory()}
+              disabled={historyLoading}
+              className="bg-gray-700 hover:bg-gray-600 disabled:bg-gray-600 rounded px-3 py-1.5 text-sm font-semibold"
+            >
+              {historyLoading ? 'Refreshing...' : 'Refresh'}
+            </button>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+            <select
+              value={historyUserIdFilter}
+              onChange={(e) => {
+                const nextUser = e.target.value as 'all' | string;
+                setHistoryUserIdFilter(nextUser);
+                void fetchHistory(nextUser, historyDate);
+              }}
+              className="bg-gray-700 border border-gray-600 rounded px-3 py-2 text-sm"
+            >
+              <option value="all">All accounts</option>
+              {accounts.map((account) => (
+                <option key={account.id} value={account.id}>
+                  {account.username}
+                </option>
+              ))}
+            </select>
+
+            <input
+              type="date"
+              value={historyDate}
+              onChange={(e) => {
+                const nextDate = e.target.value;
+                setHistoryDate(nextDate);
+                void fetchHistory(historyUserIdFilter, nextDate);
+              }}
+              className="bg-gray-700 border border-gray-600 rounded px-3 py-2 text-sm"
+            />
+
+            <button
+              onClick={() => {
+                setHistoryDate('');
+                void fetchHistory(historyUserIdFilter, '');
+              }}
+              className="bg-gray-700 hover:bg-gray-600 rounded px-3 py-2 text-sm font-semibold"
+            >
+              Show All Days
+            </button>
+          </div>
+
+          <div className="text-xs text-gray-400">
+            Viewing: {selectedHistoryAccount ? selectedHistoryAccount.username : 'all accounts'}{historyDate ? ` on ${historyDate}` : ' across all days'}
+          </div>
+
+          {historyError && (
+            <div className="bg-red-900 border border-red-600 rounded-lg p-2 text-xs">
+              {historyError}
+            </div>
+          )}
+
+          <div className="max-h-72 overflow-y-auto rounded border border-gray-700 bg-gray-900/50">
+            {historyLoading ? (
+              <div className="p-3 text-sm text-gray-300">Loading history...</div>
+            ) : historyRows.length === 0 ? (
+              <div className="p-3 text-sm text-gray-400">No history entries found for this filter.</div>
+            ) : (
+              <div className="divide-y divide-gray-800">
+                {historyRows.map((row) => (
+                  <div key={row.id} className="p-3 text-xs md:text-sm">
+                    <div className="text-gray-300">
+                      <span className="font-semibold">{getActionLabel(row.action)}</span>{' '}
+                      <span className="text-gray-400">{formatHistoryTarget(row)}</span>
+                    </div>
+                    <div className="text-gray-500">
+                      {new Date(row.created_at).toLocaleString()} · {row.actor_display_name || row.actor_username || 'system'}
+                      {row.actor_role ? ` (${row.actor_role})` : ''}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
 
         {errorText && (
           <div className="bg-red-900 border border-red-600 rounded-lg p-3 text-sm">
@@ -457,6 +618,15 @@ export default function AccountsPage() {
                       </label>
                     </div>
                     <div className="flex flex-wrap gap-2">
+                      <button
+                        onClick={() => {
+                          setHistoryUserIdFilter(account.id);
+                          void fetchHistory(account.id, historyDate);
+                        }}
+                        className="bg-gray-600 hover:bg-gray-500 px-3 py-1.5 rounded font-semibold text-sm"
+                      >
+                        History
+                      </button>
                       <button
                         onClick={() => void handleSaveAccount(account.id)}
                         disabled={savingId === account.id}
