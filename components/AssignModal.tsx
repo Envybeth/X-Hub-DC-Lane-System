@@ -41,7 +41,7 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
   const [searchMode, setSearchMode] = useState<'container' | 'pt'>('pt');
   const [existingPTs, setExistingPTs] = useState<LaneAssignment[]>([]);
   const [selectedPTDetails, setSelectedPTDetails] = useState<Pickticket | null>(null);
-  const [editingPT, setEditingPT] = useState<{ id: number; count: string; assignmentId: number } | null>(null);
+  const [editingPT, setEditingPT] = useState<{ id: number; ptId: number; count: string; assignmentId: number; compiledPalletId?: number | null } | null>(null);
   const [movingPT, setMovingPT] = useState<{ id: number; assignmentId: number; ptId: number; ptNumber: string } | null>(null);
   const [moveLaneInput, setMoveLaneInput] = useState('');
   const [moveLaneError, setMoveLaneError] = useState('');
@@ -289,7 +289,10 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
             pallet_count: assignment.pallet_count,
             order_position: assignment.order_position || 1,
             compiled_pallet_id: assignment.compiled_pallet_id,
-            pickticket
+            pickticket: {
+              ...pickticket,
+              actual_pallet_count: assignment.pallet_count
+            }
           } as LaneAssignment;
         })
         .filter((assignment): assignment is LaneAssignment => Boolean(assignment));
@@ -633,17 +636,71 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
     if (!editingPT) return;
 
     const count = parseInt(editingPT.count) || 1;
+    let ptIdsToUpdate: number[] = [editingPT.ptId];
 
     try {
-      await supabase
+      const { error: assignmentError } = await supabase
         .from('lane_assignments')
         .update({ pallet_count: count })
         .eq('id', editingPT.assignmentId);
 
-      await supabase
-        .from('picktickets')
-        .update({ actual_pallet_count: count })
-        .eq('id', editingPT.id);
+      if (assignmentError) throw assignmentError;
+
+      if (editingPT.compiledPalletId) {
+        const { data: compiledLinks, error: compiledLinksError } = await supabase
+          .from('compiled_pallet_pts')
+          .select('pt_id')
+          .eq('compiled_pallet_id', editingPT.compiledPalletId);
+
+        if (compiledLinksError) throw compiledLinksError;
+
+        ptIdsToUpdate = (compiledLinks || []).map((link) => link.pt_id);
+        if (ptIdsToUpdate.length > 0) {
+          const { error: pickticketError } = await supabase
+            .from('picktickets')
+            .update({ actual_pallet_count: count })
+            .in('id', ptIdsToUpdate);
+
+          if (pickticketError) throw pickticketError;
+        }
+
+        const { error: compiledPalletError } = await supabase
+          .from('compiled_pallets')
+          .update({ compiled_pallet_count: count })
+          .eq('id', editingPT.compiledPalletId);
+
+        if (compiledPalletError) throw compiledPalletError;
+      } else {
+        const { error: pickticketError } = await supabase
+          .from('picktickets')
+          .update({ actual_pallet_count: count })
+          .eq('id', editingPT.ptId);
+
+        if (pickticketError) throw pickticketError;
+      }
+
+      setSelectedPTDetails((prev) => {
+        if (!prev) return prev;
+        const shouldUpdateMain = ptIdsToUpdate.includes(prev.id);
+        let compiledChanged = false;
+        const updatedCompiled = (prev.compiled_with || []).map((compiledPT) => {
+          if (ptIdsToUpdate.includes(compiledPT.id)) {
+            compiledChanged = true;
+            return { ...compiledPT, actual_pallet_count: count };
+          }
+          return compiledPT;
+        });
+
+        if (!shouldUpdateMain && !compiledChanged) {
+          return prev;
+        }
+
+        return {
+          ...prev,
+          actual_pallet_count: shouldUpdateMain ? count : prev.actual_pallet_count,
+          compiled_with: updatedCompiled
+        };
+      });
 
       showToast('Pallet count updated', 'success');
       setEditingPT(null);
@@ -902,8 +959,8 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
     })
     .filter(Boolean);
 
-  function toggleEditForAssignment(assignmentId: number, currentCount: number) {
-    if (editingPT && editingPT.id === assignmentId) {
+  function toggleEditForAssignment(assignment: LaneAssignment) {
+    if (editingPT && editingPT.id === assignment.id) {
       setEditingPT(null);
       return;
     }
@@ -911,7 +968,13 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
     setMovingPT(null);
     setMoveLaneInput('');
     setMoveLaneError('');
-    setEditingPT({ id: assignmentId, count: currentCount.toString(), assignmentId });
+    setEditingPT({
+      id: assignment.id,
+      ptId: assignment.pickticket.id,
+      count: assignment.pallet_count.toString(),
+      assignmentId: assignment.id,
+      compiledPalletId: assignment.compiled_pallet_id || null
+    });
   }
 
   function toggleMoveForAssignment(assignment: LaneAssignment) {
@@ -1129,7 +1192,7 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
                         {/* Action buttons - ONE SET for entire compiled group */}
                         <div className="grid grid-cols-2 md:flex gap-1 md:gap-2">
                           <button
-                            onClick={() => toggleEditForAssignment(assignment.id, assignment.pallet_count)}
+                            onClick={() => toggleEditForAssignment(assignment)}
                             className={`px-2 md:px-4 py-1.5 md:py-2 rounded-lg font-semibold text-xs md:text-base whitespace-nowrap ${editingPT && editingPT.id === assignment.id
                               ? 'bg-orange-800 border-2 border-gray-300'
                               : 'bg-orange-600 hover:bg-orange-700'

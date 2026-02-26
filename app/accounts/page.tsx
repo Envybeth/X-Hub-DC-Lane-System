@@ -57,6 +57,7 @@ export default function AccountsPage() {
   const [historyError, setHistoryError] = useState('');
   const [historyDate, setHistoryDate] = useState('');
   const [historyUserIdFilter, setHistoryUserIdFilter] = useState<'all' | string>('all');
+  const [historyOpen, setHistoryOpen] = useState(true);
 
   useEffect(() => {
     if (!loading && isAdmin) {
@@ -365,9 +366,35 @@ export default function AccountsPage() {
   }
 
   function formatHistoryTarget(row: AuditLogEntry): string {
+    const details = row.details || {};
+    const laneNumber = typeof details.lane_number === 'string' ? details.lane_number : null;
+    const ptNumber = typeof details.pt_number === 'string' ? details.pt_number : null;
+    const ptId = typeof details.pt_id === 'string' ? details.pt_id : null;
+    const puNumber = typeof details.pu_number === 'string' ? details.pu_number : null;
+    const containerNumber = typeof details.container_number === 'string' ? details.container_number : null;
+    const status = typeof details.status === 'string' ? details.status : null;
+
+    const parts: string[] = [];
+
+    if (laneNumber) parts.push(`Lane ${laneNumber}`);
+    if (ptNumber) parts.push(`PT ${ptNumber}`);
+    if (!ptNumber && ptId) parts.push(`PT ID ${ptId}`);
+    if (puNumber) parts.push(`PU ${puNumber}`);
+    if (containerNumber) parts.push(`Container ${containerNumber}`);
+    if (status) parts.push(`Status: ${status}`);
+
+    if (parts.length > 0) {
+      return `${row.target_table} · ${parts.join(' · ')}`;
+    }
+
     return row.target_id
       ? `${row.target_table} #${row.target_id}`
       : row.target_table;
+  }
+
+  function formatRawDetails(details: Record<string, unknown> | null): string {
+    if (!details) return '';
+    return JSON.stringify(details, null, 2);
   }
 
   if (loading) {
@@ -451,88 +478,107 @@ export default function AccountsPage() {
 
         <div className="bg-gray-800 border border-gray-700 rounded-xl p-4 md:p-5 space-y-3">
           <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-2">
-            <h2 className="text-lg md:text-xl font-bold">User Activity History</h2>
             <button
-              onClick={() => void fetchHistory()}
-              disabled={historyLoading}
-              className="bg-gray-700 hover:bg-gray-600 disabled:bg-gray-600 rounded px-3 py-1.5 text-sm font-semibold"
+              onClick={() => setHistoryOpen((prev) => !prev)}
+              className="text-left text-lg md:text-xl font-bold hover:text-gray-300"
             >
-              {historyLoading ? 'Refreshing...' : 'Refresh'}
+              {historyOpen ? '▼' : '▶'} User Activity History
             </button>
-          </div>
-
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
-            <select
-              value={historyUserIdFilter}
-              onChange={(e) => {
-                const nextUser = e.target.value as 'all' | string;
-                setHistoryUserIdFilter(nextUser);
-                void fetchHistory(nextUser, historyDate);
-              }}
-              className="bg-gray-700 border border-gray-600 rounded px-3 py-2 text-sm"
-            >
-              <option value="all">All accounts</option>
-              {accounts.map((account) => (
-                <option key={account.id} value={account.id}>
-                  {account.username}
-                </option>
-              ))}
-            </select>
-
-            <input
-              type="date"
-              value={historyDate}
-              onChange={(e) => {
-                const nextDate = e.target.value;
-                setHistoryDate(nextDate);
-                void fetchHistory(historyUserIdFilter, nextDate);
-              }}
-              className="bg-gray-700 border border-gray-600 rounded px-3 py-2 text-sm"
-            />
-
-            <button
-              onClick={() => {
-                setHistoryDate('');
-                void fetchHistory(historyUserIdFilter, '');
-              }}
-              className="bg-gray-700 hover:bg-gray-600 rounded px-3 py-2 text-sm font-semibold"
-            >
-              Show All Days
-            </button>
-          </div>
-
-          <div className="text-xs text-gray-400">
-            Viewing: {selectedHistoryAccount ? selectedHistoryAccount.username : 'all accounts'}{historyDate ? ` on ${historyDate}` : ' across all days'}
-          </div>
-
-          {historyError && (
-            <div className="bg-red-900 border border-red-600 rounded-lg p-2 text-xs">
-              {historyError}
-            </div>
-          )}
-
-          <div className="max-h-72 overflow-y-auto rounded border border-gray-700 bg-gray-900/50">
-            {historyLoading ? (
-              <div className="p-3 text-sm text-gray-300">Loading history...</div>
-            ) : historyRows.length === 0 ? (
-              <div className="p-3 text-sm text-gray-400">No history entries found for this filter.</div>
-            ) : (
-              <div className="divide-y divide-gray-800">
-                {historyRows.map((row) => (
-                  <div key={row.id} className="p-3 text-xs md:text-sm">
-                    <div className="text-gray-300">
-                      <span className="font-semibold">{getActionLabel(row.action)}</span>{' '}
-                      <span className="text-gray-400">{formatHistoryTarget(row)}</span>
-                    </div>
-                    <div className="text-gray-500">
-                      {new Date(row.created_at).toLocaleString()} · {row.actor_display_name || row.actor_username || 'system'}
-                      {row.actor_role ? ` (${row.actor_role})` : ''}
-                    </div>
-                  </div>
-                ))}
-              </div>
+            {historyOpen && (
+              <button
+                onClick={() => void fetchHistory()}
+                disabled={historyLoading}
+                className="bg-gray-700 hover:bg-gray-600 disabled:bg-gray-600 rounded px-3 py-1.5 text-sm font-semibold"
+              >
+                {historyLoading ? 'Refreshing...' : 'Refresh'}
+              </button>
             )}
           </div>
+
+          {historyOpen && (
+            <>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                <select
+                  value={historyUserIdFilter}
+                  onChange={(e) => {
+                    const nextUser = e.target.value as 'all' | string;
+                    setHistoryUserIdFilter(nextUser);
+                    void fetchHistory(nextUser, historyDate);
+                  }}
+                  className="bg-gray-700 border border-gray-600 rounded px-3 py-2 text-sm"
+                >
+                  <option value="all">All accounts</option>
+                  {accounts.map((account) => (
+                    <option key={account.id} value={account.id}>
+                      {account.username}
+                    </option>
+                  ))}
+                </select>
+
+                <input
+                  type="date"
+                  value={historyDate}
+                  onChange={(e) => {
+                    const nextDate = e.target.value;
+                    setHistoryDate(nextDate);
+                    void fetchHistory(historyUserIdFilter, nextDate);
+                  }}
+                  className="bg-gray-700 border border-gray-600 rounded px-3 py-2 text-sm"
+                />
+
+                <button
+                  onClick={() => {
+                    setHistoryDate('');
+                    void fetchHistory(historyUserIdFilter, '');
+                  }}
+                  className="bg-gray-700 hover:bg-gray-600 rounded px-3 py-2 text-sm font-semibold"
+                >
+                  Show All Days
+                </button>
+              </div>
+
+              <div className="text-xs text-gray-400">
+                Viewing: {selectedHistoryAccount ? selectedHistoryAccount.username : 'all accounts'}{historyDate ? ` on ${historyDate}` : ' across all days'}
+              </div>
+
+              {historyError && (
+                <div className="bg-red-900 border border-red-600 rounded-lg p-2 text-xs">
+                  {historyError}
+                </div>
+              )}
+
+              <div className="max-h-72 overflow-y-auto rounded border border-gray-700 bg-gray-900/50">
+                {historyLoading ? (
+                  <div className="p-3 text-sm text-gray-300">Loading history...</div>
+                ) : historyRows.length === 0 ? (
+                  <div className="p-3 text-sm text-gray-400">No history entries found for this filter.</div>
+                ) : (
+                  <div className="divide-y divide-gray-800">
+                    {historyRows.map((row) => (
+                      <div key={row.id} className="p-3 text-xs md:text-sm">
+                        <div className="text-gray-300">
+                          <span className="font-semibold">{getActionLabel(row.action)}</span>{' '}
+                          <span className="text-gray-400">{formatHistoryTarget(row)}</span>
+                        </div>
+                        <div className="text-gray-500">
+                          {new Date(row.created_at).toLocaleString()} · {row.actor_display_name || row.actor_username || 'system'}
+                          {row.actor_role ? ` (${row.actor_role})` : ''}
+                        </div>
+                        <details className="mt-2 rounded border border-gray-700 bg-gray-900/70">
+                          <summary className="cursor-pointer px-2 py-1 text-xs text-gray-400 hover:text-gray-200 select-none">
+                            Raw details
+                          </summary>
+                          <pre className="max-h-48 overflow-auto border-t border-gray-700 px-2 py-2 text-[11px] leading-relaxed text-gray-300 whitespace-pre-wrap break-all">
+                            {formatRawDetails(row.details) || 'No details'}
+                          </pre>
+                        </details>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </>
+          )}
         </div>
 
         {errorText && (
