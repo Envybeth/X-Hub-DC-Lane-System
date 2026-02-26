@@ -194,6 +194,25 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
     setToast({ message, type });
   }
 
+  function formatSupabaseError(error: { message?: string; details?: string; hint?: string; code?: string } | null) {
+    if (!error) return 'Unknown database error';
+    return [error.message, error.details, error.hint, error.code].filter(Boolean).join(' | ') || 'Unknown database error';
+  }
+
+  function throwIfSupabaseError(
+    error: { message?: string; details?: string; hint?: string; code?: string } | null,
+    context: string
+  ) {
+    if (!error) return;
+    throw new Error(`${context}: ${formatSupabaseError(error)}`);
+  }
+
+  function getErrorMessage(error: unknown): string {
+    if (error instanceof Error) return error.message;
+    if (typeof error === 'string') return error;
+    return 'Unexpected error';
+  }
+
   function showConfirm(title: string, message: string, onConfirm: () => void) {
     setConfirmModal({ isOpen: true, title, message, onConfirm });
   }
@@ -437,12 +456,17 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
     }
 
     if (view === 'add' && ptSearchQuery.trim() !== '') {
-      const { data: shipmentData } = await supabase
+      const { data: shipmentData, error: shipmentLookupError } = await supabase
         .from('shipments')
         .select('id, pu_number, staging_lane')
         .eq('staging_lane', lane.lane_number)
         .eq('archived', false)
         .maybeSingle();
+
+      if (shipmentLookupError) {
+        showToast(`Failed to validate lane: ${formatSupabaseError(shipmentLookupError)}`, 'error');
+        return;
+      }
 
       if (shipmentData) {
         showToast('Cannot add individual PTs to a staging lane. Use the Shipments page instead.', 'error');
@@ -454,12 +478,13 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
 
     try {
       // Check if this lane is a staging lane for any shipment
-      const { data: shipmentData } = await supabase
+      const { data: shipmentData, error: shipmentDataError } = await supabase
         .from('shipments')
         .select('id, pu_number, staging_lane, status')
         .eq('staging_lane', lane.lane_number)
         .eq('archived', false)
         .maybeSingle();
+      throwIfSupabaseError(shipmentDataError, 'Failed to check staging status');
 
       const isTargetLaneStaging = !!shipmentData;
 
@@ -473,10 +498,11 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
       // Make room at the front once, then insert all new assignments in deterministic order.
       if (totalNewAssignments > 0) {
         for (const pt of existingPTs) {
-          await supabase
+          const { error: shiftError } = await supabase
             .from('lane_assignments')
             .update({ order_position: pt.order_position + totalNewAssignments })
             .eq('id', pt.id);
+          throwIfSupabaseError(shiftError, 'Failed to shift existing lane order');
         }
       }
 
@@ -488,7 +514,7 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
         const palletCount = parseInt(selectedPTs[ptId] || '1') || 1;
         if (palletCount === 0) continue;
 
-        await supabase
+        const { error: insertAssignmentError } = await supabase
           .from('lane_assignments')
           .insert({
             lane_number: lane.lane_number,
@@ -496,13 +522,14 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
             pallet_count: palletCount,
             order_position: nextOrderPosition
           });
+        throwIfSupabaseError(insertAssignmentError, `Failed to assign PT ${ptId} to lane`);
         nextOrderPosition += 1;
 
         const ptStatus = isTargetLaneStaging
           ? (shipmentData.status === 'finalized' ? 'ready_to_ship' : 'staged')
           : 'labeled';
 
-        await supabase
+        const { error: updatePickticketError } = await supabase
           .from('picktickets')
           .update({
             assigned_lane: lane.lane_number,
@@ -510,9 +537,10 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
             status: ptStatus
           })
           .eq('id', ptId);
+        throwIfSupabaseError(updatePickticketError, `Failed to update PT ${ptId}`);
 
         if (isTargetLaneStaging) {
-          await supabase
+          const { error: upsertShipmentPtError } = await supabase
             .from('shipment_pts')
             .upsert({
               shipment_id: shipmentData.id,
@@ -522,6 +550,7 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
             }, {
               onConflict: 'shipment_id,pt_id'
             });
+          throwIfSupabaseError(upsertShipmentPtError, `Failed to upsert shipment PT ${ptId}`);
         }
       }
 
@@ -544,7 +573,7 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
         // If adding to staging lane, add compiled group to shipment
         if (isTargetLaneStaging && result.compiledId) {
           for (const ptId of group.ptIds) {
-            await supabase
+            const { error: upsertCompiledShipmentPtError } = await supabase
               .from('shipment_pts')
               .upsert({
                 shipment_id: shipmentData.id,
@@ -554,14 +583,16 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
               }, {
                 onConflict: 'shipment_id,pt_id'
               });
+            throwIfSupabaseError(upsertCompiledShipmentPtError, `Failed to upsert compiled shipment PT ${ptId}`);
           }
 
           // Update PT status for compiled group
           const compiledStatus = shipmentData.status === 'finalized' ? 'ready_to_ship' : 'staged';
-          await supabase
+          const { error: compiledStatusError } = await supabase
             .from('picktickets')
             .update({ status: compiledStatus })
             .in('id', group.ptIds);
+          throwIfSupabaseError(compiledStatusError, 'Failed to update compiled PT statuses');
         }
 
       }
@@ -584,7 +615,7 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
 
     } catch (error) {
       console.error('Error assigning PTs:', error);
-      showToast('Failed to assign PTs', 'error');
+      showToast(`Failed to assign PTs: ${getErrorMessage(error)}`, 'error');
     }
 
     setLoading(false);
@@ -753,20 +784,22 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
 
       // Move target lane PTs back so moved PT lands at the front.
       for (const targetAssignment of targetAssignments || []) {
-        await supabase
+        const { error: shiftTargetError } = await supabase
           .from('lane_assignments')
           .update({ order_position: (targetAssignment.order_position || 1) + 1 })
           .eq('id', targetAssignment.id);
+        throwIfSupabaseError(shiftTargetError, 'Failed to shift target lane order');
       }
 
       // Update lane assignment
-      await supabase
+      const { error: updateAssignmentError } = await supabase
         .from('lane_assignments')
         .update({
           lane_number: String(targetLane.lane_number),
           order_position: 1
         })
         .eq('id', movingPT.assignmentId);
+      throwIfSupabaseError(updateAssignmentError, 'Failed to move lane assignment');
 
       // If compiled, update ALL PTs in the group
       if (ptToMove.compiled_pallet_id) {
@@ -777,16 +810,18 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
 
         const ptIds = compiledLinks?.map(l => l.pt_id) || [];
 
-        await supabase
+        const { error: compiledLaneUpdateError } = await supabase
           .from('picktickets')
           .update({ assigned_lane: String(targetLane.lane_number) })
           .in('id', ptIds);
+        throwIfSupabaseError(compiledLaneUpdateError, 'Failed to move compiled PTs to target lane');
       } else {
         // Single PT
-        await supabase
+        const { error: singleLaneUpdateError } = await supabase
           .from('picktickets')
           .update({ assigned_lane: String(targetLane.lane_number) })
           .eq('id', movingPT.ptId);
+        throwIfSupabaseError(singleLaneUpdateError, 'Failed to move PT to target lane');
       }
 
       showToast(`PT moved to Lane ${targetLane.lane_number}`, 'success');
@@ -799,7 +834,7 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
 
     } catch (error) {
       console.error('Error moving PT:', error);
-      showToast('Failed to move PT', 'error');
+      showToast(`Failed to move PT: ${getErrorMessage(error)}`, 'error');
     }
   }
 
@@ -993,11 +1028,11 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
   return (
     <>
       <div
-        className="fixed inset-0 bg-black bg-opacity-75 flex items-start md:items-center justify-center z-50 p-2 pt-14 md:p-4 md:pt-4"
+        className="fixed inset-0 bg-black bg-opacity-75 flex items-start md:items-center justify-center z-50 p-2 pt-14 pb-[env(safe-area-inset-bottom)] md:p-4 md:pt-4"
         onClickCapture={(e) => maybeHideMobileControls(e.target)}
         onTouchStartCapture={(e) => maybeHideMobileControls(e.target)}
       >
-        <div className="bg-gray-800 rounded-lg p-3 md:p-6 max-w-7xl w-full max-h-[calc(100vh-4rem)] md:max-h-[90vh] overflow-y-auto">
+        <div className="bg-gray-800 rounded-lg p-3 md:p-6 max-w-7xl w-full max-h-[calc(100dvh-4rem)] md:max-h-[90vh] overflow-y-auto">
           {/* Header - mobile optimized */}
           <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 mb-4 md:mb-6">
             <div className="flex flex-wrap items-center gap-2">
@@ -1722,13 +1757,15 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
               )}
 
               {/* Assign button */}
-              <button
-                onClick={handleAssign}
-                disabled={loading || Object.keys(selectedPTs).length === 0}
-                className="w-full bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed py-3 md:py-4 rounded-lg font-bold text-base md:text-xl"
-              >
-                {loading ? 'Assigning...' : `Assign ${Object.keys(selectedPTs).length} PTs`}
-              </button>
+              <div className="sticky bottom-0 mt-3 pt-2 pb-[env(safe-area-inset-bottom)] bg-gradient-to-t from-gray-800 via-gray-800/95 to-transparent">
+                <button
+                  onClick={handleAssign}
+                  disabled={loading || Object.keys(selectedPTs).length === 0}
+                  className="w-full bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed py-3 md:py-4 rounded-lg font-bold text-base md:text-xl"
+                >
+                  {loading ? 'Assigning...' : `Assign ${Object.keys(selectedPTs).length} PTs`}
+                </button>
+              </div>
             </div>
           )}
 

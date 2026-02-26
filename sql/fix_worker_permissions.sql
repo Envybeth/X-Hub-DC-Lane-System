@@ -1,39 +1,18 @@
--- Run this once in Supabase SQL Editor.
--- It creates account profiles, role helpers, and enables RLS:
--- - authenticated users: read access
--- - admin users: full write access
+-- Run in Supabase SQL editor.
+-- Purpose: restore worker write permissions for operational tables.
+-- Safe to run multiple times.
 
-create extension if not exists citext;
+begin;
 
-create table if not exists public.user_profiles (
-  id uuid primary key references auth.users(id) on delete cascade,
-  username citext not null unique,
-  display_name text,
-  role text not null check (role in ('admin', 'worker', 'guest')) default 'guest',
-  active boolean not null default true,
-  created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
-);
+-- Ensure role constraint supports worker.
+alter table public.user_profiles
+  drop constraint if exists user_profiles_role_check;
 
-create unique index if not exists idx_user_profiles_username_unique
-  on public.user_profiles (lower(username::text));
+alter table public.user_profiles
+  add constraint user_profiles_role_check
+  check (role in ('admin', 'worker', 'guest'));
 
-create or replace function public.set_user_profiles_updated_at()
-returns trigger
-language plpgsql
-as $$
-begin
-  new.updated_at = now();
-  return new;
-end;
-$$;
-
-drop trigger if exists trg_set_user_profiles_updated_at on public.user_profiles;
-create trigger trg_set_user_profiles_updated_at
-before update on public.user_profiles
-for each row
-execute function public.set_user_profiles_updated_at();
-
+-- Ensure helper functions exist and include workers.
 create or replace function public.current_user_role()
 returns text
 language sql
@@ -67,6 +46,7 @@ as $$
   select coalesce(public.current_user_role() in ('admin', 'worker'), false);
 $$;
 
+-- Keep user profile visibility/admin-write policies correct.
 alter table public.user_profiles enable row level security;
 
 drop policy if exists user_profiles_select_self_or_admin on public.user_profiles;
@@ -84,6 +64,7 @@ to authenticated
 using (public.is_admin())
 with check (public.is_admin());
 
+-- Rebuild operational table policies so workers can write.
 do $$
 declare
   table_name text;
@@ -123,11 +104,8 @@ begin
   end loop;
 end $$;
 
--- Bootstrap your first admin account after creating a user in Authentication > Users:
--- insert into public.user_profiles (id, username, display_name, role, active)
--- values ('<auth_user_uuid>', 'your_username', 'Your Name', 'admin', true)
--- on conflict (id) do update set
---   username = excluded.username,
---   display_name = excluded.display_name,
---   role = excluded.role,
---   active = excluded.active;
+commit;
+
+-- Verify after running:
+-- select username, role, active from public.user_profiles order by username;
+-- select policyname, cmd, qual, with_check from pg_policies where schemaname = 'public' and tablename in ('lane_assignments','picktickets','shipment_pts') order by tablename, policyname;
