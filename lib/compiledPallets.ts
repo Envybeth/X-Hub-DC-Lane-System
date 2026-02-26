@@ -4,7 +4,8 @@ import { Pickticket } from '@/types/pickticket';
 export async function createCompiledPallet(
     ptIds: number[],
     compiledPalletCount: number,
-    laneNumber: string
+    laneNumber: string,
+    orderPosition: number = 1
 ): Promise<{ success: boolean; compiledId?: number; error?: string }> {
     try {
         // Create compiled pallet record
@@ -36,7 +37,7 @@ export async function createCompiledPallet(
                 lane_number: laneNumber,
                 pt_id: ptIds[0], // Use first PT as representative
                 pallet_count: compiledPalletCount,
-                order_position: 1,
+                order_position: orderPosition,
                 compiled_pallet_id: compiled.id
             });
 

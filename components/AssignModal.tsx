@@ -62,6 +62,7 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
 
   const [picktickets, setPicktickets] = useState<Pickticket[]>([]);
   const [selectedPTs, setSelectedPTs] = useState<{ [key: number]: string }>({});
+  const [selectionOrder, setSelectionOrder] = useState<number[]>([]);
   const [loading, setLoading] = useState(false);
   const [allLanes, setAllLanes] = useState<Lane[]>([]);
 
@@ -110,6 +111,7 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
     } else {
       setPicktickets([]);
       setSelectedPTs({});
+      setSelectionOrder([]);
     }
   }, [selectedContainer, searchMode]);
 
@@ -409,8 +411,10 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
       const newSelected = { ...prev };
       if (newSelected[ptId] !== undefined) {
         delete newSelected[ptId];
+        setSelectionOrder(prevOrder => prevOrder.filter(id => id !== ptId));
       } else {
         newSelected[ptId] = '1';
+        setSelectionOrder(prevOrder => [...prevOrder.filter(id => id !== ptId), ptId]);
       }
       return newSelected;
     });
@@ -456,15 +460,83 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
 
       const isTargetLaneStaging = !!shipmentData;
 
-      // STEP 1: Process preview compiled groups FIRST
-      for (const group of previewCompiledGroups) {
-        const result = await createCompiledPallet(group.ptIds, group.palletCount, lane.lane_number);
+      const compiledPTIds = new Set(previewCompiledGroups.flatMap((group) => group.ptIds));
+      const individualSelectionOrder = selectionOrder.filter(
+        (ptId) => selectedPTs[ptId] !== undefined && !compiledPTIds.has(ptId)
+      );
+
+      const totalNewAssignments = previewCompiledGroups.length + individualSelectionOrder.length;
+
+      // Make room at the front once, then insert all new assignments in deterministic order.
+      if (totalNewAssignments > 0) {
+        for (const pt of existingPTs) {
+          await supabase
+            .from('lane_assignments')
+            .update({ order_position: pt.order_position + totalNewAssignments })
+            .eq('id', pt.id);
+        }
+      }
+
+      let nextOrderPosition = 1;
+
+      // STEP 1: Process individual PTs first.
+      // Last selected should end up farthest out (front), so insert in reverse selection order.
+      for (const ptId of [...individualSelectionOrder].reverse()) {
+        const palletCount = parseInt(selectedPTs[ptId] || '1') || 1;
+        if (palletCount === 0) continue;
+
+        await supabase
+          .from('lane_assignments')
+          .insert({
+            lane_number: lane.lane_number,
+            pt_id: ptId,
+            pallet_count: palletCount,
+            order_position: nextOrderPosition
+          });
+        nextOrderPosition += 1;
+
+        const ptStatus = isTargetLaneStaging
+          ? (shipmentData.status === 'finalized' ? 'ready_to_ship' : 'staged')
+          : 'labeled';
+
+        await supabase
+          .from('picktickets')
+          .update({
+            assigned_lane: lane.lane_number,
+            actual_pallet_count: palletCount,
+            status: ptStatus
+          })
+          .eq('id', ptId);
+
+        if (isTargetLaneStaging) {
+          await supabase
+            .from('shipment_pts')
+            .upsert({
+              shipment_id: shipmentData.id,
+              pt_id: ptId,
+              original_lane: null,
+              removed_from_staging: false
+            }, {
+              onConflict: 'shipment_id,pt_id'
+            });
+        }
+      }
+
+      // STEP 2: Process preview compiled groups.
+      for (const group of [...previewCompiledGroups].reverse()) {
+        const result = await createCompiledPallet(
+          group.ptIds,
+          group.palletCount,
+          lane.lane_number,
+          nextOrderPosition
+        );
 
         if (!result.success) {
           showToast('Failed to create compiled pallet', 'error');
           setLoading(false);
           return;
         }
+        nextOrderPosition += 1;
 
         // If adding to staging lane, add compiled group to shipment
         if (isTargetLaneStaging && result.compiledId) {
@@ -489,69 +561,14 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
             .in('id', group.ptIds);
         }
 
-        // Remove these PTs from selectedPTs since they're now compiled
-        group.ptIds.forEach(id => {
-          delete selectedPTs[id];
-        });
       }
 
-      // STEP 2: Process remaining individual PTs
-      for (const [ptId, palletCountStr] of Object.entries(selectedPTs)) {
-        const palletCount = parseInt(palletCountStr) || 1;
-        if (palletCount === 0) continue;
-
-        // Shift all existing PTs back by 1
-        for (const pt of existingPTs) {
-          await supabase
-            .from('lane_assignments')
-            .update({ order_position: pt.order_position + 1 })
-            .eq('id', pt.id);
-        }
-
-        // Insert new PT at position 1 (front)
-        await supabase
-          .from('lane_assignments')
-          .insert({
-            lane_number: lane.lane_number,
-            pt_id: parseInt(ptId),
-            pallet_count: palletCount,
-            order_position: 1
-          });
-
-        // Determine status based on whether it's a staging lane
-        const ptStatus = isTargetLaneStaging
-          ? (shipmentData.status === 'finalized' ? 'ready_to_ship' : 'staged')
-          : 'labeled';
-
-        await supabase
-          .from('picktickets')
-          .update({
-            assigned_lane: lane.lane_number,
-            actual_pallet_count: palletCount,
-            status: ptStatus
-          })
-          .eq('id', parseInt(ptId));
-
-        // If adding to a staging lane, add to shipment_pts
-        if (isTargetLaneStaging) {
-          await supabase
-            .from('shipment_pts')
-            .upsert({
-              shipment_id: shipmentData.id,
-              pt_id: parseInt(ptId),
-              original_lane: null,
-              removed_from_staging: false
-            }, {
-              onConflict: 'shipment_id,pt_id'
-            });
-        }
-      }
-
-      const totalAssigned = previewCompiledGroups.length + Object.keys(selectedPTs).length;
+      const totalAssigned = previewCompiledGroups.length + individualSelectionOrder.length;
       showToast(`✅ Assigned ${totalAssigned} PT group(s)`, 'success');
 
       // Clear everything
       setSelectedPTs({});
+      setSelectionOrder([]);
       setPreviewCompiledGroups([]);
       setSelectedContainer('');
       setContainerSearch('');
@@ -670,21 +687,27 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
       const ptToMove = existingPTs.find(pt => pt.id === movingPT.assignmentId);
       if (!ptToMove) return;
 
-      const { data: targetAssignments } = await supabase
+      const { data: targetAssignments, error: targetAssignmentsError } = await supabase
         .from('lane_assignments')
-        .select('pallet_count, order_position')
+        .select('id, order_position')
         .eq('lane_number', String(targetLane.lane_number));
 
-      const newPosition = targetAssignments && targetAssignments.length > 0
-        ? Math.max(...targetAssignments.map(a => a.order_position)) + 1
-        : 1;
+      if (targetAssignmentsError) throw targetAssignmentsError;
+
+      // Move target lane PTs back so moved PT lands at the front.
+      for (const targetAssignment of targetAssignments || []) {
+        await supabase
+          .from('lane_assignments')
+          .update({ order_position: (targetAssignment.order_position || 1) + 1 })
+          .eq('id', targetAssignment.id);
+      }
 
       // Update lane assignment
       await supabase
         .from('lane_assignments')
         .update({
           lane_number: String(targetLane.lane_number),
-          order_position: newPosition
+          order_position: 1
         })
         .eq('id', movingPT.assignmentId);
 
@@ -863,17 +886,21 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
   const totalNewPallets = Object.values(selectedPTs).reduce((sum, countStr) => sum + (parseInt(countStr) || 1), 0);
   const availableCapacity = lane.max_capacity - currentPallets;
 
-  const selectedPTDetails_summary = Object.keys(selectedPTs).map(ptId => {
+  const selectedPTDetails_summary = [...selectionOrder]
+    .reverse()
+    .filter((ptId) => selectedPTs[ptId] !== undefined)
+    .map((ptId) => {
     // Try to find in current filtered results first
-    let pt = picktickets.find(p => p.id === parseInt(ptId));
+      let pt = picktickets.find(p => p.id === ptId);
 
-    // If not found, search in all unassigned PTs
-    if (!pt) {
-      pt = allUnassignedPTs.find(p => p.id === parseInt(ptId));
-    }
+      // If not found, search in all unassigned PTs
+      if (!pt) {
+        pt = allUnassignedPTs.find(p => p.id === ptId);
+      }
 
-    return pt ? { pt, pallets: parseInt(selectedPTs[parseInt(ptId)]) || 1 } : null;
-  }).filter(Boolean);
+      return pt ? { pt, pallets: parseInt(selectedPTs[ptId]) || 1 } : null;
+    })
+    .filter(Boolean);
 
   function toggleEditForAssignment(assignmentId: number, currentCount: number) {
     if (editingPT && editingPT.id === assignmentId) {
@@ -903,11 +930,11 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
   return (
     <>
       <div
-        className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50 p-2 md:p-4"
+        className="fixed inset-0 bg-black bg-opacity-75 flex items-start md:items-center justify-center z-50 p-2 pt-14 md:p-4 md:pt-4"
         onClickCapture={(e) => maybeHideMobileControls(e.target)}
         onTouchStartCapture={(e) => maybeHideMobileControls(e.target)}
       >
-        <div className="bg-gray-800 rounded-lg p-3 md:p-6 max-w-7xl w-full max-h-[90vh] overflow-y-auto">
+        <div className="bg-gray-800 rounded-lg p-3 md:p-6 max-w-7xl w-full max-h-[calc(100vh-4rem)] md:max-h-[90vh] overflow-y-auto">
           {/* Header - mobile optimized */}
           <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 mb-4 md:mb-6">
             <div className="flex flex-wrap items-center gap-2">
@@ -1253,6 +1280,7 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
                       setSearchMode('pt');
                       setPicktickets([]);
                       setSelectedPTs({});
+                      setSelectionOrder([]);
                       setSelectedContainer('');
                       setContainerSearch('');
                     }}
@@ -1269,6 +1297,7 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
                       setSearchMode('container');
                       setPicktickets([]);
                       setSelectedPTs({});
+                      setSelectionOrder([]);
                       setPtSearchQuery('');
                     }}
                     className="w-4 h-4 md:w-5 md:h-5"
