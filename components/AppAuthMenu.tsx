@@ -60,6 +60,14 @@ export default function AppAuthMenu() {
           <span className="text-[11px] text-gray-200 font-semibold max-w-[8.5rem] truncate">
             {username}
           </span>
+          {isAdmin && (
+            <Link
+              href="/accounts"
+              className="bg-blue-600 hover:bg-blue-700 px-2 py-1 rounded text-[11px] font-semibold"
+            >
+              Accounts
+            </Link>
+          )}
           <button
             onClick={() => void signOut()}
             className="bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded text-[11px] font-semibold"

@@ -4,6 +4,7 @@ import { FormEvent, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useAuth } from '@/components/AuthProvider';
 import { AppRole } from '@/lib/auth';
+import { supabase } from '@/lib/supabase';
 
 interface AccountRow {
   id: string;
@@ -23,7 +24,7 @@ interface EditableAccountState {
 }
 
 export default function AccountsPage() {
-  const { loading, isAdmin, session } = useAuth();
+  const { loading, isAdmin, session, signOut } = useAuth();
   const [accounts, setAccounts] = useState<AccountRow[]>([]);
   const [loadingAccounts, setLoadingAccounts] = useState(false);
   const [savingId, setSavingId] = useState<string | null>(null);
@@ -45,24 +46,76 @@ export default function AccountsPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loading, isAdmin]);
 
-  async function fetchAccounts() {
-    if (!session?.access_token) return;
+  async function getAccessToken(): Promise<string | null> {
+    const { data } = await supabase.auth.getSession();
+    return data.session?.access_token || session?.access_token || null;
+  }
 
+  async function requestAdminApi(url: string, init?: RequestInit) {
+    const token = await getAccessToken();
+    if (!token) {
+      setErrorText('Session expired. Please sign in again.');
+      await signOut();
+      return { response: null as Response | null, payload: null as unknown };
+    }
+
+    const response = await fetch(url, {
+      ...init,
+      headers: {
+        ...(init?.headers || {}),
+        Authorization: `Bearer ${token}`
+      }
+    });
+
+    let payload: unknown = null;
+    try {
+      payload = await response.json();
+    } catch {
+      payload = null;
+    }
+
+    const errorTextFromPayload =
+      typeof payload === 'object' &&
+      payload !== null &&
+      'error' in payload &&
+      typeof (payload as { error: unknown }).error === 'string'
+        ? (payload as { error: string }).error
+        : '';
+
+    if (response.status === 401 && errorTextFromPayload.toLowerCase().includes('invalid session')) {
+      setErrorText('Session expired. Please sign in again.');
+      await signOut();
+      return { response: null as Response | null, payload };
+    }
+
+    return { response, payload };
+  }
+
+  async function fetchAccounts() {
     setLoadingAccounts(true);
     setErrorText('');
     try {
-      const response = await fetch('/api/admin/users', {
-        headers: {
-          Authorization: `Bearer ${session.access_token}`
-        }
-      });
-      const payload = await response.json();
+      const { response, payload } = await requestAdminApi('/api/admin/users');
+      if (!response) return;
       if (!response.ok) {
-        setErrorText(payload.error || 'Failed to load accounts.');
+        const message =
+          typeof payload === 'object' &&
+          payload !== null &&
+          'error' in payload &&
+          typeof (payload as { error: unknown }).error === 'string'
+            ? (payload as { error: string }).error
+            : 'Failed to load accounts.';
+        setErrorText(message);
         return;
       }
 
-      const nextAccounts = payload.users as AccountRow[];
+      const nextAccounts = (
+        typeof payload === 'object' &&
+        payload !== null &&
+        'users' in payload
+          ? (payload as { users: AccountRow[] }).users
+          : []
+      ) as AccountRow[];
       setAccounts(nextAccounts);
 
       const nextEdits: Record<string, EditableAccountState> = {};
@@ -85,22 +138,27 @@ export default function AccountsPage() {
 
   async function handleCreateAccount(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!session?.access_token) return;
 
     setErrorText('');
     setCreating(true);
     try {
-      const response = await fetch('/api/admin/users', {
+      const { response, payload } = await requestAdminApi('/api/admin/users', {
         method: 'POST',
         headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${session.access_token}`
+          'Content-Type': 'application/json'
         },
         body: JSON.stringify(createForm)
       });
-      const payload = await response.json();
+      if (!response) return;
       if (!response.ok) {
-        setErrorText(payload.error || 'Failed to create account.');
+        const message =
+          typeof payload === 'object' &&
+          payload !== null &&
+          'error' in payload &&
+          typeof (payload as { error: unknown }).error === 'string'
+            ? (payload as { error: string }).error
+            : 'Failed to create account.';
+        setErrorText(message);
         return;
       }
 
@@ -121,18 +179,16 @@ export default function AccountsPage() {
   }
 
   async function handleSaveAccount(accountId: string) {
-    if (!session?.access_token) return;
     const edits = editsById[accountId];
     if (!edits) return;
 
     setSavingId(accountId);
     setErrorText('');
     try {
-      const response = await fetch(`/api/admin/users/${accountId}`, {
+      const { response, payload } = await requestAdminApi(`/api/admin/users/${accountId}`, {
         method: 'PATCH',
         headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${session.access_token}`
+          'Content-Type': 'application/json'
         },
         body: JSON.stringify({
           username: edits.username,
@@ -141,9 +197,16 @@ export default function AccountsPage() {
           active: edits.active
         })
       });
-      const payload = await response.json();
+      if (!response) return;
       if (!response.ok) {
-        setErrorText(payload.error || 'Failed to save account.');
+        const message =
+          typeof payload === 'object' &&
+          payload !== null &&
+          'error' in payload &&
+          typeof (payload as { error: unknown }).error === 'string'
+            ? (payload as { error: string }).error
+            : 'Failed to save account.';
+        setErrorText(message);
         return;
       }
 
@@ -157,25 +220,29 @@ export default function AccountsPage() {
   }
 
   async function handleResetPassword(accountId: string) {
-    if (!session?.access_token) return;
-
     const nextPassword = window.prompt('Enter new password (min 8 chars):');
     if (nextPassword === null) return;
 
     setSavingId(accountId);
     setErrorText('');
     try {
-      const response = await fetch(`/api/admin/users/${accountId}`, {
+      const { response, payload } = await requestAdminApi(`/api/admin/users/${accountId}`, {
         method: 'PATCH',
         headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${session.access_token}`
+          'Content-Type': 'application/json'
         },
         body: JSON.stringify({ password: nextPassword })
       });
-      const payload = await response.json();
+      if (!response) return;
       if (!response.ok) {
-        setErrorText(payload.error || 'Failed to reset password.');
+        const message =
+          typeof payload === 'object' &&
+          payload !== null &&
+          'error' in payload &&
+          typeof (payload as { error: unknown }).error === 'string'
+            ? (payload as { error: string }).error
+            : 'Failed to reset password.';
+        setErrorText(message);
         return;
       }
     } catch (error) {
@@ -187,22 +254,25 @@ export default function AccountsPage() {
   }
 
   async function handleDeleteAccount(accountId: string, username: string) {
-    if (!session?.access_token) return;
     const confirmed = window.confirm(`Delete account "${username}"? This cannot be undone.`);
     if (!confirmed) return;
 
     setSavingId(accountId);
     setErrorText('');
     try {
-      const response = await fetch(`/api/admin/users/${accountId}`, {
-        method: 'DELETE',
-        headers: {
-          Authorization: `Bearer ${session.access_token}`
-        }
+      const { response, payload } = await requestAdminApi(`/api/admin/users/${accountId}`, {
+        method: 'DELETE'
       });
-      const payload = await response.json();
+      if (!response) return;
       if (!response.ok) {
-        setErrorText(payload.error || 'Failed to delete account.');
+        const message =
+          typeof payload === 'object' &&
+          payload !== null &&
+          'error' in payload &&
+          typeof (payload as { error: unknown }).error === 'string'
+            ? (payload as { error: string }).error
+            : 'Failed to delete account.';
+        setErrorText(message);
         return;
       }
 
