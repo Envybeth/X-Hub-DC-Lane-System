@@ -23,17 +23,18 @@ function isRole(value: unknown): value is AppRole {
   return value === 'admin' || value === 'worker' || value === 'guest';
 }
 
-interface RouteParams {
-  params: { userId: string };
+interface RouteContext {
+  params: Promise<{ userId: string }>;
 }
 
-export async function PATCH(request: NextRequest, { params }: RouteParams) {
+export async function PATCH(request: NextRequest, context: RouteContext) {
   const authResult = await requireAdmin(request);
   if (!authResult.ok) {
     return authResult.response;
   }
   const supabaseAdmin = getSupabaseAdmin();
 
+  const params = await context.params;
   const { userId } = params;
   if (!userId) {
     return NextResponse.json({ error: 'Missing user id.' }, { status: 400 });
@@ -144,13 +145,14 @@ export async function PATCH(request: NextRequest, { params }: RouteParams) {
   return NextResponse.json({ success: true });
 }
 
-export async function DELETE(request: NextRequest, { params }: RouteParams) {
+export async function DELETE(request: NextRequest, context: RouteContext) {
   const authResult = await requireAdmin(request);
   if (!authResult.ok) {
     return authResult.response;
   }
   const supabaseAdmin = getSupabaseAdmin();
 
+  const params = await context.params;
   const { userId } = params;
   if (!userId) {
     return NextResponse.json({ error: 'Missing user id.' }, { status: 400 });
