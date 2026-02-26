@@ -57,7 +57,7 @@ export default function AccountsPage() {
   const [historyError, setHistoryError] = useState('');
   const [historyDate, setHistoryDate] = useState('');
   const [historyUserIdFilter, setHistoryUserIdFilter] = useState<'all' | string>('all');
-  const [historyOpen, setHistoryOpen] = useState(true);
+  const [historyOpen, setHistoryOpen] = useState(false);
 
   useEffect(() => {
     if (!loading && isAdmin) {

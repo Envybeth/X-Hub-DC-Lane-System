@@ -1,5 +1,6 @@
+import 'server-only';
 import { google } from 'googleapis';
-import { supabase } from './supabase';
+import { getSupabaseAdmin } from './supabaseAdmin';
 
 function parseDate(dateStr: string | undefined): string | null {
   if (!dateStr || dateStr.trim() === '') return null;
@@ -44,38 +45,52 @@ const getGoogleAuth = () => {
 const auth = getGoogleAuth();
 const sheets = google.sheets({ version: 'v4', auth });
 
+function quoteSheetNameForRange(sheetName: string): string {
+  return `'${sheetName.replace(/'/g, "''")}'`;
+}
+
+async function resolveSourceSheetName(spreadsheetId: string): Promise<string> {
+  const metadata = await sheets.spreadsheets.get({
+    spreadsheetId,
+  });
+
+  const firstSheetName = metadata.data.sheets?.[0]?.properties?.title;
+  if (!firstSheetName) {
+    throw new Error('No sheets found in the spreadsheet');
+  }
+
+  return firstSheetName;
+}
+
 export async function syncGoogleSheetData() {
   try {
     const spreadsheetId = process.env.GOOGLE_SHEET_ID;
-
-    const sheetMetadata = await sheets.spreadsheets.get({
-      spreadsheetId,
-    });
-
-    const firstSheetName = sheetMetadata.data.sheets?.[0]?.properties?.title;
-
-    if (!firstSheetName) {
-      throw new Error('No sheets found in the spreadsheet');
+    if (!spreadsheetId) {
+      throw new Error('GOOGLE_SHEET_ID is not configured');
     }
+    const supabaseAdmin = getSupabaseAdmin();
+    const sourceSheetName = await resolveSourceSheetName(spreadsheetId);
 
-    console.log(`📊 Syncing from sheet: ${firstSheetName}`);
+    console.log(`📊 Syncing from sheet: ${sourceSheetName}`);
 
     // Fetch columns A through S (19 columns)
     const response = await sheets.spreadsheets.values.get({
       spreadsheetId,
-      range: `${firstSheetName}!A:S`,
+      range: `${quoteSheetNameForRange(sourceSheetName)}!A:S`,
     });
 
     const rows = response.data.values;
 
     if (!rows || rows.length === 0) {
       console.log('No data found.');
-      return { success: false, message: 'No data found' };
+      return { success: false, message: 'No data found', sourceSheet: sourceSheetName, count: 0, skipped: 0, errors: 0 };
     }
 
     const dataRows = rows.slice(1);
 
     let syncedCount = 0;
+    let skippedCount = 0;
+    let errorCount = 0;
 
     for (const row of dataRows) {
       const [
@@ -102,26 +117,35 @@ export async function syncGoogleSheetData() {
 
       // SKIP if already picked up
       if (pickup_status && pickup_status.toLowerCase().includes('picked up')) {
+        skippedCount++;
         continue;
       }
 
       // SKIP if customer is PAPER
       if (customer && customer.trim().toUpperCase() === 'PAPER') {
+        skippedCount++;
         continue;
       }
 
-      if (!pt_number || !po_number) continue;
+      if (!pt_number || !po_number) {
+        skippedCount++;
+        continue;
+      }
 
       if (container_number) {
-        await supabase
+        const { error: containerError } = await supabaseAdmin
           .from('containers')
           .upsert(
             { container_number },
             { onConflict: 'container_number' }
           );
+        if (containerError) {
+          errorCount++;
+          console.error('Error upserting container:', container_number, containerError);
+        }
       }
 
-      const { error } = await supabase
+      const { error } = await supabaseAdmin
         .from('picktickets')
         .upsert(
           {
@@ -150,12 +174,25 @@ export async function syncGoogleSheetData() {
       if (!error) {
         syncedCount++;
       } else {
+        errorCount++;
         console.error('Error upserting PT:', pt_number, error);
       }
     }
 
-    console.log(`✅ Synced ${syncedCount} picktickets from Google Sheets`);
-    return { success: true, count: syncedCount };
+    const success = errorCount === 0;
+    const message = success
+      ? `Synced ${syncedCount} picktickets from "${sourceSheetName}"`
+      : `Sync completed with errors from "${sourceSheetName}"`;
+
+    console.log(`✅ ${message}. skipped=${skippedCount} errors=${errorCount}`);
+    return {
+      success,
+      message,
+      count: syncedCount,
+      skipped: skippedCount,
+      errors: errorCount,
+      sourceSheet: sourceSheetName
+    };
 
   } catch (error) {
     console.error('Error syncing Google Sheets:', error);

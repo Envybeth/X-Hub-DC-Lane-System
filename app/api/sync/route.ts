@@ -1,9 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { syncGoogleSheetData } from '@/lib/googleSheets';
-import { requireStaff } from '@/lib/serverAuth';
+import { requireAdmin } from '@/lib/serverAuth';
 
 export async function POST(request: NextRequest) {
-  const authResult = await requireStaff(request);
+  const authResult = await requireAdmin(request);
   if (!authResult.ok) {
     return authResult.response;
   }
@@ -21,7 +21,7 @@ export async function POST(request: NextRequest) {
 }
 
 export async function GET(request: NextRequest) {
-  const authResult = await requireStaff(request);
+  const authResult = await requireAdmin(request);
   if (!authResult.ok) {
     return authResult.response;
   }

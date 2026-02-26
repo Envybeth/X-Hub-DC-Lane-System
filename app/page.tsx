@@ -55,11 +55,18 @@ export default function Home() {
       const data = await response.json();
 
       if (data.success) {
-        alert(`✅ Synced ${data.count} picktickets`);
+        const sourceText = data.sourceSheet ? ` from "${data.sourceSheet}"` : '';
+        const skippedText = typeof data.skipped === 'number' ? `\nSkipped: ${data.skipped}` : '';
+        alert(`✅ Synced ${data.count} picktickets${sourceText}${skippedText}`);
         setLastSync(new Date());
         window.location.reload();
       } else {
-        alert('❌ Sync failed');
+        const errorText = data.error || data.details || data.message || 'Sync failed';
+        const sourceText = data.sourceSheet ? `\nSource sheet: ${data.sourceSheet}` : '';
+        const syncedText = typeof data.count === 'number' ? `\nSynced: ${data.count}` : '';
+        const skippedText = typeof data.skipped === 'number' ? `\nSkipped: ${data.skipped}` : '';
+        const errorsText = typeof data.errors === 'number' ? `\nRow errors: ${data.errors}` : '';
+        alert(`❌ ${errorText}${sourceText}${syncedText}${skippedText}${errorsText}`);
       }
     } catch (error) {
       console.error('Sync error:', error);
