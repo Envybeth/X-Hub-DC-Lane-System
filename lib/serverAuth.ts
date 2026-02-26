@@ -3,6 +3,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
 import { UserProfile } from '@/types/auth';
 import { AppRole } from './auth';
+import { getSupabaseAdmin } from './supabaseAdmin';
 
 interface AdminAuthSuccess {
   ok: true;
@@ -48,7 +49,10 @@ async function requireAnyRole(request: NextRequest, allowedRoles: AppRole[]): Pr
     };
   }
 
-  const { data: profile, error: profileError } = await supabase
+  // Use service-role for profile lookup after token validation.
+  // The previous anon client query could run as anonymous and miss rows behind RLS.
+  const supabaseAdmin = getSupabaseAdmin();
+  const { data: profile, error: profileError } = await supabaseAdmin
     .from('user_profiles')
     .select('id, username, display_name, role, active, created_at, updated_at')
     .eq('id', userResult.user.id)
@@ -57,7 +61,10 @@ async function requireAnyRole(request: NextRequest, allowedRoles: AppRole[]): Pr
   if (profileError || !profile) {
     return {
       ok: false,
-      response: NextResponse.json({ error: 'User profile not found.' }, { status: 403 })
+      response: NextResponse.json(
+        { error: `User profile not found for user id: ${userResult.user.id}` },
+        { status: 403 }
+      )
     };
   }
 
