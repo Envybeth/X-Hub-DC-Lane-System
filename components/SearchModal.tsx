@@ -704,8 +704,11 @@ export default function SearchModal({ onClose, mostRecentSync }: SearchModalProp
 
             <div className="space-y-3">
               {quickAssignRows.map((row, index) => (
-                <div key={index} className="grid grid-cols-[1fr_1fr_auto] gap-2 items-center">
-                  <div className="flex flex-col gap-1">
+                <div
+                  key={index}
+                  className="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] gap-2 items-end"
+                >
+                  <div className="flex flex-col gap-1 min-w-0">
                     <label htmlFor={`quick-assign-lane-${index}`} className="text-xs text-gray-300 font-semibold">
                       Lane
                     </label>
@@ -718,7 +721,7 @@ export default function SearchModal({ onClose, mostRecentSync }: SearchModalProp
                       className="bg-gray-700 border border-gray-600 rounded px-3 py-2"
                     />
                   </div>
-                  <div className="flex flex-col gap-1">
+                  <div className="flex flex-col gap-1 min-w-0">
                     <label htmlFor={`quick-assign-pallet-${index}`} className="text-xs text-gray-300 font-semibold">
                       Pallet Qty
                     </label>
@@ -739,7 +742,7 @@ export default function SearchModal({ onClose, mostRecentSync }: SearchModalProp
                     <button
                       onClick={() => removeQuickAssignRow(index)}
                       disabled={quickAssignRows.length <= 1}
-                      className="bg-red-600 hover:bg-red-700 disabled:bg-gray-600 disabled:cursor-not-allowed px-3 py-2 rounded font-bold"
+                      className="w-full sm:w-auto bg-red-600 hover:bg-red-700 disabled:bg-gray-600 disabled:cursor-not-allowed px-3 py-2 rounded font-bold"
                       type="button"
                       aria-label="Remove lane row"
                     >
