@@ -20,6 +20,43 @@ type StaleSnapshotRow = {
   snapshot: Shipment;
 };
 
+type PickticketShipmentRow = {
+  id: number;
+  pt_number: string;
+  po_number: string;
+  customer: string;
+  assigned_lane: string | null;
+  actual_pallet_count: number | null;
+  container_number: string;
+  store_dc: string;
+  cancel_date: string;
+  start_date: string;
+  pu_number: string;
+  pu_date: string;
+  status: string;
+  ctn: string | null;
+  carrier: string | null;
+  last_synced_at: string | null;
+};
+
+type ShipmentRecordRow = {
+  id: number;
+  pu_number: string;
+  pu_date: string;
+  staging_lane: string | null;
+  status: string;
+  carrier: string | null;
+  archived: boolean;
+  updated_at: string | null;
+  created_at: string | null;
+};
+
+type ShipmentPtRecordRow = {
+  shipment_id: number;
+  pt_id: number;
+  removed_from_staging: boolean;
+};
+
 function shipmentKey(shipment: Shipment) {
   return `${shipment.pu_number}-${shipment.pu_date}`;
 }
@@ -59,12 +96,15 @@ export default function ShipmentsPage() {
   const [verifyingOCRTogglePassword, setVerifyingOCRTogglePassword] = useState(false);
   const [ocrToggleToast, setOcrToggleToast] = useState('');
   const shipmentRefreshTimerRef = useRef<number | null>(null);
+  const shipmentFetchInFlightRef = useRef(false);
+  const shipmentFetchQueuedRef = useRef(false);
+  const staleRefreshRequestedRef = useRef(false);
+  const fetchShipmentsRef = useRef<() => Promise<void>>(async () => { });
+  const fetchStaleSnapshotsRef = useRef<() => Promise<void>>(async () => { });
 
   useEffect(() => {
-    fetchMostRecentSync();
-    fetchShipments();
-
-    fetchStaleSnapshotsFromSupabase();
+    void fetchShipmentsRef.current();
+    void fetchStaleSnapshotsRef.current();
   }, []);
 
   useEffect(() => {
@@ -124,27 +164,30 @@ export default function ShipmentsPage() {
     }
   }
 
-  const scheduleShipmentRefresh = useCallback(() => {
+  const scheduleShipmentRefresh = useCallback((includeStale = false) => {
+    if (includeStale) {
+      staleRefreshRequestedRef.current = true;
+    }
     if (shipmentRefreshTimerRef.current) {
       window.clearTimeout(shipmentRefreshTimerRef.current);
     }
     shipmentRefreshTimerRef.current = window.setTimeout(() => {
-      void fetchMostRecentSync();
-      void fetchShipments();
-      if (staleSnapshotStoreAvailable) {
-        void fetchStaleSnapshotsFromSupabase();
+      void fetchShipmentsRef.current();
+      if (staleSnapshotStoreAvailable && staleRefreshRequestedRef.current) {
+        staleRefreshRequestedRef.current = false;
+        void fetchStaleSnapshotsRef.current();
       }
       shipmentRefreshTimerRef.current = null;
-    }, 120);
+    }, 450);
   }, [staleSnapshotStoreAvailable]);
 
   useEffect(() => {
     const channel = supabase
       .channel('shipments-page-realtime')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'shipments' }, scheduleShipmentRefresh)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'shipment_pts' }, scheduleShipmentRefresh)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'picktickets' }, scheduleShipmentRefresh)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'stale_shipment_snapshots' }, scheduleShipmentRefresh)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'shipments' }, () => scheduleShipmentRefresh(false))
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'shipment_pts' }, () => scheduleShipmentRefresh(false))
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'picktickets' }, () => scheduleShipmentRefresh(false))
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'stale_shipment_snapshots' }, () => scheduleShipmentRefresh(true))
       .subscribe();
 
     return () => {
@@ -155,19 +198,6 @@ export default function ShipmentsPage() {
       void supabase.removeChannel(channel);
     };
   }, [scheduleShipmentRefresh]);
-
-  async function fetchMostRecentSync() {
-    const { data } = await supabase
-      .from('picktickets')
-      .select('last_synced_at')
-      .order('last_synced_at', { ascending: false })
-      .limit(1)
-      .single();
-
-    if (data?.last_synced_at) {
-      setMostRecentSync(new Date(data.last_synced_at));
-    }
-  }
 
   async function fetchStaleSnapshotsFromSupabase() {
     const { data, error } = await supabase
@@ -192,150 +222,131 @@ export default function ShipmentsPage() {
   }
 
   async function fetchShipments() {
+    if (shipmentFetchInFlightRef.current) {
+      shipmentFetchQueuedRef.current = true;
+      return;
+    }
+    shipmentFetchInFlightRef.current = true;
     setLoading(true);
 
     try {
-      // Get all PTs with PU numbers from Excel sync
       const { data: pts, error } = await supabase
         .from('picktickets')
         .select('id, pt_number, po_number, customer, assigned_lane, actual_pallet_count, container_number, store_dc, cancel_date, start_date, pu_number, pu_date, status, ctn, carrier, last_synced_at')
         .not('pu_number', 'is', null)
         .not('pu_date', 'is', null)
-        .neq('status', 'shipped')
         .neq('customer', 'PAPER');
 
       if (error) throw error;
 
-      console.log('Found PTs with PU numbers:', pts?.length || 0);
-
+      const typedPTs = (pts || []) as PickticketShipmentRow[];
       const groupedShipments: { [key: string]: Shipment } = {};
 
-      // Group PTs by PU number + date
-      pts?.forEach(pt => {
-        const key = `${pt.pu_number}-${pt.pu_date}`;
-
-        if (!groupedShipments[key]) {
-          groupedShipments[key] = {
-            pu_number: pt.pu_number!,
-            pu_date: pt.pu_date!,
-            carrier: pt.carrier || '',
-            pts: [],
-            staging_lane: null,
-            status: 'not_started',
-            archived: false,
-            shipped_at: null
-          };
-        }
-
-        if (!groupedShipments[key].carrier && pt.carrier) {
-          groupedShipments[key].carrier = pt.carrier;
-        }
-
-        groupedShipments[key].pts.push({
-          id: pt.id,
-          pt_number: pt.pt_number,
-          po_number: pt.po_number,
-          customer: pt.customer,
-          assigned_lane: pt.assigned_lane,
-          actual_pallet_count: pt.actual_pallet_count || 0,
-          moved_to_staging: false,
-          container_number: pt.container_number,
-          store_dc: pt.store_dc,
-          cancel_date: pt.cancel_date,
-          start_date: pt.start_date,
-          removed_from_staging: false,
-          status: pt.status,
-          ctn: pt.ctn,
-          last_synced_at: pt.last_synced_at
-        });
-      });
-
-      // Also get shipped PTs
-      const { data: shippedPTs } = await supabase
-        .from('picktickets')
-        .select('id, pt_number, po_number, customer, assigned_lane, actual_pallet_count, container_number, store_dc, cancel_date, start_date, pu_number, pu_date, status, ctn, carrier, last_synced_at')
-        .eq('status', 'shipped')
-        .not('pu_number', 'is', null)
-        .not('pu_date', 'is', null)
-        .neq('customer', 'PAPER');
-
-      // Group shipped PTs
-      shippedPTs?.forEach(pt => {
-        const key = `${pt.pu_number}-${pt.pu_date}`;
-
-        if (!groupedShipments[key]) {
-          groupedShipments[key] = {
-            pu_number: pt.pu_number!,
-            pu_date: pt.pu_date!,
-            carrier: pt.carrier || '',
-            pts: [],
-            staging_lane: null,
-            status: 'finalized',
-            archived: true,
-            shipped_at: null
-          };
-        }
-
-        if (!groupedShipments[key].carrier && pt.carrier) {
-          groupedShipments[key].carrier = pt.carrier;
-        }
-
-        groupedShipments[key].pts.push({
-          id: pt.id,
-          pt_number: pt.pt_number,
-          po_number: pt.po_number,
-          customer: pt.customer,
-          assigned_lane: pt.assigned_lane,
-          actual_pallet_count: pt.actual_pallet_count || 0,
-          moved_to_staging: false,
-          container_number: pt.container_number,
-          store_dc: pt.store_dc,
-          cancel_date: pt.cancel_date,
-          start_date: pt.start_date,
-          removed_from_staging: false,
-          status: 'shipped',
-          ctn: pt.ctn,
-          last_synced_at: pt.last_synced_at
-        });
-
-        groupedShipments[key].archived = true;
-      });
-
-      // Check shipments table for staging info, status and shipped timestamps
-      for (const shipment of Object.values(groupedShipments)) {
-        const { data: stagingData } = await supabase
-          .from('shipments')
-          .select('staging_lane, status, carrier, id, archived, updated_at, created_at')
-          .eq('pu_number', shipment.pu_number)
-          .eq('pu_date', shipment.pu_date)
-          .maybeSingle();
-
-        if (stagingData) {
-          shipment.staging_lane = stagingData.staging_lane;
-          shipment.status = stagingData.status;
-          shipment.carrier = stagingData.carrier || shipment.carrier;
-          shipment.archived = stagingData.archived || false;
-          shipment.shipped_at = stagingData.updated_at || stagingData.created_at || null;
-
-          const { data: movedPTs } = await supabase
-            .from('shipment_pts')
-            .select('pt_id, removed_from_staging')
-            .eq('shipment_id', stagingData.id);
-
-          if (movedPTs) {
-            const movedPTRecords = movedPTs as Array<{ pt_id: number; removed_from_staging: boolean }>;
-            shipment.pts.forEach(pt => {
-              const movedRecord = movedPTRecords.find(m => m.pt_id === pt.id);
-              if (movedRecord) {
-                pt.moved_to_staging = !movedRecord.removed_from_staging;
-                pt.removed_from_staging = movedRecord.removed_from_staging;
-              }
-            });
-          }
-        }
+      const latestSync = typedPTs
+        .map((pt) => pt.last_synced_at)
+        .filter((value): value is string => Boolean(value))
+        .sort((a, b) => new Date(b).getTime() - new Date(a).getTime())[0];
+      if (latestSync) {
+        setMostRecentSync(new Date(latestSync));
       }
 
-      // SHIPPED always wins: if any PT in a PU is shipped, force whole PU to shipped
+      typedPTs.forEach(pt => {
+        const key = `${pt.pu_number}-${pt.pu_date}`;
+        const isShipped = pt.status === 'shipped';
+
+        if (!groupedShipments[key]) {
+          groupedShipments[key] = {
+            pu_number: pt.pu_number!,
+            pu_date: pt.pu_date!,
+            carrier: pt.carrier || '',
+            pts: [],
+            staging_lane: null,
+            status: isShipped ? 'finalized' : 'not_started',
+            archived: isShipped,
+            shipped_at: null
+          };
+        }
+
+        if (!groupedShipments[key].carrier && pt.carrier) {
+          groupedShipments[key].carrier = pt.carrier;
+        }
+
+        groupedShipments[key].pts.push({
+          id: pt.id,
+          pt_number: pt.pt_number,
+          po_number: pt.po_number,
+          customer: pt.customer,
+          assigned_lane: pt.assigned_lane,
+          actual_pallet_count: pt.actual_pallet_count || 0,
+          moved_to_staging: false,
+          container_number: pt.container_number,
+          store_dc: pt.store_dc,
+          cancel_date: pt.cancel_date,
+          start_date: pt.start_date,
+          removed_from_staging: false,
+          status: isShipped ? 'shipped' : pt.status,
+          ctn: pt.ctn || undefined,
+          last_synced_at: pt.last_synced_at || undefined
+        });
+        if (isShipped) {
+          groupedShipments[key].archived = true;
+        }
+      });
+
+      const { data: shipmentRows, error: shipmentRowsError } = await supabase
+        .from('shipments')
+        .select('id, pu_number, pu_date, staging_lane, status, carrier, archived, updated_at, created_at')
+        .eq('archived', false);
+      if (shipmentRowsError) throw shipmentRowsError;
+
+      const matchedShipmentRows: ShipmentRecordRow[] = [];
+      ((shipmentRows || []) as ShipmentRecordRow[]).forEach((shipmentRow) => {
+        const key = `${shipmentRow.pu_number}-${shipmentRow.pu_date}`;
+        const shipment = groupedShipments[key];
+        if (!shipment) return;
+
+        shipment.staging_lane = shipmentRow.staging_lane;
+        if (shipmentRow.status === 'not_started' || shipmentRow.status === 'in_process' || shipmentRow.status === 'finalized') {
+          shipment.status = shipmentRow.status;
+        }
+        shipment.carrier = shipmentRow.carrier || shipment.carrier;
+        shipment.archived = shipmentRow.archived || false;
+        shipment.shipped_at = shipmentRow.updated_at || shipmentRow.created_at || null;
+        matchedShipmentRows.push(shipmentRow);
+      });
+
+      if (matchedShipmentRows.length > 0) {
+        const shipmentIds = matchedShipmentRows.map((shipmentRow) => shipmentRow.id);
+        const { data: shipmentPtRows, error: shipmentPtRowsError } = await supabase
+          .from('shipment_pts')
+          .select('shipment_id, pt_id, removed_from_staging')
+          .in('shipment_id', shipmentIds);
+        if (shipmentPtRowsError) throw shipmentPtRowsError;
+
+        const movedByShipmentId = new Map<number, Map<number, boolean>>();
+        ((shipmentPtRows || []) as ShipmentPtRecordRow[]).forEach((row) => {
+          const byPt = movedByShipmentId.get(row.shipment_id) || new Map<number, boolean>();
+          byPt.set(row.pt_id, row.removed_from_staging);
+          movedByShipmentId.set(row.shipment_id, byPt);
+        });
+
+        matchedShipmentRows.forEach((shipmentRow) => {
+          const key = `${shipmentRow.pu_number}-${shipmentRow.pu_date}`;
+          const shipment = groupedShipments[key];
+          if (!shipment) return;
+
+          const movedByPt = movedByShipmentId.get(shipmentRow.id);
+          if (!movedByPt) return;
+
+          shipment.pts.forEach((pt) => {
+            const removed = movedByPt.get(pt.id);
+            if (removed === undefined) return;
+            pt.moved_to_staging = !removed;
+            pt.removed_from_staging = removed;
+          });
+        });
+      }
+
       Object.values(groupedShipments).forEach((shipment) => {
         const hasShippedPT = shipment.pts.some(pt => pt.status === 'shipped');
         if (!hasShippedPT) return;
@@ -362,15 +373,22 @@ export default function ShipmentsPage() {
         return dateB.getTime() - dateA.getTime();
       });
 
-      console.log('Total shipments:', sortedShipments.length);
       setShipments(sortedShipments);
 
     } catch (error) {
       console.error('Error fetching shipments:', error);
     } finally {
       setLoading(false);
+      shipmentFetchInFlightRef.current = false;
+      if (shipmentFetchQueuedRef.current) {
+        shipmentFetchQueuedRef.current = false;
+        void fetchShipments();
+      }
     }
   }
+
+  fetchShipmentsRef.current = fetchShipments;
+  fetchStaleSnapshotsRef.current = fetchStaleSnapshotsFromSupabase;
 
   const isInActiveSection = useCallback((shipment: Shipment) => {
     if (shipment.archived) return false;

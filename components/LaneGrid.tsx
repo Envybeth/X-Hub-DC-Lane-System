@@ -27,6 +27,22 @@ interface LaneGridProps {
   readOnly?: boolean;
 }
 
+interface LaneAssignmentRow {
+  lane_number: string;
+  pallet_count: number | null;
+}
+
+interface ShipmentLaneRow {
+  staging_lane: string | null;
+  pu_number: string;
+  status: string;
+}
+
+interface LanePTStatusRow {
+  assigned_lane: string | null;
+  status: string | null;
+}
+
 function describeSupabaseError(error: { code?: string; message?: string; details?: string; hint?: string } | null) {
   if (!error) return 'Unknown Supabase error';
   return [error.code, error.message, error.details, error.hint].filter(Boolean).join(' | ') || 'Unknown Supabase error';
@@ -64,155 +80,212 @@ export default function LaneGrid({ readOnly = false }: LaneGridProps) {
   const searchParams = useSearchParams();
   const router = useRouter();
   const laneRefreshTimerRef = useRef<number | null>(null);
+  const laneFetchInFlightRef = useRef(false);
+  const laneFetchQueuedRef = useRef(false);
 
   const fetchLanes = useCallback(async () => {
-    const { data: laneRows } = await supabase
-      .from('lanes')
-      .select('*')
-      .order('id');
-
-    if (!laneRows) {
-      setLanes([]);
+    if (laneFetchInFlightRef.current) {
+      laneFetchQueuedRef.current = true;
       return;
     }
+    laneFetchInFlightRef.current = true;
 
-    let activeStorageAssignments: StorageAssignment[] = [];
-    const { data: storageRows, error: storageError } = await supabase
-      .from('container_storage_assignments')
-      .select('id, container_number, customer, lane_number, active, organized_to_label, organized_at, created_at, updated_at')
-      .eq('active', true)
-      .order('container_number', { ascending: true })
-      .order('customer', { ascending: true })
-      .order('lane_number', { ascending: true });
+    try {
+      const [{ data: laneRows }, { data: storageRows, error: storageError }] = await Promise.all([
+        supabase
+          .from('lanes')
+          .select('id, lane_number, max_capacity, lane_type')
+          .order('id'),
+        supabase
+          .from('container_storage_assignments')
+          .select('id, container_number, customer, lane_number, active, organized_to_label, organized_at, created_at, updated_at')
+          .eq('active', true)
+          .order('container_number', { ascending: true })
+          .order('customer', { ascending: true })
+          .order('lane_number', { ascending: true })
+      ]);
 
-    if (storageError) {
-      const isMissingTable = storageError.code === '42P01';
-      setStorageTableAvailable(false);
-      setStorageAssignments([]);
-      setStorageWarning(
-        isMissingTable
-          ? 'Storage table is missing. Run sql/container_storage_assignments.sql in Supabase SQL Editor.'
-          : `Storage table unavailable: ${describeSupabaseError(storageError)}`
-      );
-    } else {
-      activeStorageAssignments = (storageRows || []) as StorageAssignment[];
-      setStorageTableAvailable(true);
-      setStorageWarning('');
+      if (!laneRows) {
+        setLanes([]);
+        return;
+      }
 
-      if (activeStorageAssignments.length > 0) {
-        const containerNumbers = Array.from(new Set(activeStorageAssignments.map((row) => row.container_number)));
-        const { data: storagePTs, error: storagePTError } = await supabase
-          .from('picktickets')
-          .select('container_number, status')
-          .in('container_number', containerNumbers)
-          .neq('customer', 'PAPER');
+      let activeStorageAssignments: StorageAssignment[] = [];
+      if (storageError) {
+        const isMissingTable = storageError.code === '42P01';
+        setStorageTableAvailable(false);
+        setStorageAssignments([]);
+        setStorageWarning(
+          isMissingTable
+            ? 'Storage table is missing. Run sql/container_storage_assignments.sql in Supabase SQL Editor.'
+            : `Storage table unavailable: ${describeSupabaseError(storageError)}`
+        );
+      } else {
+        activeStorageAssignments = (storageRows || []) as StorageAssignment[];
+        setStorageTableAvailable(true);
+        setStorageWarning('');
 
-        if (storagePTError) {
-          console.error('Failed to evaluate storage auto-organize:', storagePTError);
-        } else if (storagePTs) {
-          const statusByContainer = new Map<string, { total: number; unlabeled: number }>();
+        if (activeStorageAssignments.length > 0) {
+          const containerNumbers = Array.from(new Set(activeStorageAssignments.map((row) => row.container_number)));
+          const { data: storagePTs, error: storagePTError } = await supabase
+            .from('picktickets')
+            .select('container_number, status')
+            .in('container_number', containerNumbers)
+            .neq('customer', 'PAPER');
 
-          storagePTs.forEach((pt) => {
-            const key = String(pt.container_number || '').trim();
-            if (!key) return;
+          if (storagePTError) {
+            console.error('Failed to evaluate storage auto-organize:', storagePTError);
+          } else if (storagePTs) {
+            const statusByContainer = new Map<string, { total: number; unlabeled: number }>();
 
-            const current = statusByContainer.get(key) || { total: 0, unlabeled: 0 };
-            current.total += 1;
-            if (isUnlabeledStatus(pt.status)) {
-              current.unlabeled += 1;
-            }
-            statusByContainer.set(key, current);
-          });
+            storagePTs.forEach((pt) => {
+              const key = String(pt.container_number || '').trim();
+              if (!key) return;
 
-          const completedContainers = new Set(
-            Array.from(statusByContainer.entries())
-              .filter(([, counts]) => counts.total > 0 && counts.unlabeled === 0)
-              .map(([containerNumber]) => containerNumber)
-          );
+              const current = statusByContainer.get(key) || { total: 0, unlabeled: 0 };
+              current.total += 1;
+              if (isUnlabeledStatus(pt.status)) {
+                current.unlabeled += 1;
+              }
+              statusByContainer.set(key, current);
+            });
 
-          const autoOrganizeIds = activeStorageAssignments
-            .filter((assignment) => completedContainers.has(assignment.container_number))
-            .map((assignment) => assignment.id);
+            const completedContainers = new Set(
+              Array.from(statusByContainer.entries())
+                .filter(([, counts]) => counts.total > 0 && counts.unlabeled === 0)
+                .map(([containerNumber]) => containerNumber)
+            );
 
-          if (autoOrganizeIds.length > 0) {
-            const { error: autoOrganizeError } = await supabase
-              .from('container_storage_assignments')
-              .update({
-                active: false,
-                organized_to_label: true,
-                organized_at: new Date().toISOString()
-              })
-              .in('id', autoOrganizeIds);
+            const autoOrganizeIds = activeStorageAssignments
+              .filter((assignment) => completedContainers.has(assignment.container_number))
+              .map((assignment) => assignment.id);
 
-            if (autoOrganizeError) {
-              console.error('Failed to auto-organize storage assignments:', autoOrganizeError);
-            } else {
-              const autoOrganizedIdSet = new Set(autoOrganizeIds);
-              activeStorageAssignments = activeStorageAssignments.filter((assignment) => !autoOrganizedIdSet.has(assignment.id));
+            if (autoOrganizeIds.length > 0) {
+              const { error: autoOrganizeError } = await supabase
+                .from('container_storage_assignments')
+                .update({
+                  active: false,
+                  organized_to_label: true,
+                  organized_at: new Date().toISOString()
+                })
+                .in('id', autoOrganizeIds);
+
+              if (autoOrganizeError) {
+                console.error('Failed to auto-organize storage assignments:', autoOrganizeError);
+              } else {
+                const autoOrganizedIdSet = new Set(autoOrganizeIds);
+                activeStorageAssignments = activeStorageAssignments.filter((assignment) => !autoOrganizedIdSet.has(assignment.id));
+              }
             }
           }
         }
+
+        setStorageAssignments(activeStorageAssignments);
       }
 
-      setStorageAssignments(activeStorageAssignments);
-    }
+      const storageByLane = new Map<string, StorageAssignment[]>();
+      activeStorageAssignments.forEach((assignment) => {
+        const laneKey = String(assignment.lane_number);
+        const current = storageByLane.get(laneKey) || [];
+        current.push(assignment);
+        storageByLane.set(laneKey, current);
+      });
 
-    const storageByLane = new Map<string, StorageAssignment[]>();
-    activeStorageAssignments.forEach((assignment) => {
-      const laneKey = String(assignment.lane_number);
-      const current = storageByLane.get(laneKey) || [];
-      current.push(assignment);
-      storageByLane.set(laneKey, current);
-    });
-
-    const lanesWithCapacity = await Promise.all(
-      laneRows.map(async (lane) => {
-        const { data: assignments } = await supabase
-          .from('lane_assignments')
-          .select('pallet_count')
-          .eq('lane_number', lane.lane_number);
-
-        const current_pallets = assignments?.reduce((sum, a) => sum + a.pallet_count, 0) || 0;
-
-        const { data: shipmentData } = await supabase
-          .from('shipments')
-          .select('pu_number, status, archived')
-          .eq('staging_lane', lane.lane_number.toString())
-          .eq('archived', false);
-
-        const activeShipment = shipmentData?.find((s) => s.status !== 'cleared') || shipmentData?.[0];
-
-        let isStaging = false;
-        let stagingPuNumber = null;
-        let isFinalized = false;
-
-        if (activeShipment) {
-          isStaging = true;
-          stagingPuNumber = activeShipment.pu_number;
-          isFinalized = activeShipment.status === 'finalized';
-        } else {
-          const { data: pts } = await supabase
+      const laneNumbers = laneRows.map((lane) => String(lane.lane_number));
+      const [assignmentResponse, shipmentResponse, ptStatusResponse] = await Promise.all([
+        laneNumbers.length > 0
+          ? supabase
+            .from('lane_assignments')
+            .select('lane_number, pallet_count')
+            .in('lane_number', laneNumbers)
+          : Promise.resolve({ data: [], error: null }),
+        laneNumbers.length > 0
+          ? supabase
+            .from('shipments')
+            .select('staging_lane, pu_number, status')
+            .eq('archived', false)
+            .in('staging_lane', laneNumbers)
+          : Promise.resolve({ data: [], error: null }),
+        laneNumbers.length > 0
+          ? supabase
             .from('picktickets')
-            .select('status')
-            .eq('assigned_lane', lane.lane_number);
-          isStaging = (pts && pts.length > 0 && pts.every((pt) => pt.status === 'ready_to_ship')) || false;
+            .select('assigned_lane, status')
+            .in('assigned_lane', laneNumbers)
+          : Promise.resolve({ data: [], error: null })
+      ]);
+
+      if (assignmentResponse.error) {
+        console.error('Failed to load lane assignment totals:', assignmentResponse.error);
+      }
+      if (shipmentResponse.error) {
+        console.error('Failed to load staging lanes:', shipmentResponse.error);
+      }
+      if (ptStatusResponse.error) {
+        console.error('Failed to load lane PT statuses:', ptStatusResponse.error);
+      }
+
+      const currentPalletsByLane = new Map<string, number>();
+      ((assignmentResponse.data || []) as LaneAssignmentRow[]).forEach((assignment) => {
+        const laneKey = String(assignment.lane_number || '').trim();
+        if (!laneKey) return;
+        currentPalletsByLane.set(laneKey, (currentPalletsByLane.get(laneKey) || 0) + (assignment.pallet_count || 0));
+      });
+
+      const activeShipmentByLane = new Map<string, ShipmentLaneRow>();
+      ((shipmentResponse.data || []) as ShipmentLaneRow[]).forEach((shipment) => {
+        const laneKey = String(shipment.staging_lane || '').trim();
+        if (!laneKey) return;
+
+        const existing = activeShipmentByLane.get(laneKey);
+        if (!existing) {
+          activeShipmentByLane.set(laneKey, shipment);
+          return;
         }
 
-        const laneStorageAssignments = storageByLane.get(String(lane.lane_number)) || [];
+        if (existing.status === 'cleared' && shipment.status !== 'cleared') {
+          activeShipmentByLane.set(laneKey, shipment);
+        }
+      });
+
+      const laneStatusCounts = new Map<string, { total: number; ready: number }>();
+      ((ptStatusResponse.data || []) as LanePTStatusRow[]).forEach((ptRow) => {
+        const laneKey = String(ptRow.assigned_lane || '').trim();
+        if (!laneKey) return;
+
+        const current = laneStatusCounts.get(laneKey) || { total: 0, ready: 0 };
+        current.total += 1;
+        if (String(ptRow.status || '').trim().toLowerCase() === 'ready_to_ship') {
+          current.ready += 1;
+        }
+        laneStatusCounts.set(laneKey, current);
+      });
+
+      const lanesWithCapacity = laneRows.map((lane) => {
+        const laneKey = String(lane.lane_number);
+        const activeShipment = activeShipmentByLane.get(laneKey);
+        const statusCounts = laneStatusCounts.get(laneKey);
+        const isReadyOnlyLane = !activeShipment && !!statusCounts && statusCounts.total > 0 && statusCounts.total === statusCounts.ready;
+        const laneStorageAssignments = storageByLane.get(laneKey) || [];
 
         return {
           ...lane,
-          current_pallets,
-          isStaging,
-          stagingPuNumber,
-          isFinalized,
+          current_pallets: currentPalletsByLane.get(laneKey) || 0,
+          isStaging: Boolean(activeShipment) || isReadyOnlyLane,
+          stagingPuNumber: activeShipment?.pu_number || null,
+          isFinalized: activeShipment?.status === 'finalized',
           hasStorage: laneStorageAssignments.length > 0,
           storageAssignments: laneStorageAssignments
         } as Lane;
-      })
-    );
+      });
 
-    setLanes(lanesWithCapacity);
+      setLanes(lanesWithCapacity);
+    } finally {
+      laneFetchInFlightRef.current = false;
+      if (laneFetchQueuedRef.current) {
+        laneFetchQueuedRef.current = false;
+        void fetchLanes();
+      }
+    }
   }, []);
 
   const scheduleLaneRefresh = useCallback(() => {
@@ -222,15 +295,11 @@ export default function LaneGrid({ readOnly = false }: LaneGridProps) {
     laneRefreshTimerRef.current = window.setTimeout(() => {
       void fetchLanes();
       laneRefreshTimerRef.current = null;
-    }, 120);
+    }, 450);
   }, [fetchLanes]);
 
   useEffect(() => {
-    const timer = window.setTimeout(() => {
-      void fetchLanes();
-    }, 0);
-
-    return () => window.clearTimeout(timer);
+    void fetchLanes();
   }, [fetchLanes]);
 
   useEffect(() => {
