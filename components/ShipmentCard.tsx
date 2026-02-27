@@ -42,6 +42,8 @@ export interface Shipment {
   shipped_at?: string | null;
 }
 
+const SHIPMENT_STATUS_OPTIONS: Shipment['status'][] = ['not_started', 'in_process', 'finalized'];
+
 export interface ShipmentCardProps {
   shipment: Shipment;
   onUpdate: () => void;
@@ -50,6 +52,7 @@ export interface ShipmentCardProps {
   onToggleExpand?: (isExpanded: boolean) => void;
   readOnly?: boolean;
   requireOCRForStaging?: boolean;
+  allowAdminStatusEdit?: boolean;
 }
 
 
@@ -60,7 +63,8 @@ export default function ShipmentCard({
   isExpanded = false,
   onToggleExpand,
   readOnly = false,
-  requireOCRForStaging = true
+  requireOCRForStaging = true,
+  allowAdminStatusEdit = false
 }: ShipmentCardProps) {
   const [expanded, setExpanded] = useState(isExpanded);
   const [selectingLane, setSelectingLane] = useState(false);
@@ -75,6 +79,11 @@ export default function ShipmentCard({
   const [deleteConfirmText, setDeleteConfirmText] = useState('');
   const [laneOrderByPtId, setLaneOrderByPtId] = useState<Record<number, number>>({});
   const [stagingPTIds, setStagingPTIds] = useState<number[]>([]);
+  const [adminShipmentStatus, setAdminShipmentStatus] = useState<Shipment['status']>(shipment.status);
+  const [adminShipmentArchived, setAdminShipmentArchived] = useState(Boolean(shipment.archived));
+  const [adminSavingShipmentStatus, setAdminSavingShipmentStatus] = useState(false);
+  const [adminPtStatusById, setAdminPtStatusById] = useState<Record<number, string>>({});
+  const [adminSavingPtIds, setAdminSavingPtIds] = useState<number[]>([]);
 
   //ocr
   const [scanningPT, setScanningPT] = useState<ShipmentPT | null>(null);
@@ -127,6 +136,11 @@ export default function ShipmentCard({
       return () => clearTimeout(timer);
     }
   }, [toast]);
+
+  useEffect(() => {
+    setAdminShipmentStatus(shipment.status);
+    setAdminShipmentArchived(Boolean(shipment.archived));
+  }, [shipment.status, shipment.archived, shipment.pu_number, shipment.pu_date]);
 
   // THE WATCHDOG: Automatically syncs PTs in the staging lane to staged/ready_to_ship based on shipment status.
   useEffect(() => {
@@ -318,6 +332,66 @@ export default function ShipmentCard({
 
   function showConfirm(title: string, message: string, onConfirm: () => void) {
     setConfirmModal({ isOpen: true, title, message, onConfirm });
+  }
+
+  async function handleAdminSaveShipmentStatus() {
+    if (!allowAdminStatusEdit) return;
+
+    setAdminSavingShipmentStatus(true);
+    try {
+      const { error } = await supabase
+        .from('shipments')
+        .upsert({
+          pu_number: shipment.pu_number,
+          pu_date: shipment.pu_date,
+          carrier: shipment.carrier || null,
+          staging_lane: shipment.staging_lane,
+          status: adminShipmentStatus,
+          archived: adminShipmentArchived,
+          updated_at: new Date().toISOString()
+        }, {
+          onConflict: 'pu_number,pu_date'
+        });
+
+      if (error) throw error;
+
+      showToast('Admin override saved for shipment', 'success');
+      onUpdate();
+    } catch (error) {
+      console.error('Failed to save admin shipment status override:', error);
+      showToast('Failed to save shipment override', 'error');
+    } finally {
+      setAdminSavingShipmentStatus(false);
+    }
+  }
+
+  async function handleAdminSavePtStatus(pt: ShipmentPT) {
+    if (!allowAdminStatusEdit) return;
+
+    const nextStatus = (adminPtStatusById[pt.id] ?? pt.status ?? '').trim();
+    if (!nextStatus) {
+      showToast('PT status cannot be empty', 'error');
+      return;
+    }
+
+    setAdminSavingPtIds((prev) => (prev.includes(pt.id) ? prev : [...prev, pt.id]));
+    try {
+      const { error } = await supabase
+        .from('picktickets')
+        .update({ status: nextStatus })
+        .eq('id', pt.id);
+
+      if (error) throw error;
+
+      setAdminPtStatusById((prev) => ({ ...prev, [pt.id]: nextStatus }));
+      showToast(`PT ${pt.pt_number} status updated`, 'success');
+      onUpdate();
+    } catch (error) {
+      console.error('Failed to save admin PT status override:', error);
+      showToast(`Failed to update PT ${pt.pt_number}`, 'error');
+    } finally {
+      setAdminSavingPtIds((prev) => prev.filter((id) => id !== pt.id));
+    }
   }
 
   const ptsByLane = shipment.pts.reduce((acc, pt) => {
@@ -811,6 +885,45 @@ export default function ShipmentCard({
         {/* Expanded content */}
         {expanded && (
           <div className="p-3 md:p-6 border-t-2 border-gray-600 space-y-4 md:space-y-6">
+            {allowAdminStatusEdit && (
+              <div className="bg-indigo-900 border border-indigo-600 p-3 md:p-4 rounded-lg">
+                <div className="font-bold text-sm md:text-base text-indigo-200 mb-3">
+                  Admin Status Override
+                </div>
+                <div className="flex flex-col lg:flex-row gap-3 lg:items-center">
+                  <div className="flex flex-col sm:flex-row gap-2 sm:items-center">
+                    <label className="text-xs md:text-sm text-indigo-100 whitespace-nowrap">Shipment status</label>
+                    <select
+                      value={adminShipmentStatus}
+                      onChange={(event) => setAdminShipmentStatus(event.target.value as Shipment['status'])}
+                      className="bg-gray-900 border border-indigo-500 text-white rounded px-3 py-2 text-sm md:text-base"
+                    >
+                      {SHIPMENT_STATUS_OPTIONS.map((statusOption) => (
+                        <option key={statusOption} value={statusOption}>
+                          {statusOption}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <label className="flex items-center gap-2 text-xs md:text-sm text-indigo-100">
+                    <input
+                      type="checkbox"
+                      checked={adminShipmentArchived}
+                      onChange={(event) => setAdminShipmentArchived(event.target.checked)}
+                    />
+                    Archived
+                  </label>
+                  <button
+                    onClick={handleAdminSaveShipmentStatus}
+                    disabled={adminSavingShipmentStatus}
+                    className="bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-600 px-3 md:px-5 py-2 rounded-lg font-semibold text-sm md:text-base"
+                  >
+                    {adminSavingShipmentStatus ? 'Saving...' : 'Save Shipment Override'}
+                  </button>
+                </div>
+              </div>
+            )}
+
             {/* Action buttons - wrap on mobile */}
             {/* Only show action buttons if NOT archived */}
             {!readOnly && !shipment.archived && shipment.staging_lane && (
@@ -1194,6 +1307,32 @@ export default function ShipmentCard({
                               )}
                             </div>
                           </div>
+                          {allowAdminStatusEdit && (
+                            <div className="mt-3 pt-3 border-t border-indigo-700">
+                              <div className="flex flex-col md:flex-row md:items-center gap-2 md:gap-3">
+                                <span className="text-xs md:text-sm text-indigo-200 font-semibold whitespace-nowrap">
+                                  Admin PT status
+                                </span>
+                                <input
+                                  type="text"
+                                  value={adminPtStatusById[pt.id] ?? pt.status ?? ''}
+                                  onChange={(event) => {
+                                    const nextValue = event.target.value;
+                                    setAdminPtStatusById((prev) => ({ ...prev, [pt.id]: nextValue }));
+                                  }}
+                                  placeholder="Enter status"
+                                  className="flex-1 bg-gray-900 border border-indigo-600 text-white rounded px-3 py-2 text-sm md:text-base"
+                                />
+                                <button
+                                  onClick={() => handleAdminSavePtStatus(pt)}
+                                  disabled={adminSavingPtIds.includes(pt.id)}
+                                  className="bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-600 px-3 md:px-4 py-2 rounded-lg font-semibold text-xs md:text-sm whitespace-nowrap"
+                                >
+                                  {adminSavingPtIds.includes(pt.id) ? 'Saving...' : 'Save PT Status'}
+                                </button>
+                              </div>
+                            </div>
+                          )}
                         </div>
                       );
                     })}

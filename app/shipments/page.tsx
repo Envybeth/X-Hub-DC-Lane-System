@@ -83,7 +83,7 @@ function getDaysSince(timestamp?: string | null, fallbackDate?: string): number 
 }
 
 export default function ShipmentsPage() {
-  const { session, isGuest } = useAuth();
+  const { session, isGuest, isAdmin } = useAuth();
   const [shipments, setShipments] = useState<Shipment[]>([]);
   const [loading, setLoading] = useState(true);
   const [mostRecentSync, setMostRecentSync] = useState<Date | null>(null);
@@ -296,7 +296,7 @@ export default function ShipmentsPage() {
       const { data: shipmentRows, error: shipmentRowsError } = await supabase
         .from('shipments')
         .select('id, pu_number, pu_date, staging_lane, status, carrier, archived, updated_at, created_at')
-        .eq('archived', false);
+        ;
       if (shipmentRowsError) throw shipmentRowsError;
 
       const matchedShipmentRows: ShipmentRecordRow[] = [];
@@ -345,6 +345,71 @@ export default function ShipmentsPage() {
             pt.removed_from_staging = removed;
           });
         });
+      }
+
+      const syncReference = latestSync ? new Date(latestSync) : mostRecentSync;
+      if (!isGuest && syncReference) {
+        const staleReadyToShipLoads = Object.values(groupedShipments).filter((shipment) => {
+          if (shipment.archived || shipment.pts.length === 0) return false;
+          const hasShippedPT = shipment.pts.some((pt) => pt.status === 'shipped');
+          if (hasShippedPT) return false;
+          const allReadyToShip = shipment.pts.every((pt) => pt.status === 'ready_to_ship');
+          if (!allReadyToShip) return false;
+          const allDefunctBySync = shipment.pts.every((pt) => isPTArchived(pt, syncReference));
+          return allDefunctBySync;
+        });
+
+        for (const staleReadyLoad of staleReadyToShipLoads) {
+          const ptIds = staleReadyLoad.pts.map((pt) => pt.id);
+          if (ptIds.length === 0) continue;
+          // Keep stale/defunct loads in their existing historical section after auto-ship.
+          const preservedShippedAt = new Date(
+            Date.now() - ((HIDE_ARCHIVED_AFTER_DAYS + 1) * DAY_MS)
+          ).toISOString();
+
+          const { error: ptShipError } = await supabase
+            .from('picktickets')
+            .update({ status: 'shipped' })
+            .in('id', ptIds);
+          if (ptShipError) {
+            console.warn(`Auto-ship skipped for PU ${staleReadyLoad.pu_number}: ${ptShipError.message}`);
+            continue;
+          }
+
+          const { error: laneClearError } = await supabase
+            .from('lane_assignments')
+            .delete()
+            .in('pt_id', ptIds);
+          if (laneClearError) {
+            console.warn(`Lane clear failed during auto-ship for PU ${staleReadyLoad.pu_number}: ${laneClearError.message}`);
+          }
+
+          const { error: shipmentArchiveError } = await supabase
+            .from('shipments')
+            .upsert({
+              pu_number: staleReadyLoad.pu_number,
+              pu_date: staleReadyLoad.pu_date,
+              carrier: staleReadyLoad.carrier || null,
+              status: 'finalized',
+              archived: true,
+              staging_lane: null,
+              updated_at: preservedShippedAt
+            }, {
+              onConflict: 'pu_number,pu_date'
+            });
+          if (shipmentArchiveError) {
+            console.warn(`Shipment archive failed during auto-ship for PU ${staleReadyLoad.pu_number}: ${shipmentArchiveError.message}`);
+            continue;
+          }
+
+          staleReadyLoad.pts.forEach((pt) => {
+            pt.status = 'shipped';
+          });
+          staleReadyLoad.status = 'finalized';
+          staleReadyLoad.archived = true;
+          staleReadyLoad.staging_lane = null;
+          staleReadyLoad.shipped_at = preservedShippedAt;
+        }
       }
 
       Object.values(groupedShipments).forEach((shipment) => {
@@ -640,6 +705,7 @@ export default function ShipmentsPage() {
             }}
             requireOCRForStaging={requireOCRForStaging}
             readOnly={isGuest}
+            allowAdminStatusEdit={isAdmin}
           />
         ))}
       </div>
@@ -667,6 +733,7 @@ export default function ShipmentsPage() {
             }}
             requireOCRForStaging={requireOCRForStaging}
             readOnly={isGuest}
+            allowAdminStatusEdit={isAdmin}
           />
         ))}
       </div>
@@ -694,6 +761,7 @@ export default function ShipmentsPage() {
             }}
             requireOCRForStaging={requireOCRForStaging}
             readOnly={isGuest}
+            allowAdminStatusEdit={isAdmin}
           />
         ))}
       </div>
@@ -720,7 +788,12 @@ export default function ShipmentsPage() {
               <ShipmentCard
                 key={`stale-${shipmentKey(shipment)}`}
                 shipment={shipment}
-                onUpdate={() => { }}
+                onUpdate={() => {
+                  const currentKey = `stale-${shipmentKey(shipment)}`;
+                  setExpandedShipmentKey(currentKey);
+                  fetchShipments();
+                  fetchStaleSnapshotsFromSupabase();
+                }}
                 mostRecentSync={mostRecentSync}
                 isExpanded={expandedShipmentKey === `stale-${shipmentKey(shipment)}`}
                 readOnly={true}
@@ -728,6 +801,7 @@ export default function ShipmentsPage() {
                   setExpandedShipmentKey(isExpanded ? `stale-${shipmentKey(shipment)}` : null);
                 }}
                 requireOCRForStaging={requireOCRForStaging}
+                allowAdminStatusEdit={isAdmin}
               />
             ))}
           </div>
@@ -765,6 +839,7 @@ export default function ShipmentsPage() {
                 isExpanded={true}
                 requireOCRForStaging={requireOCRForStaging}
                 readOnly={isGuest}
+                allowAdminStatusEdit={isAdmin}
               />
             </div>
           </div>
