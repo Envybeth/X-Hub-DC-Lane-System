@@ -98,6 +98,7 @@ export default function ShipmentsPage() {
   const shipmentRefreshTimerRef = useRef<number | null>(null);
   const shipmentFetchInFlightRef = useRef(false);
   const shipmentFetchQueuedRef = useRef(false);
+  const hasLoadedShipmentsRef = useRef(false);
   const staleRefreshRequestedRef = useRef(false);
   const focusedShipmentKeyRef = useRef<string | null>(null);
   const fetchShipmentsRef = useRef<() => Promise<void>>(async () => { });
@@ -259,7 +260,9 @@ export default function ShipmentsPage() {
       return;
     }
     shipmentFetchInFlightRef.current = true;
-    setLoading(true);
+    if (!hasLoadedShipmentsRef.current) {
+      setLoading(true);
+    }
 
     try {
       const { data: pts, error } = await supabase
@@ -475,6 +478,7 @@ export default function ShipmentsPage() {
     } catch (error) {
       console.error('Error fetching shipments:', error);
     } finally {
+      hasLoadedShipmentsRef.current = true;
       setLoading(false);
       shipmentFetchInFlightRef.current = false;
       if (shipmentFetchQueuedRef.current) {
