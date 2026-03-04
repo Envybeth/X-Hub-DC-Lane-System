@@ -34,6 +34,7 @@ interface AuditLogEntry {
   actor_username: string | null;
   actor_display_name: string | null;
   actor_role: AppRole | null;
+  summary?: string | null;
 }
 
 export default function AccountsPage() {
@@ -362,6 +363,7 @@ export default function AccountsPage() {
     if (action === 'INSERT') return 'Created';
     if (action === 'UPDATE') return 'Updated';
     if (action === 'DELETE') return 'Deleted';
+    if (action === 'MOVE') return 'Moved';
     return action;
   }
 
@@ -557,8 +559,14 @@ export default function AccountsPage() {
                     {historyRows.map((row) => (
                       <div key={row.id} className="p-3 text-xs md:text-sm">
                         <div className="text-gray-300">
-                          <span className="font-semibold">{getActionLabel(row.action)}</span>{' '}
-                          <span className="text-gray-400">{formatHistoryTarget(row)}</span>
+                          {row.summary ? (
+                            <span className="font-semibold">{row.summary}</span>
+                          ) : (
+                            <>
+                              <span className="font-semibold">{getActionLabel(row.action)}</span>{' '}
+                              <span className="text-gray-400">{formatHistoryTarget(row)}</span>
+                            </>
+                          )}
                         </div>
                         <div className="text-gray-500">
                           {new Date(row.created_at).toLocaleString()} · {row.actor_display_name || row.actor_username || 'system'}

@@ -232,7 +232,12 @@ export function exportShipmentSummaryPdf(loads: ShipmentPdfLoad[], fileBaseName:
     const shouldMergePuDate = Boolean(mergedPuDate);
     const mergedLocation = getMergedColumnValue(rowCells, 10);
     const shouldMergeLocation = Boolean(mergedLocation);
-    const rowHeights = rowCells.map(cells => {
+    const getLineCount = (text: string, columnWidth: number) => {
+      const wrapped = doc.splitTextToSize(text || '', Math.max(columnWidth - CELL_TEXT_INSET, 1));
+      return Math.max(1, wrapped.length || 1);
+    };
+
+    let rowHeights = rowCells.map(cells => {
       let maxLines = 1;
       for (let index = 0; index < cells.length; index++) {
         if (MERGED_LOAD_COL_INDEXES.has(index)) continue;
@@ -244,7 +249,33 @@ export function exportShipmentSummaryPdf(loads: ShipmentPdfLoad[], fileBaseName:
       return Math.max(MIN_ROW_HEIGHT, (maxLines * CELL_LINE_HEIGHT) + 1);
     });
 
-    const loadHeight = rowHeights.reduce((sum, h) => sum + h, 0);
+    let loadHeight = rowHeights.reduce((sum, h) => sum + h, 0);
+
+    // Ensure merged PU#/Carrier (and merged date/location, when applicable) never clip.
+    const mergedColumnRequiredHeights: number[] = [
+      Math.max(MIN_ROW_HEIGHT, (getLineCount(load.puNumber || '', colWidths[8]) * 2.7) + 1),
+      Math.max(MIN_ROW_HEIGHT, (getLineCount(load.carrier || '', colWidths[9]) * 2.3) + 1)
+    ];
+
+    if (shouldMergePuDate) {
+      mergedColumnRequiredHeights.push(
+        Math.max(MIN_ROW_HEIGHT, (getLineCount(mergedPuDate || '', colWidths[0]) * 2.3) + 1)
+      );
+    }
+
+    if (shouldMergeLocation) {
+      mergedColumnRequiredHeights.push(
+        Math.max(MIN_ROW_HEIGHT, (getLineCount(mergedLocation || '', colWidths[10]) * 2.5) + 1)
+      );
+    }
+
+    const minRequiredLoadHeight = Math.max(...mergedColumnRequiredHeights);
+    if (loadHeight < minRequiredLoadHeight && rowHeights.length > 0) {
+      const extraHeightNeeded = minRequiredLoadHeight - loadHeight;
+      rowHeights = [...rowHeights];
+      rowHeights[rowHeights.length - 1] += extraHeightNeeded;
+      loadHeight = minRequiredLoadHeight;
+    }
 
     if (cursorY + loadHeight > contentBottom) {
       doc.addPage('letter', 'landscape');

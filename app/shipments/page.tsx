@@ -99,6 +99,7 @@ export default function ShipmentsPage() {
   const shipmentFetchInFlightRef = useRef(false);
   const shipmentFetchQueuedRef = useRef(false);
   const staleRefreshRequestedRef = useRef(false);
+  const focusedShipmentKeyRef = useRef<string | null>(null);
   const fetchShipmentsRef = useRef<() => Promise<void>>(async () => { });
   const fetchStaleSnapshotsRef = useRef<() => Promise<void>>(async () => { });
 
@@ -121,6 +122,37 @@ export default function ShipmentsPage() {
     const timer = window.setTimeout(() => setOcrToggleToast(''), 2500);
     return () => window.clearTimeout(timer);
   }, [ocrToggleToast]);
+
+  const refreshShipmentView = useCallback((shipmentKeyToFocus: string, includeStale = false) => {
+    focusedShipmentKeyRef.current = shipmentKeyToFocus;
+    setExpandedShipmentKey(shipmentKeyToFocus);
+    void fetchShipmentsRef.current();
+    if (includeStale) {
+      void fetchStaleSnapshotsRef.current();
+    }
+  }, []);
+
+  useEffect(() => {
+    const targetKey = focusedShipmentKeyRef.current;
+    if (!targetKey || loading) return;
+
+    const target = document.querySelector<HTMLElement>(`[data-shipment-card-key="${targetKey}"]`);
+    if (!target) return;
+
+    const rafId = window.requestAnimationFrame(() => {
+      const topOffsetPx = 92;
+      const targetTop = target.getBoundingClientRect().top + window.scrollY - topOffsetPx;
+      window.scrollTo({
+        top: Math.max(0, targetTop),
+        behavior: 'smooth'
+      });
+      if (focusedShipmentKeyRef.current === targetKey) {
+        focusedShipmentKeyRef.current = null;
+      }
+    });
+
+    return () => window.cancelAnimationFrame(rafId);
+  }, [shipments, loading]);
 
   async function handleToggleOCRRequirement() {
     if (verifyingOCRTogglePassword) return;
@@ -478,9 +510,33 @@ export default function ShipmentsPage() {
     return daysSinceShipped > SHIPPED_TO_ARCHIVED_DAYS && daysSinceShipped <= HIDE_ARCHIVED_AFTER_DAYS;
   }, []);
 
-  const activeShipments = shipments.filter(s => {
-    return isInActiveSection(s);
-  });
+  const activeStatusSortOrder: Record<Shipment['status'], number> = {
+    in_process: 0,
+    not_started: 1,
+    finalized: 2
+  };
+
+  const activeShipments = shipments
+    .filter((shipment) => isInActiveSection(shipment))
+    .sort((a, b) => {
+      const rankA = activeStatusSortOrder[a.status] ?? Number.MAX_SAFE_INTEGER;
+      const rankB = activeStatusSortOrder[b.status] ?? Number.MAX_SAFE_INTEGER;
+      if (rankA !== rankB) return rankA - rankB;
+
+      const timeA = new Date(a.pu_date).getTime();
+      const timeB = new Date(b.pu_date).getTime();
+      const hasValidTimeA = !Number.isNaN(timeA);
+      const hasValidTimeB = !Number.isNaN(timeB);
+
+      if (hasValidTimeA && hasValidTimeB && timeA !== timeB) {
+        return timeA - timeB;
+      }
+
+      return (a.pu_number || '').localeCompare((b.pu_number || ''), undefined, {
+        sensitivity: 'base',
+        numeric: true
+      });
+    });
 
   const shippedShipments = shipments.filter(s => {
     return isInShippedSection(s);
@@ -565,7 +621,13 @@ export default function ShipmentsPage() {
     })
     .sort((a, b) => new Date(b.pu_date).getTime() - new Date(a.pu_date).getTime());
 
-  const readyToShipActiveLoads: ShipmentPdfLoad[] = activeShipments
+  const activeShipmentsForExport = [...activeShipments].sort((a, b) => {
+    const byPuDate = new Date(a.pu_date).getTime() - new Date(b.pu_date).getTime();
+    if (byPuDate !== 0) return byPuDate;
+    return (a.pu_number || '').localeCompare((b.pu_number || ''), undefined, { sensitivity: 'base' });
+  });
+
+  const readyToShipActiveLoads: ShipmentPdfLoad[] = activeShipmentsForExport
     .filter(shipment => shipment.status === 'finalized')
     .map(shipment => ({
       puNumber: shipment.pu_number || '',
@@ -581,15 +643,40 @@ export default function ShipmentsPage() {
           ctn: pt.ctn || '',
           palletQty: pt.actual_pallet_count !== null && pt.actual_pallet_count !== undefined ? String(pt.actual_pallet_count) : '',
           container: pt.container_number || '',
-          location: shipment.staging_lane ? `L${shipment.staging_lane}` : (pt.assigned_lane ? `L${pt.assigned_lane}` : ''),
+          location: pt.assigned_lane ? `L${pt.assigned_lane}` : '',
           notes: ''
         }))
     }))
     .filter(load => load.rows.length > 0);
 
+  const allActiveLoadSummaries: ShipmentPdfLoad[] = activeShipmentsForExport
+    .map(shipment => ({
+      puNumber: shipment.pu_number || '',
+      carrier: shipment.carrier || '',
+      rows: shipment.pts
+        .map((pt) => ({
+          puDate: shipment.pu_date || '',
+          customer: pt.customer || '',
+          dc: pt.store_dc || '',
+          pickticket: pt.pt_number || '',
+          po: pt.po_number || '',
+          ctn: pt.ctn || '',
+          palletQty: pt.actual_pallet_count !== null && pt.actual_pallet_count !== undefined ? String(pt.actual_pallet_count) : '',
+          container: pt.container_number || '',
+          location: pt.assigned_lane ? `L${pt.assigned_lane}` : '',
+          notes: ''
+        }))
+    }))
+    .filter((load) => load.rows.length > 0);
+
   function exportAllReadyToShipPDF() {
     if (readyToShipActiveLoads.length === 0) return;
     exportShipmentSummaryPdf(readyToShipActiveLoads, 'shipment-summary-ready-to-ship');
+  }
+
+  function exportAllActiveLoadSummariesPDF() {
+    if (allActiveLoadSummaries.length === 0) return;
+    exportShipmentSummaryPdf(allActiveLoadSummaries, 'shipment-summary-all-active-loads');
   }
 
   const normalizedLoadSearch = loadSearch.trim().toLowerCase();
@@ -601,6 +688,7 @@ export default function ShipmentsPage() {
     ? shipments.find(shipment => shipmentKey(shipment) === searchSelectedShipmentKey) || null
     : null;
   const readyToShipCount = readyToShipActiveLoads.length;
+  const allActiveLoadSummaryCount = allActiveLoadSummaries.length;
 
   function handleOpenSearchShipment(targetShipment: Shipment) {
     setSearchSelectedShipmentKey(shipmentKey(targetShipment));
@@ -665,6 +753,14 @@ export default function ShipmentsPage() {
                 Export All Ready to Ship ({readyToShipCount})
               </button>
             )}
+            {allActiveLoadSummaryCount > 0 && (
+              <button
+                onClick={exportAllActiveLoadSummariesPDF}
+                className="w-full md:w-auto text-center bg-cyan-600 hover:bg-cyan-700 px-6 py-3 rounded-lg font-semibold transition-colors"
+              >
+                Export All Load Summaries ({allActiveLoadSummaryCount})
+              </button>
+            )}
             <Link
               href="/"
               className="w-full md:w-auto text-center bg-gray-700 hover:bg-gray-600 px-6 py-3 rounded-lg font-semibold transition-colors"
@@ -689,25 +785,28 @@ export default function ShipmentsPage() {
       </div>
     ) : (
       <div className="space-y-4">
-        {activeShipments.map((shipment) => (
-          <ShipmentCard
-            key={`${shipment.pu_number}-${shipment.pu_date}`}
-            shipment={shipment}
-            onUpdate={() => {
-              const currentKey = `${shipment.pu_number}-${shipment.pu_date}`;
-              setExpandedShipmentKey(currentKey);
-              fetchShipments();
-            }}
-            mostRecentSync={mostRecentSync}
-            isExpanded={expandedShipmentKey === `${shipment.pu_number}-${shipment.pu_date}`}
-            onToggleExpand={(isExpanded) => {
-              setExpandedShipmentKey(isExpanded ? `${shipment.pu_number}-${shipment.pu_date}` : null);
-            }}
-            requireOCRForStaging={requireOCRForStaging}
-            readOnly={isGuest}
-            allowAdminStatusEdit={isAdmin}
-          />
-        ))}
+        {activeShipments.map((shipment) => {
+          const currentKey = shipmentKey(shipment);
+          return (
+            <div key={currentKey} data-shipment-card-key={currentKey}>
+              <ShipmentCard
+                shipment={shipment}
+                onUpdate={() => refreshShipmentView(currentKey)}
+                mostRecentSync={mostRecentSync}
+                isExpanded={expandedShipmentKey === currentKey}
+                onToggleExpand={(isExpanded) => {
+                  setExpandedShipmentKey(isExpanded ? currentKey : null);
+                  if (isExpanded) {
+                    focusedShipmentKeyRef.current = currentKey;
+                  }
+                }}
+                requireOCRForStaging={requireOCRForStaging}
+                readOnly={isGuest}
+                allowAdminStatusEdit={isAdmin}
+              />
+            </div>
+          );
+        })}
       </div>
     )}
   </div>
@@ -717,25 +816,28 @@ export default function ShipmentsPage() {
     <div className="border-t-4 border-green-600 pt-8 mb-8">
       <h2 className="text-2xl font-bold mb-4 text-green-400">✈️ Shipped ({shippedShipments.length})</h2>
       <div className="space-y-4 opacity-75">
-        {shippedShipments.map((shipment) => (
-          <ShipmentCard
-            key={`${shipment.pu_number}-${shipment.pu_date}`}
-            shipment={shipment}
-            onUpdate={() => {
-              const currentKey = `${shipment.pu_number}-${shipment.pu_date}`;
-              setExpandedShipmentKey(currentKey);
-              fetchShipments();
-            }}
-            mostRecentSync={mostRecentSync}
-            isExpanded={expandedShipmentKey === `${shipment.pu_number}-${shipment.pu_date}`}
-            onToggleExpand={(isExpanded) => {
-              setExpandedShipmentKey(isExpanded ? `${shipment.pu_number}-${shipment.pu_date}` : null);
-            }}
-            requireOCRForStaging={requireOCRForStaging}
-            readOnly={isGuest}
-            allowAdminStatusEdit={isAdmin}
-          />
-        ))}
+        {shippedShipments.map((shipment) => {
+          const currentKey = shipmentKey(shipment);
+          return (
+            <div key={currentKey} data-shipment-card-key={currentKey}>
+              <ShipmentCard
+                shipment={shipment}
+                onUpdate={() => refreshShipmentView(currentKey)}
+                mostRecentSync={mostRecentSync}
+                isExpanded={expandedShipmentKey === currentKey}
+                onToggleExpand={(isExpanded) => {
+                  setExpandedShipmentKey(isExpanded ? currentKey : null);
+                  if (isExpanded) {
+                    focusedShipmentKeyRef.current = currentKey;
+                  }
+                }}
+                requireOCRForStaging={requireOCRForStaging}
+                readOnly={isGuest}
+                allowAdminStatusEdit={isAdmin}
+              />
+            </div>
+          );
+        })}
       </div>
     </div>
   )}
@@ -745,25 +847,28 @@ export default function ShipmentsPage() {
     <div className="border-t-4 border-gray-600 pt-8">
       <h2 className="text-2xl font-bold mb-4 text-gray-300">Archived ({archivedShipments.length})</h2>
       <div className="space-y-4 opacity-60">
-        {archivedShipments.map((shipment) => (
-          <ShipmentCard
-            key={`${shipment.pu_number}-${shipment.pu_date}`}
-            shipment={shipment}
-            onUpdate={() => {
-              const currentKey = `${shipment.pu_number}-${shipment.pu_date}`;
-              setExpandedShipmentKey(currentKey);
-              fetchShipments();
-            }}
-            mostRecentSync={mostRecentSync}
-            isExpanded={expandedShipmentKey === `${shipment.pu_number}-${shipment.pu_date}`}
-            onToggleExpand={(isExpanded) => {
-              setExpandedShipmentKey(isExpanded ? `${shipment.pu_number}-${shipment.pu_date}` : null);
-            }}
-            requireOCRForStaging={requireOCRForStaging}
-            readOnly={isGuest}
-            allowAdminStatusEdit={isAdmin}
-          />
-        ))}
+        {archivedShipments.map((shipment) => {
+          const currentKey = shipmentKey(shipment);
+          return (
+            <div key={currentKey} data-shipment-card-key={currentKey}>
+              <ShipmentCard
+                shipment={shipment}
+                onUpdate={() => refreshShipmentView(currentKey)}
+                mostRecentSync={mostRecentSync}
+                isExpanded={expandedShipmentKey === currentKey}
+                onToggleExpand={(isExpanded) => {
+                  setExpandedShipmentKey(isExpanded ? currentKey : null);
+                  if (isExpanded) {
+                    focusedShipmentKeyRef.current = currentKey;
+                  }
+                }}
+                requireOCRForStaging={requireOCRForStaging}
+                readOnly={isGuest}
+                allowAdminStatusEdit={isAdmin}
+              />
+            </div>
+          );
+        })}
       </div>
     </div>
   )}
@@ -784,26 +889,28 @@ export default function ShipmentsPage() {
           </div>
         ) : (
           <div className="space-y-4 opacity-70">
-            {staleSnapshotShipments.map((shipment) => (
-              <ShipmentCard
-                key={`stale-${shipmentKey(shipment)}`}
-                shipment={shipment}
-                onUpdate={() => {
-                  const currentKey = `stale-${shipmentKey(shipment)}`;
-                  setExpandedShipmentKey(currentKey);
-                  fetchShipments();
-                  fetchStaleSnapshotsFromSupabase();
-                }}
-                mostRecentSync={mostRecentSync}
-                isExpanded={expandedShipmentKey === `stale-${shipmentKey(shipment)}`}
-                readOnly={true}
-                onToggleExpand={(isExpanded) => {
-                  setExpandedShipmentKey(isExpanded ? `stale-${shipmentKey(shipment)}` : null);
-                }}
-                requireOCRForStaging={requireOCRForStaging}
-                allowAdminStatusEdit={isAdmin}
-              />
-            ))}
+            {staleSnapshotShipments.map((shipment) => {
+              const staleKey = `stale-${shipmentKey(shipment)}`;
+              return (
+                <div key={staleKey} data-shipment-card-key={staleKey}>
+                  <ShipmentCard
+                    shipment={shipment}
+                    onUpdate={() => refreshShipmentView(staleKey, true)}
+                    mostRecentSync={mostRecentSync}
+                    isExpanded={expandedShipmentKey === staleKey}
+                    readOnly={true}
+                    onToggleExpand={(isExpanded) => {
+                      setExpandedShipmentKey(isExpanded ? staleKey : null);
+                      if (isExpanded) {
+                        focusedShipmentKeyRef.current = staleKey;
+                      }
+                    }}
+                    requireOCRForStaging={requireOCRForStaging}
+                    allowAdminStatusEdit={isAdmin}
+                  />
+                </div>
+              );
+            })}
           </div>
         )}
       </div>

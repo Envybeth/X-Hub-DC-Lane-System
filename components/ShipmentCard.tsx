@@ -483,34 +483,96 @@ export default function ShipmentCard({
       }
     });
 
-    for (const pt of shipment.pts) {
-      if (pt.assigned_lane) {
-        const { data: laneData } = await supabase
-          .from('lanes')
-          .select('max_capacity')
-          .eq('lane_number', pt.assigned_lane)
-          .single();
-
-        const { data: assignments } = await supabase
-          .from('lane_assignments')
-          .select('pt_id, pallet_count, order_position')
-          .eq('lane_number', pt.assigned_lane)
-          .order('order_position', { ascending: true });
-
-        if (assignments && laneData) {
-          let palletsInFront = 0;
-          for (const assignment of assignments) {
-            if (assignment.pt_id === pt.id) break;
-            palletsInFront += assignment.pallet_count;
-          }
-
-          depthMap[pt.id] = {
-            palletsInFront,
-            maxCapacity: laneData.max_capacity
-          };
-        }
-      }
+    const assignedLaneNumbers = Array.from(
+      new Set(
+        shipment.pts
+          .map((pt) => String(pt.assigned_lane || '').trim())
+          .filter(Boolean)
+      )
+    );
+    if (assignedLaneNumbers.length === 0) {
+      setPtDepthInfo(depthMap);
+      return;
     }
+
+    const [{ data: laneRows, error: laneRowsError }, { data: assignmentRows, error: assignmentRowsError }] = await Promise.all([
+      supabase
+        .from('lanes')
+        .select('lane_number, max_capacity')
+        .in('lane_number', assignedLaneNumbers),
+      supabase
+        .from('lane_assignments')
+        .select('lane_number, pt_id, pallet_count, order_position')
+        .in('lane_number', assignedLaneNumbers)
+        .order('order_position', { ascending: true })
+    ]);
+
+    if (laneRowsError) {
+      console.error('Failed to fetch lane capacities for depth info:', laneRowsError);
+      setPtDepthInfo(depthMap);
+      return;
+    }
+
+    if (assignmentRowsError) {
+      console.error('Failed to fetch lane assignments for depth info:', assignmentRowsError);
+      setPtDepthInfo(depthMap);
+      return;
+    }
+
+    type LaneRow = {
+      lane_number: string;
+      max_capacity: number;
+    };
+    type LaneAssignmentDepthRow = {
+      lane_number: string;
+      pt_id: number;
+      pallet_count: number | null;
+      order_position: number | null;
+    };
+
+    const maxCapacityByLane = new Map<string, number>();
+    ((laneRows || []) as LaneRow[]).forEach((laneRow) => {
+      maxCapacityByLane.set(String(laneRow.lane_number), laneRow.max_capacity);
+    });
+
+    const assignmentsByLane = new Map<string, LaneAssignmentDepthRow[]>();
+    ((assignmentRows || []) as LaneAssignmentDepthRow[]).forEach((assignmentRow) => {
+      const laneKey = String(assignmentRow.lane_number);
+      const existing = assignmentsByLane.get(laneKey) || [];
+      existing.push(assignmentRow);
+      assignmentsByLane.set(laneKey, existing);
+    });
+
+    const palletsInFrontByPtId = new Map<number, number>();
+    const totalPalletsByLane = new Map<string, number>();
+
+    assignmentsByLane.forEach((laneAssignments, laneKey) => {
+      laneAssignments.sort((a, b) => (a.order_position || Number.MAX_SAFE_INTEGER) - (b.order_position || Number.MAX_SAFE_INTEGER));
+
+      let runningTotal = 0;
+      laneAssignments.forEach((assignmentRow) => {
+        palletsInFrontByPtId.set(Number(assignmentRow.pt_id), runningTotal);
+        runningTotal += Number(assignmentRow.pallet_count || 0);
+      });
+      totalPalletsByLane.set(laneKey, runningTotal);
+    });
+
+    shipment.pts.forEach((pt) => {
+      const laneKey = String(pt.assigned_lane || '').trim();
+      if (!laneKey) return;
+
+      const maxCapacity = maxCapacityByLane.get(laneKey);
+      if (maxCapacity === undefined) return;
+
+      const palletsInFront = palletsInFrontByPtId.has(pt.id)
+        ? (palletsInFrontByPtId.get(pt.id) || 0)
+        : (totalPalletsByLane.get(laneKey) || 0);
+
+      depthMap[pt.id] = {
+        palletsInFront,
+        maxCapacity
+      };
+    });
 
     setPtDepthInfo(depthMap);
   }
@@ -840,7 +902,7 @@ export default function ShipmentCard({
           ctn: pt.ctn || '',
           palletQty: pt.actual_pallet_count !== null && pt.actual_pallet_count !== undefined ? String(pt.actual_pallet_count) : '',
           container: pt.container_number || '',
-          location: shipment.staging_lane ? `L${shipment.staging_lane}` : (pt.assigned_lane ? `L${pt.assigned_lane}` : ''),
+          location: pt.assigned_lane ? `L${pt.assigned_lane}` : '',
           notes: ''
         }))
       };
@@ -1086,12 +1148,20 @@ export default function ShipmentCard({
                     </div>
                   </div>
                   {shipment.status !== 'finalized' && (
-                    <button
-                      onClick={handleFinalizeShipment}
-                      className="w-full sm:w-auto bg-green-600 hover:bg-green-700 px-4 md:px-6 py-2 md:py-3 rounded-lg font-bold text-sm md:text-base"
-                    >
-                      Finalize
-                    </button>
+                    <div className="flex flex-col sm:flex-row gap-2 w-full sm:w-auto">
+                      <button
+                        onClick={handleFinalizeShipment}
+                        className="w-full sm:w-auto bg-green-600 hover:bg-green-700 px-4 md:px-6 py-2 md:py-3 rounded-lg font-bold text-sm md:text-base"
+                      >
+                        Finalize
+                      </button>
+                      <button
+                        onClick={exportShipmentPDF}
+                        className="w-full sm:w-auto bg-blue-600 hover:bg-blue-700 px-3 md:px-6 py-2 md:py-3 rounded-lg font-bold text-sm md:text-base whitespace-nowrap"
+                      >
+                        Export Shipment PDF
+                      </button>
+                    </div>
                   )}
                   {shipment.status === 'finalized' && !shipment.archived && (
                     <div className="flex flex-col sm:flex-row gap-2 w-full sm:w-auto">

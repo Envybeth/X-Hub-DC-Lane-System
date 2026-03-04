@@ -21,8 +21,9 @@ export default function OCRCamera({ expectedPT, expectedPO, onSuccess, onCancel 
 
     //manual override
     const [showManualOverride, setShowManualOverride] = useState(false);
-    const [overridePasscode, setOverridePasscode] = useState('');
-    const [passcodeError, setPasscodeError] = useState('');
+    const [manualPTInput, setManualPTInput] = useState('');
+    const [manualPOInput, setManualPOInput] = useState('');
+    const [manualOverrideError, setManualOverrideError] = useState('');
 
     useEffect(() => {
         startCamera();
@@ -281,32 +282,44 @@ export default function OCRCamera({ expectedPT, expectedPO, onSuccess, onCancel 
                     {showManualOverride && (
                         <div className="bg-orange-900 border-2 border-orange-600 border-t-0 p-4 rounded-b-lg">
                             <div className="text-xs text-gray-300 mb-3">
-                                Skip OCR verification and stage PT manually. Requires passcode.
+                                Skip OCR verification and stage PT manually by confirming PT and PO.
                             </div>
                             <input
-                                type="password"
-                                placeholder="Enter passcode"
-                                value={overridePasscode}
+                                type="text"
+                                placeholder="Enter PT number"
+                                value={manualPTInput}
                                 onChange={(e) => {
-                                    setOverridePasscode(e.target.value);
-                                    setPasscodeError('');
+                                    setManualPTInput(e.target.value);
+                                    setManualOverrideError('');
                                 }}
                                 className="w-full bg-gray-900 text-white p-2 rounded mb-2"
                             />
-                            {passcodeError && (
-                                <div className="text-red-400 text-xs mb-2">{passcodeError}</div>
+                            <input
+                                type="text"
+                                placeholder="Enter PO number"
+                                value={manualPOInput}
+                                onChange={(e) => {
+                                    setManualPOInput(e.target.value);
+                                    setManualOverrideError('');
+                                }}
+                                className="w-full bg-gray-900 text-white p-2 rounded mb-2"
+                            />
+                            {manualOverrideError && (
+                                <div className="text-red-400 text-xs mb-2">{manualOverrideError}</div>
                             )}
                             <button
                                 onClick={() => {
-                                    // CHANGE THIS PASSCODE TO WHATEVER YOU WANT
-                                    const CORRECT_PASSCODE = '1234';
+                                    const expectedPTClean = normalizeDigits(expectedPT);
+                                    const expectedPOClean = normalizeDigits(expectedPO);
+                                    const enteredPTClean = normalizeDigits(manualPTInput);
+                                    const enteredPOClean = normalizeDigits(manualPOInput);
 
-                                    if (overridePasscode === CORRECT_PASSCODE) {
+                                    if (enteredPTClean === expectedPTClean && enteredPOClean === expectedPOClean) {
                                         console.log('✅ Manual override authorized');
                                         stopCamera();
                                         onSuccess();
                                     } else {
-                                        setPasscodeError('❌ Incorrect passcode');
+                                        setManualOverrideError('❌ PT/PO does not match this ticket');
                                     }
                                 }}
                                 className="w-full bg-red-600 hover:bg-red-700 py-2 rounded font-bold"

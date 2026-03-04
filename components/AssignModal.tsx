@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { supabase } from '@/lib/supabase';
 import ConfirmModal from './ConfirmModal';
 import PTDetails from './PTDetails';
@@ -45,6 +45,30 @@ interface PTLaneAssignmentRow {
   compiled_pallet_id?: number | null;
 }
 
+const ASSIGN_MODAL_PICKTICKET_SELECT_COLUMNS = `
+  id,
+  pt_number,
+  po_number,
+  customer,
+  container_number,
+  assigned_lane,
+  store_dc,
+  start_date,
+  cancel_date,
+  actual_pallet_count,
+  status,
+  pu_number,
+  pu_date,
+  carrier,
+  ctn,
+  qty,
+  last_synced_at,
+  compiled_pallet_id,
+  sample_checked,
+  sample_labeled,
+  sample_shipped
+`;
+
 export default function AssignModal({ lane, onClose, onUpdated }: AssignModalProps) {
   const [view, setView] = useState<'existing' | 'add'>('existing');
   const [searchMode, setSearchMode] = useState<'container' | 'pt'>('pt');
@@ -79,6 +103,7 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
 
   // archived pts
   const [mostRecentSync, setMostRecentSync] = useState<Date | null>(null);
+  const mostRecentSyncLoadRef = useRef<Promise<Date | null> | null>(null);
 
   //compiling PTs
   const [compilingPTs, setCompilingPTs] = useState<Set<number>>(new Set());
@@ -122,6 +147,7 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
       setSelectedPTs({});
       setSelectionOrder([]);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedContainer, searchMode]);
 
   useEffect(() => {
@@ -415,49 +441,29 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
   }
 
   async function fetchAllUnassignedPTs() {
-    // Get most recent sync date first
-    const { data: recentPT } = await supabase
-      .from('picktickets')
-      .select('last_synced_at')
-      .order('last_synced_at', { ascending: false })
-      .limit(1)
-      .single();
-
-    const mostRecentSync = recentPT?.last_synced_at
-      ? new Date(recentPT.last_synced_at)
-      : null;
+    const latestMostRecentSync = await loadMostRecentSync();
 
     const { data } = await supabase
       .from('picktickets')
-      .select('*')
+      .select(ASSIGN_MODAL_PICKTICKET_SELECT_COLUMNS)
       .is('assigned_lane', null)
       .neq('status', 'shipped')
       .neq('customer', 'PAPER')
       .order('pt_number');
 
     if (data) {
-      const visibleForAssign = data.filter(pt => !isPTArchivedOver60Days(pt, mostRecentSync));
+      const visibleForAssign = data.filter(pt => !isPTArchivedOver60Days(pt, latestMostRecentSync));
       setAllPicktickets(visibleForAssign);
       setAllUnassignedPTs(visibleForAssign);
     }
   }
 
   async function fetchPickticketsByContainer(containerNumber: string) {
-    // Get most recent sync date first
-    const { data: recentPT } = await supabase
-      .from('picktickets')
-      .select('last_synced_at')
-      .order('last_synced_at', { ascending: false })
-      .limit(1)
-      .single();
-
-    const mostRecentSync = recentPT?.last_synced_at
-      ? new Date(recentPT.last_synced_at)
-      : null;
+    const latestMostRecentSync = await loadMostRecentSync();
 
     const { data } = await supabase
       .from('picktickets')
-      .select('*')
+      .select(ASSIGN_MODAL_PICKTICKET_SELECT_COLUMNS)
       .eq('container_number', containerNumber)
       .is('assigned_lane', null)
       .neq('status', 'shipped')
@@ -465,22 +471,39 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
       .order('pt_number');
 
     if (data) {
-      const visibleForAssign = data.filter(pt => !isPTArchivedOver60Days(pt, mostRecentSync));
+      const visibleForAssign = data.filter(pt => !isPTArchivedOver60Days(pt, latestMostRecentSync));
       setPicktickets(visibleForAssign);
     }
   }
 
   //fetch most recent sync
   async function fetchMostRecentSync() {
-    const { data } = await supabase
-      .from('picktickets')
-      .select('last_synced_at')
-      .order('last_synced_at', { ascending: false })
-      .limit(1)
-      .single();
+    await loadMostRecentSync();
+  }
 
-    if (data?.last_synced_at) {
-      setMostRecentSync(new Date(data.last_synced_at));
+  async function loadMostRecentSync(): Promise<Date | null> {
+    if (mostRecentSyncLoadRef.current) {
+      return mostRecentSyncLoadRef.current;
+    }
+
+    const loadPromise = (async (): Promise<Date | null> => {
+      const { data } = await supabase
+        .from('picktickets')
+        .select('last_synced_at')
+        .order('last_synced_at', { ascending: false })
+        .limit(1)
+        .single();
+
+      const parsedSync = data?.last_synced_at ? new Date(data.last_synced_at) : null;
+      setMostRecentSync(parsedSync);
+      return parsedSync;
+    })();
+
+    mostRecentSyncLoadRef.current = loadPromise;
+    try {
+      return await loadPromise;
+    } finally {
+      mostRecentSyncLoadRef.current = null;
     }
   }
 

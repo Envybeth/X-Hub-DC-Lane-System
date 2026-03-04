@@ -20,6 +20,269 @@ type UserProfileRow = {
   role: AppRole;
 };
 
+type PickticketLookupRow = {
+  id: number;
+  pt_number: string | null;
+  po_number: string | null;
+};
+
+type AuditLogResponseRow = AuditLogRow & {
+  actor_username: string | null;
+  actor_display_name: string | null;
+  actor_role: AppRole | null;
+  summary: string;
+};
+
+function toText(value: unknown): string | null {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    return String(value);
+  }
+  return null;
+}
+
+function toDetailsObject(row: AuditLogRow): Record<string, unknown> {
+  if (!row.details || typeof row.details !== 'object' || Array.isArray(row.details)) {
+    return {};
+  }
+  return row.details;
+}
+
+function toSnapshotObject(row: AuditLogRow, key: 'before' | 'after'): Record<string, unknown> | null {
+  const details = toDetailsObject(row);
+  const snapshot = details[key];
+  if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) {
+    return null;
+  }
+  return snapshot as Record<string, unknown>;
+}
+
+function readDetail(row: AuditLogRow, key: string, snapshot?: 'before' | 'after'): string | null {
+  if (!snapshot) {
+    return toText(toDetailsObject(row)[key]);
+  }
+  const source = toSnapshotObject(row, snapshot);
+  if (!source) return null;
+  return toText(source[key]);
+}
+
+function readDetailAny(row: AuditLogRow, key: string): string | null {
+  return readDetail(row, key, 'after') || readDetail(row, key) || readDetail(row, key, 'before');
+}
+
+function extractPtId(row: AuditLogRow): string | null {
+  const ptId = readDetailAny(row, 'pt_id');
+  if (ptId) return ptId;
+  if (row.target_table === 'picktickets') {
+    return toText(row.target_id);
+  }
+  return null;
+}
+
+function formatLaneLabel(value: string | null): string {
+  if (value === null) return 'Unknown lane';
+  if (!value.trim()) return 'Unassigned';
+  return `Lane ${value}`;
+}
+
+function humanizeValue(value: string): string {
+  return value.replace(/_/g, ' ');
+}
+
+function getActionLabel(action: string): string {
+  if (action === 'INSERT') return 'Created';
+  if (action === 'UPDATE') return 'Updated';
+  if (action === 'DELETE') return 'Deleted';
+  if (action === 'MOVE') return 'Moved';
+  return action;
+}
+
+function getFriendlyTableName(tableName: string): string {
+  return tableName.replace(/_/g, ' ');
+}
+
+function combineLaneMoveLogs(logs: AuditLogRow[]): AuditLogRow[] {
+  const consumedIds = new Set<number>();
+  const combined: AuditLogRow[] = [];
+  const maxLookahead = 12;
+  const maxMoveDeltaMs = 20_000;
+
+  for (let i = 0; i < logs.length; i += 1) {
+    const row = logs[i];
+    if (consumedIds.has(row.id)) continue;
+
+    if (row.target_table === 'lane_assignments' && row.action === 'INSERT') {
+      const insertPtId = extractPtId(row);
+      const insertLane = readDetailAny(row, 'lane_number');
+      const insertTimestamp = Date.parse(row.created_at);
+
+      if (insertPtId && insertLane && Number.isFinite(insertTimestamp)) {
+        for (let j = i + 1; j < Math.min(logs.length, i + maxLookahead + 1); j += 1) {
+          const candidate = logs[j];
+          if (consumedIds.has(candidate.id)) continue;
+          if (candidate.target_table !== 'lane_assignments' || candidate.action !== 'DELETE') continue;
+          if ((candidate.user_id || '') !== (row.user_id || '')) continue;
+          if (extractPtId(candidate) !== insertPtId) continue;
+
+          const deleteLane = readDetailAny(candidate, 'lane_number');
+          if (!deleteLane || deleteLane === insertLane) continue;
+
+          const deleteTimestamp = Date.parse(candidate.created_at);
+          if (!Number.isFinite(deleteTimestamp)) continue;
+          const deltaMs = insertTimestamp - deleteTimestamp;
+          if (deltaMs < 0 || deltaMs > maxMoveDeltaMs) continue;
+
+          consumedIds.add(row.id);
+          consumedIds.add(candidate.id);
+
+          combined.push({
+            ...row,
+            action: 'MOVE',
+            target_id: insertPtId,
+            details: {
+              operation: 'combined_lane_move',
+              pt_id: insertPtId,
+              pt_number: readDetailAny(row, 'pt_number') || readDetailAny(candidate, 'pt_number'),
+              po_number: readDetailAny(row, 'po_number') || readDetailAny(candidate, 'po_number'),
+              from_lane: deleteLane,
+              to_lane: insertLane,
+              source_log_ids: [candidate.id, row.id],
+              source: {
+                delete: candidate.details,
+                insert: row.details
+              }
+            }
+          });
+          break;
+        }
+      }
+    }
+
+    if (consumedIds.has(row.id)) continue;
+    consumedIds.add(row.id);
+    combined.push(row);
+  }
+
+  return combined;
+}
+
+function buildAuditSummary(
+  row: AuditLogRow,
+  pickticketsById: Map<string, PickticketLookupRow>
+): string {
+  const ptId = extractPtId(row);
+  const pickedFromLookup = ptId ? pickticketsById.get(ptId) : null;
+  const ptNumber = readDetailAny(row, 'pt_number') || pickedFromLookup?.pt_number || null;
+  const poNumber = readDetailAny(row, 'po_number') || pickedFromLookup?.po_number || null;
+  const ptLabel = ptNumber
+    ? `PT ${ptNumber}${poNumber ? ` / PO ${poNumber}` : ''}`
+    : (ptId ? `PT ID ${ptId}` : 'PT');
+
+  if (row.target_table === 'lane_assignments') {
+    const laneBefore = readDetail(row, 'lane_number', 'before') || readDetailAny(row, 'from_lane');
+    const laneAfter = readDetail(row, 'lane_number', 'after') || readDetailAny(row, 'to_lane') || readDetailAny(row, 'lane_number');
+    const palletBefore = readDetail(row, 'pallet_count', 'before');
+    const palletAfter = readDetail(row, 'pallet_count', 'after') || readDetailAny(row, 'pallet_count');
+
+    if (row.action === 'MOVE' || (row.action === 'UPDATE' && laneBefore && laneAfter && laneBefore !== laneAfter)) {
+      return `${ptLabel} moved from ${formatLaneLabel(laneBefore)} to ${formatLaneLabel(laneAfter)}`;
+    }
+
+    if (row.action === 'INSERT') {
+      return `${ptLabel} assigned to ${formatLaneLabel(laneAfter || laneBefore)}`;
+    }
+
+    if (row.action === 'DELETE') {
+      return `${ptLabel} removed from ${formatLaneLabel(laneBefore || laneAfter)}`;
+    }
+
+    if (row.action === 'UPDATE' && palletBefore && palletAfter && palletBefore !== palletAfter) {
+      const laneText = laneAfter || laneBefore;
+      return `${ptLabel} pallet count changed${laneText ? ` in ${formatLaneLabel(laneText)}` : ''}: ${palletBefore} -> ${palletAfter}`;
+    }
+
+    return `${ptLabel} lane assignment updated${laneAfter ? ` in ${formatLaneLabel(laneAfter)}` : ''}`;
+  }
+
+  if (row.target_table === 'picktickets') {
+    const statusBefore = readDetail(row, 'status', 'before');
+    const statusAfter = readDetail(row, 'status', 'after') || readDetailAny(row, 'status');
+    const laneBefore = readDetail(row, 'assigned_lane', 'before');
+    const laneAfter = readDetail(row, 'assigned_lane', 'after') || readDetailAny(row, 'assigned_lane');
+    const palletBefore = readDetail(row, 'actual_pallet_count', 'before');
+    const palletAfter = readDetail(row, 'actual_pallet_count', 'after') || readDetailAny(row, 'actual_pallet_count');
+
+    if (row.action === 'INSERT') return `${ptLabel} created`;
+    if (row.action === 'DELETE') return `${ptLabel} deleted`;
+
+    if (statusBefore && statusAfter && statusBefore !== statusAfter) {
+      return `${ptLabel} status changed: ${humanizeValue(statusBefore)} -> ${humanizeValue(statusAfter)}`;
+    }
+
+    if ((laneBefore || laneAfter) && laneBefore !== laneAfter) {
+      return `${ptLabel} lane changed: ${formatLaneLabel(laneBefore)} -> ${formatLaneLabel(laneAfter)}`;
+    }
+
+    if ((palletBefore || palletAfter) && palletBefore !== palletAfter) {
+      return `${ptLabel} pallet count changed: ${palletBefore || '0'} -> ${palletAfter || '0'}`;
+    }
+
+    return `${ptLabel} updated`;
+  }
+
+  if (row.target_table === 'shipment_pts') {
+    const shipmentId = readDetailAny(row, 'shipment_id');
+    if (row.action === 'INSERT') return `${ptLabel} added to shipment staging${shipmentId ? ` (Shipment ${shipmentId})` : ''}`;
+    if (row.action === 'DELETE') return `${ptLabel} removed from shipment staging${shipmentId ? ` (Shipment ${shipmentId})` : ''}`;
+    return `${ptLabel} shipment staging link updated${shipmentId ? ` (Shipment ${shipmentId})` : ''}`;
+  }
+
+  if (row.target_table === 'shipments') {
+    const puNumber = readDetailAny(row, 'pu_number') || row.target_id || 'Unknown PU';
+    const statusBefore = readDetail(row, 'status', 'before');
+    const statusAfter = readDetail(row, 'status', 'after') || readDetailAny(row, 'status');
+    const stagingBefore = readDetail(row, 'staging_lane', 'before');
+    const stagingAfter = readDetail(row, 'staging_lane', 'after') || readDetailAny(row, 'staging_lane');
+    const archivedBefore = readDetail(row, 'archived', 'before');
+    const archivedAfter = readDetail(row, 'archived', 'after') || readDetailAny(row, 'archived');
+
+    if (row.action === 'INSERT') return `PU ${puNumber} shipment created`;
+    if (row.action === 'DELETE') return `PU ${puNumber} shipment deleted`;
+
+    if (statusBefore && statusAfter && statusBefore !== statusAfter) {
+      return `PU ${puNumber} status changed: ${humanizeValue(statusBefore)} -> ${humanizeValue(statusAfter)}`;
+    }
+
+    if ((stagingBefore || stagingAfter) && stagingBefore !== stagingAfter) {
+      return `PU ${puNumber} staging lane changed: ${formatLaneLabel(stagingBefore)} -> ${formatLaneLabel(stagingAfter)}`;
+    }
+
+    if ((archivedBefore || archivedAfter) && archivedBefore !== archivedAfter) {
+      if (archivedAfter === 'true') return `PU ${puNumber} marked archived`;
+      if (archivedAfter === 'false') return `PU ${puNumber} unarchived`;
+    }
+
+    return `PU ${puNumber} shipment updated`;
+  }
+
+  const laneNumber = readDetailAny(row, 'lane_number');
+  const containerNumber = readDetailAny(row, 'container_number');
+  const parts: string[] = [];
+  if (ptNumber) parts.push(`PT ${ptNumber}`);
+  else if (ptId) parts.push(`PT ID ${ptId}`);
+  if (laneNumber) parts.push(formatLaneLabel(laneNumber));
+  if (containerNumber) parts.push(`Container ${containerNumber}`);
+
+  if (parts.length > 0) {
+    return `${getActionLabel(row.action)} ${getFriendlyTableName(row.target_table)}: ${parts.join(' · ')}`;
+  }
+
+  return `${getActionLabel(row.action)} ${getFriendlyTableName(row.target_table)}`;
+}
+
 export async function GET(request: NextRequest) {
   const authResult = await requireAdmin(request);
   if (!authResult.ok) {
@@ -60,7 +323,8 @@ export async function GET(request: NextRequest) {
     );
   }
 
-  const logs = (logsData || []) as AuditLogRow[];
+  const rawLogs = (logsData || []) as AuditLogRow[];
+  const logs = combineLaneMoveLogs(rawLogs);
   const actorIds = Array.from(new Set(logs.map((row) => row.user_id).filter((id): id is string => Boolean(id))));
 
   let profilesById = new Map<string, UserProfileRow>();
@@ -74,13 +338,34 @@ export async function GET(request: NextRequest) {
     profilesById = new Map(profiles.map((profile) => [profile.id, profile]));
   }
 
-  const rows = logs.map((row) => {
+  const ptIds = Array.from(
+    new Set(
+      logs
+        .map((row) => extractPtId(row))
+        .filter((id): id is string => typeof id === 'string' && /^\d+$/.test(id))
+    )
+  );
+
+  const pickticketsById = new Map<string, PickticketLookupRow>();
+  if (ptIds.length > 0) {
+    const { data: pickticketsData } = await supabaseAdmin
+      .from('picktickets')
+      .select('id, pt_number, po_number')
+      .in('id', ptIds.map((id) => Number(id)));
+
+    ((pickticketsData || []) as PickticketLookupRow[]).forEach((pickticket) => {
+      pickticketsById.set(String(pickticket.id), pickticket);
+    });
+  }
+
+  const rows: AuditLogResponseRow[] = logs.map((row) => {
     const actor = row.user_id ? profilesById.get(row.user_id) : null;
     return {
       ...row,
       actor_username: actor?.username || null,
       actor_display_name: actor?.display_name || null,
-      actor_role: actor?.role || null
+      actor_role: actor?.role || null,
+      summary: buildAuditSummary(row, pickticketsById)
     };
   });
 
