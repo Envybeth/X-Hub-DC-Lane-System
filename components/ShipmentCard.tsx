@@ -1440,7 +1440,7 @@ export default function ShipmentCard({
 
       {/* Toast */}
       {toast && (
-        <div className={`fixed top-4 right-4 z-[110] px-4 md:px-6 py-2 md:py-3 rounded-lg font-semibold shadow-lg animate-fade-in text-sm md:text-base ${toast.type === 'success' ? 'bg-green-600' : 'bg-red-600'
+        <div className={`fixed top-4 left-1/2 -translate-x-1/2 z-[110] px-5 md:px-8 py-3 md:py-4 rounded-xl font-semibold shadow-2xl animate-toast-fade-in-out text-base md:text-lg text-center max-w-[92vw] ${toast.type === 'success' ? 'bg-green-600' : 'bg-red-600'
           }`}>
           {toast.message}
         </div>
