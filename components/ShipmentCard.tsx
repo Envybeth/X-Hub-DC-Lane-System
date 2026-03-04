@@ -43,6 +43,16 @@ export interface Shipment {
 }
 
 const SHIPMENT_STATUS_OPTIONS: Shipment['status'][] = ['not_started', 'in_process', 'finalized'];
+const PICKTICKET_STATUS_OPTIONS = ['unlabeled', 'labeled', 'staged', 'ready_to_ship', 'shipped'] as const;
+type PickticketStatusOption = (typeof PICKTICKET_STATUS_OPTIONS)[number];
+
+function normalizeAdminPtStatus(status?: string | null): PickticketStatusOption {
+  const normalized = (status || '').trim().toLowerCase();
+  if (PICKTICKET_STATUS_OPTIONS.includes(normalized as PickticketStatusOption)) {
+    return normalized as PickticketStatusOption;
+  }
+  return 'unlabeled';
+}
 
 export interface ShipmentCardProps {
   shipment: Shipment;
@@ -82,7 +92,7 @@ export default function ShipmentCard({
   const [adminShipmentStatus, setAdminShipmentStatus] = useState<Shipment['status']>(shipment.status);
   const [adminShipmentArchived, setAdminShipmentArchived] = useState(Boolean(shipment.archived));
   const [adminSavingShipmentStatus, setAdminSavingShipmentStatus] = useState(false);
-  const [adminPtStatusById, setAdminPtStatusById] = useState<Record<number, string>>({});
+  const [adminPtStatusById, setAdminPtStatusById] = useState<Record<number, PickticketStatusOption>>({});
   const [adminSavingPtIds, setAdminSavingPtIds] = useState<number[]>([]);
 
   //ocr
@@ -368,9 +378,9 @@ export default function ShipmentCard({
   async function handleAdminSavePtStatus(pt: ShipmentPT) {
     if (!allowAdminStatusEdit) return;
 
-    const nextStatus = (adminPtStatusById[pt.id] ?? pt.status ?? '').trim();
-    if (!nextStatus) {
-      showToast('PT status cannot be empty', 'error');
+    const nextStatus = adminPtStatusById[pt.id] ?? normalizeAdminPtStatus(pt.status);
+    if (!PICKTICKET_STATUS_OPTIONS.includes(nextStatus)) {
+      showToast('Select a valid PT status', 'error');
       return;
     }
 
@@ -1313,16 +1323,21 @@ export default function ShipmentCard({
                                 <span className="text-xs md:text-sm text-indigo-200 font-semibold whitespace-nowrap">
                                   Admin PT status
                                 </span>
-                                <input
-                                  type="text"
-                                  value={adminPtStatusById[pt.id] ?? pt.status ?? ''}
+                                <select
+                                  value={adminPtStatusById[pt.id] ?? normalizeAdminPtStatus(pt.status)}
                                   onChange={(event) => {
-                                    const nextValue = event.target.value;
+                                    const nextValue = event.target.value as PickticketStatusOption;
+                                    if (!PICKTICKET_STATUS_OPTIONS.includes(nextValue)) return;
                                     setAdminPtStatusById((prev) => ({ ...prev, [pt.id]: nextValue }));
                                   }}
-                                  placeholder="Enter status"
                                   className="flex-1 bg-gray-900 border border-indigo-600 text-white rounded px-3 py-2 text-sm md:text-base"
-                                />
+                                >
+                                  {PICKTICKET_STATUS_OPTIONS.map((statusOption) => (
+                                    <option key={statusOption} value={statusOption}>
+                                      {statusOption}
+                                    </option>
+                                  ))}
+                                </select>
                                 <button
                                   onClick={() => handleAdminSavePtStatus(pt)}
                                   disabled={adminSavingPtIds.includes(pt.id)}
