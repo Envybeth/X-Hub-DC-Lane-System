@@ -628,7 +628,7 @@ export default function AssignModal({
       // Check if this lane is a staging lane for any shipment
       const { data: shipmentData, error: shipmentDataError } = await supabase
         .from('shipments')
-        .select('id, pu_number, staging_lane, status')
+        .select('id, pu_number, pu_date, staging_lane, status')
         .eq('staging_lane', lane.lane_number)
         .eq('archived', false)
         .maybeSingle();
@@ -642,6 +642,26 @@ export default function AssignModal({
       );
 
       const totalNewAssignments = previewCompiledGroups.length + individualSelectionOrder.length;
+
+      let effectiveShipmentStatus = shipmentData?.status || null;
+      if (isTargetLaneStaging && shipmentData && shipmentData.status === 'finalized' && totalNewAssignments > 0) {
+        const reopenTimestamp = new Date().toISOString();
+        const { error: reopenShipmentError } = await supabase
+          .from('shipments')
+          .update({ status: 'in_process', updated_at: reopenTimestamp })
+          .eq('id', shipmentData.id);
+        throwIfSupabaseError(reopenShipmentError, 'Failed to reopen finalized shipment');
+
+        const { error: demoteReadyError } = await supabase
+          .from('picktickets')
+          .update({ status: 'staged' })
+          .eq('pu_number', shipmentData.pu_number)
+          .eq('pu_date', shipmentData.pu_date)
+          .eq('status', 'ready_to_ship');
+        throwIfSupabaseError(demoteReadyError, 'Failed to demote ready-to-ship PTs after reopening shipment');
+
+        effectiveShipmentStatus = 'in_process';
+      }
 
       // Make room at the front once, then insert all new assignments in deterministic order.
       if (totalNewAssignments > 0) {
@@ -674,7 +694,7 @@ export default function AssignModal({
         nextOrderPosition += 1;
 
         const ptStatus = isTargetLaneStaging
-          ? (shipmentData.status === 'finalized' ? 'ready_to_ship' : 'staged')
+          ? (effectiveShipmentStatus === 'finalized' ? 'ready_to_ship' : 'staged')
           : 'labeled';
 
         const { error: updatePickticketError } = await supabase
@@ -735,7 +755,7 @@ export default function AssignModal({
           }
 
           // Update PT status for compiled group
-          const compiledStatus = shipmentData.status === 'finalized' ? 'ready_to_ship' : 'staged';
+          const compiledStatus = effectiveShipmentStatus === 'finalized' ? 'ready_to_ship' : 'staged';
           const { error: compiledStatusError } = await supabase
             .from('picktickets')
             .update({ status: compiledStatus })

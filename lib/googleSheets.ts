@@ -1,6 +1,7 @@
 import 'server-only';
 import { google } from 'googleapis';
 import { getSupabaseAdmin } from './supabaseAdmin';
+import { buildPuLoadKey, normalizePuDate, normalizePuNumber } from './shipmentIdentity';
 
 function parseDate(dateStr: string | undefined): string | null {
   if (!dateStr || dateStr.trim() === '') return null;
@@ -46,6 +47,42 @@ const auth = getGoogleAuth();
 const sheets = google.sheets({ version: 'v4', auth });
 const UPSERT_CHUNK_SIZE = 500;
 
+type SupabaseAdminClient = ReturnType<typeof getSupabaseAdmin>;
+
+type ShipmentRow = {
+  id: number;
+  pu_number: string | null;
+  pu_date: string | null;
+  staging_lane: string | null;
+  status: string | null;
+  carrier: string | null;
+  archived: boolean | null;
+  updated_at: string | null;
+  created_at: string | null;
+};
+
+type ShipmentPtRow = {
+  shipment_id: number;
+  pt_id: number;
+  original_lane: string | null;
+  removed_from_staging: boolean | null;
+};
+
+type PickticketStateRow = {
+  id: number;
+  pu_number: string | null;
+  pu_date: string | null;
+  status: string | null;
+  carrier: string | null;
+};
+
+type ReconcileResult = {
+  shipmentRowsNormalized: number;
+  shipmentDatesReconciled: number;
+  mergedRows: number;
+  finalizedReopened: number;
+};
+
 function chunkArray<T>(items: T[], chunkSize: number): T[][] {
   if (chunkSize <= 0) return [items];
   const chunks: T[][] = [];
@@ -57,6 +94,306 @@ function chunkArray<T>(items: T[], chunkSize: number): T[][] {
 
 function quoteSheetNameForRange(sheetName: string): string {
   return `'${sheetName.replace(/'/g, "''")}'`;
+}
+
+function trimToNull(value?: string | null): string | null {
+  if (value === null || value === undefined) return null;
+  const trimmed = String(value).trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function parseInteger(value?: string): number | null {
+  if (!value || value.trim() === '') return null;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isNaN(parsed) ? null : parsed;
+}
+
+function parseDecimal(value?: string): number | null {
+  if (!value || value.trim() === '') return null;
+  const parsed = Number.parseFloat(value);
+  return Number.isNaN(parsed) ? null : parsed;
+}
+
+function statusRank(status?: string | null): number {
+  const normalized = (status || '').trim().toLowerCase();
+  if (normalized === 'finalized') return 3;
+  if (normalized === 'in_process') return 2;
+  if (normalized === 'not_started') return 1;
+  return 0;
+}
+
+function pickHigherShipmentStatus(a?: string | null, b?: string | null): string {
+  return statusRank(a) >= statusRank(b) ? (a || 'not_started') : (b || 'not_started');
+}
+
+async function loadShipmentRows(supabaseAdmin: SupabaseAdminClient): Promise<ShipmentRow[]> {
+  const { data, error } = await supabaseAdmin
+    .from('shipments')
+    .select('id, pu_number, pu_date, staging_lane, status, carrier, archived, updated_at, created_at');
+  if (error) throw error;
+  return (data || []) as ShipmentRow[];
+}
+
+async function loadShipmentPtRows(
+  supabaseAdmin: SupabaseAdminClient,
+  shipmentIds: number[]
+): Promise<ShipmentPtRow[]> {
+  if (shipmentIds.length === 0) return [];
+  const links: ShipmentPtRow[] = [];
+
+  for (const chunk of chunkArray(shipmentIds, UPSERT_CHUNK_SIZE)) {
+    const { data, error } = await supabaseAdmin
+      .from('shipment_pts')
+      .select('shipment_id, pt_id, original_lane, removed_from_staging')
+      .in('shipment_id', chunk);
+    if (error) throw error;
+    links.push(...(((data || []) as ShipmentPtRow[])));
+  }
+
+  return links;
+}
+
+async function loadPickticketStateRows(supabaseAdmin: SupabaseAdminClient): Promise<PickticketStateRow[]> {
+  const { data, error } = await supabaseAdmin
+    .from('picktickets')
+    .select('id, pu_number, pu_date, status, carrier')
+    .not('pu_number', 'is', null)
+    .not('pu_date', 'is', null)
+    .neq('customer', 'PAPER');
+  if (error) throw error;
+  return (data || []) as PickticketStateRow[];
+}
+
+async function mergeShipmentRows(
+  supabaseAdmin: SupabaseAdminClient,
+  sourceRow: ShipmentRow,
+  targetRow: ShipmentRow,
+  sourceLinks: ShipmentPtRow[],
+  nowIso: string
+): Promise<void> {
+  for (const sourceLink of sourceLinks) {
+    const { error: upsertLinkError } = await supabaseAdmin
+      .from('shipment_pts')
+      .upsert({
+        shipment_id: targetRow.id,
+        pt_id: sourceLink.pt_id,
+        original_lane: sourceLink.original_lane,
+        removed_from_staging: Boolean(sourceLink.removed_from_staging)
+      }, {
+        onConflict: 'shipment_id,pt_id'
+      });
+    if (upsertLinkError) throw upsertLinkError;
+  }
+
+  if (sourceLinks.length > 0) {
+    const { error: deleteSourceLinksError } = await supabaseAdmin
+      .from('shipment_pts')
+      .delete()
+      .eq('shipment_id', sourceRow.id);
+    if (deleteSourceLinksError) throw deleteSourceLinksError;
+  }
+
+  const mergedStatus = pickHigherShipmentStatus(sourceRow.status, targetRow.status);
+  const mergedCarrier = trimToNull(targetRow.carrier) || trimToNull(sourceRow.carrier);
+  const mergedStagingLane = trimToNull(targetRow.staging_lane) || trimToNull(sourceRow.staging_lane);
+  const mergedArchived = Boolean(targetRow.archived) && Boolean(sourceRow.archived);
+
+  const { error: updateTargetError } = await supabaseAdmin
+    .from('shipments')
+    .update({
+      carrier: mergedCarrier,
+      staging_lane: mergedStagingLane,
+      status: mergedStatus,
+      archived: mergedArchived,
+      updated_at: nowIso
+    })
+    .eq('id', targetRow.id);
+  if (updateTargetError) throw updateTargetError;
+
+  const { error: deleteSourceError } = await supabaseAdmin
+    .from('shipments')
+    .delete()
+    .eq('id', sourceRow.id);
+  if (deleteSourceError) throw deleteSourceError;
+}
+
+async function reconcileShipmentIdentityAndStatus(
+  supabaseAdmin: SupabaseAdminClient
+): Promise<ReconcileResult> {
+  const result: ReconcileResult = {
+    shipmentRowsNormalized: 0,
+    shipmentDatesReconciled: 0,
+    mergedRows: 0,
+    finalizedReopened: 0
+  };
+
+  const nowIso = new Date().toISOString();
+  const shipments = await loadShipmentRows(supabaseAdmin);
+  if (shipments.length === 0) {
+    return result;
+  }
+
+  const shipmentIds = shipments.map((row) => row.id);
+  const shipmentPtRows = await loadShipmentPtRows(supabaseAdmin, shipmentIds);
+  const pickticketRows = await loadPickticketStateRows(supabaseAdmin);
+
+  const pickticketById = new Map<number, PickticketStateRow>();
+  const nonShippedPtIdsByPuKey = new Map<string, number[]>();
+  const readyToShipPtIdsByPuKey = new Map<string, number[]>();
+  const carrierByPuKey = new Map<string, string>();
+
+  pickticketRows.forEach((row) => {
+    const normalizedPuNumber = normalizePuNumber(row.pu_number);
+    const normalizedPuDate = normalizePuDate(row.pu_date);
+    const key = buildPuLoadKey(normalizedPuNumber, normalizedPuDate);
+    if (!normalizedPuNumber || !normalizedPuDate || !key) return;
+
+    const normalizedCarrier = trimToNull(row.carrier);
+    pickticketById.set(row.id, {
+      ...row,
+      pu_number: normalizedPuNumber,
+      pu_date: normalizedPuDate,
+      carrier: normalizedCarrier
+    });
+
+    if (normalizedCarrier && !carrierByPuKey.has(key)) {
+      carrierByPuKey.set(key, normalizedCarrier);
+    }
+
+    const normalizedStatus = (row.status || '').trim().toLowerCase();
+    if (normalizedStatus !== 'shipped') {
+      const ids = nonShippedPtIdsByPuKey.get(key) || [];
+      ids.push(row.id);
+      nonShippedPtIdsByPuKey.set(key, ids);
+    }
+    if (normalizedStatus === 'ready_to_ship') {
+      const ids = readyToShipPtIdsByPuKey.get(key) || [];
+      ids.push(row.id);
+      readyToShipPtIdsByPuKey.set(key, ids);
+    }
+  });
+
+  const linksByShipmentId = new Map<number, ShipmentPtRow[]>();
+  shipmentPtRows.forEach((row) => {
+    const existing = linksByShipmentId.get(row.shipment_id) || [];
+    existing.push(row);
+    linksByShipmentId.set(row.shipment_id, existing);
+  });
+
+  for (const shipment of shipments) {
+    const shipmentLinks = linksByShipmentId.get(shipment.id) || [];
+    const linkedKeys = new Set<string>();
+
+    shipmentLinks.forEach((linkRow) => {
+      const ptRow = pickticketById.get(linkRow.pt_id);
+      const key = buildPuLoadKey(ptRow?.pu_number, ptRow?.pu_date);
+      if (key) linkedKeys.add(key);
+    });
+
+    const normalizedShipmentPu = normalizePuNumber(shipment.pu_number);
+    const normalizedShipmentDate = normalizePuDate(shipment.pu_date);
+    const originalKey = buildPuLoadKey(shipment.pu_number, shipment.pu_date);
+    const normalizedKey = buildPuLoadKey(normalizedShipmentPu, normalizedShipmentDate);
+    const canonicalLinkedKey = linkedKeys.size === 1 ? Array.from(linkedKeys)[0] : null;
+    const targetKey = canonicalLinkedKey || normalizedKey;
+
+    if (!targetKey) continue;
+    const [targetPuNumber, targetPuDate] = targetKey.split('::');
+    const targetCarrier = carrierByPuKey.get(targetKey) || trimToNull(shipment.carrier);
+
+    const puChanged = trimToNull(shipment.pu_number) !== targetPuNumber;
+    const puDateChanged = normalizePuDate(shipment.pu_date) !== targetPuDate;
+    const carrierChanged = trimToNull(shipment.carrier) !== targetCarrier;
+    if (!puChanged && !puDateChanged && !carrierChanged) {
+      continue;
+    }
+
+    const { data: conflictingRows, error: conflictingRowsError } = await supabaseAdmin
+      .from('shipments')
+      .select('id, pu_number, pu_date, staging_lane, status, carrier, archived, updated_at, created_at')
+      .eq('pu_number', targetPuNumber)
+      .eq('pu_date', targetPuDate)
+      .neq('id', shipment.id)
+      .order('id', { ascending: false })
+      .limit(1);
+    if (conflictingRowsError) throw conflictingRowsError;
+
+    const conflictingRow = ((conflictingRows || []) as ShipmentRow[])[0];
+    if (conflictingRow) {
+      await mergeShipmentRows(supabaseAdmin, shipment, conflictingRow, shipmentLinks, nowIso);
+      result.mergedRows += 1;
+      continue;
+    }
+
+    const { error: updateShipmentError } = await supabaseAdmin
+      .from('shipments')
+      .update({
+        pu_number: targetPuNumber,
+        pu_date: targetPuDate,
+        carrier: targetCarrier,
+        updated_at: nowIso
+      })
+      .eq('id', shipment.id);
+    if (updateShipmentError) throw updateShipmentError;
+
+    if (puChanged || carrierChanged || !originalKey || originalKey !== normalizedKey) {
+      result.shipmentRowsNormalized += 1;
+    }
+    if (puDateChanged || (canonicalLinkedKey && canonicalLinkedKey !== originalKey)) {
+      result.shipmentDatesReconciled += 1;
+    }
+  }
+
+  const reconciledShipments = await loadShipmentRows(supabaseAdmin);
+  const activeShipments = reconciledShipments.filter((row) => !Boolean(row.archived));
+  if (activeShipments.length === 0) {
+    return result;
+  }
+
+  const activeShipmentIds = activeShipments.map((row) => row.id);
+  const reconciledShipmentPtRows = await loadShipmentPtRows(supabaseAdmin, activeShipmentIds);
+  const linkedPtIdsByShipment = new Map<number, Set<number>>();
+  reconciledShipmentPtRows.forEach((row) => {
+    const existing = linkedPtIdsByShipment.get(row.shipment_id) || new Set<number>();
+    existing.add(row.pt_id);
+    linkedPtIdsByShipment.set(row.shipment_id, existing);
+  });
+
+  for (const shipment of activeShipments) {
+    if ((shipment.status || '').trim().toLowerCase() !== 'finalized') continue;
+
+    const key = buildPuLoadKey(shipment.pu_number, shipment.pu_date);
+    if (!key) continue;
+
+    const expectedPtIds = nonShippedPtIdsByPuKey.get(key) || [];
+    if (expectedPtIds.length === 0) continue;
+
+    const linkedPtIds = linkedPtIdsByShipment.get(shipment.id) || new Set<number>();
+    const hasNewUnlinkedPt = expectedPtIds.some((ptId) => !linkedPtIds.has(ptId));
+    if (!hasNewUnlinkedPt) continue;
+
+    const readyToShipIds = readyToShipPtIdsByPuKey.get(key) || [];
+    if (readyToShipIds.length > 0) {
+      const { error: demoteError } = await supabaseAdmin
+        .from('picktickets')
+        .update({ status: 'staged' })
+        .in('id', readyToShipIds);
+      if (demoteError) throw demoteError;
+    }
+
+    const { error: reopenError } = await supabaseAdmin
+      .from('shipments')
+      .update({
+        status: 'in_process',
+        updated_at: nowIso
+      })
+      .eq('id', shipment.id);
+    if (reopenError) throw reopenError;
+
+    result.finalizedReopened += 1;
+  }
+
+  return result;
 }
 
 async function resolveSourceSheetName(spreadsheetId: string): Promise<string> {
@@ -152,45 +489,57 @@ export async function syncGoogleSheetData() {
         pickup_status,     // S (18)
       ] = row;
 
+      const normalizedCustomer = trimToNull(customer);
+      const normalizedStoreDc = trimToNull(store_dc);
+      const normalizedPtNumber = trimToNull(pt_number);
+      const normalizedPoNumber = trimToNull(po_number);
+      const normalizedDeptNumber = trimToNull(dept_number);
+      const normalizedCtn = trimToNull(ctn);
+      const normalizedContainerNumber = trimToNull(container_number);
+      const normalizedRoutingNumber = trimToNull(routing_number);
+      const normalizedPuNumber = normalizePuNumber(pu_number);
+      const normalizedCarrier = trimToNull(carrier);
+      const normalizedPickupStatus = trimToNull(pickup_status);
+
       // SKIP if already picked up
-      if (pickup_status && pickup_status.toLowerCase().includes('picked up')) {
+      if (normalizedPickupStatus && normalizedPickupStatus.toLowerCase().includes('picked up')) {
         skippedBreakdown.picked_up += 1;
         continue;
       }
 
       // SKIP if customer is PAPER
-      if (customer && customer.trim().toUpperCase() === 'PAPER') {
+      if (normalizedCustomer && normalizedCustomer.toUpperCase() === 'PAPER') {
         skippedBreakdown.paper += 1;
         continue;
       }
 
-      if (!pt_number || !po_number) {
+      if (!normalizedPtNumber || !normalizedPoNumber) {
         skippedBreakdown.missing_pt_or_po += 1;
         continue;
       }
 
-      if (container_number) {
-        containerNumbers.add(container_number);
+      if (normalizedContainerNumber) {
+        containerNumbers.add(normalizedContainerNumber);
       }
 
       pickticketRows.push({
-        customer,
-        store_dc,
-        pt_number,
-        po_number,
-        dept_number,
-        qty: qty ? parseInt(qty) : null,
-        ctn: ctn || null,
-        weight: weight ? parseFloat(weight) : null,
-        cubic_feet: cubic_feet ? parseFloat(cubic_feet) : null,
-        est_pallet: est_pallet ? parseInt(est_pallet) : null,
+        customer: normalizedCustomer || undefined,
+        store_dc: normalizedStoreDc || undefined,
+        pt_number: normalizedPtNumber,
+        po_number: normalizedPoNumber,
+        dept_number: normalizedDeptNumber || undefined,
+        qty: parseInteger(qty),
+        ctn: normalizedCtn,
+        weight: parseDecimal(weight),
+        cubic_feet: parseDecimal(cubic_feet),
+        est_pallet: parseInteger(est_pallet),
         start_date: parseDate(start_date),
         cancel_date: parseDate(cancel_date),
-        container_number: container_number || null,
-        routing_number: routing_number || null,
-        pu_number: pu_number || null,
-        carrier: carrier?.trim() || null,
-        pu_date: parseDate(pu_date),
+        container_number: normalizedContainerNumber,
+        routing_number: normalizedRoutingNumber,
+        pu_number: normalizedPuNumber,
+        carrier: normalizedCarrier,
+        pu_date: normalizePuDate(parseDate(pu_date)),
         last_synced_at: nowIso,
       });
     }
@@ -239,6 +588,8 @@ export async function syncGoogleSheetData() {
       }
     }
 
+    const reconcileResult = await reconcileShipmentIdentityAndStatus(supabaseAdmin);
+
     const skippedCount = skippedBreakdown.picked_up + skippedBreakdown.paper + skippedBreakdown.missing_pt_or_po;
     const success = errorCount === 0;
     const message = success
@@ -253,7 +604,8 @@ export async function syncGoogleSheetData() {
       skipped: skippedCount,
       skipped_breakdown: skippedBreakdown,
       errors: errorCount,
-      sourceSheet: sourceSheetName
+      sourceSheet: sourceSheetName,
+      reconciliation: reconcileResult
     };
 
   } catch (error) {

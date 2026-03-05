@@ -8,6 +8,7 @@ import StorageAddModal from './StorageAddModal';
 import StorageLaneModal from './StorageLaneModal';
 import { StorageAssignment, StorageGroup } from '@/types/storage';
 import { useRealtimeCoordinator } from './RealtimeProvider';
+import { normalizePuNumber } from '@/lib/shipmentIdentity';
 
 const LANE_GRID_FALLBACK_FULL_SYNC_MS = 180000;
 
@@ -36,14 +37,11 @@ interface LaneAssignmentRow {
 }
 
 interface ShipmentLaneRow {
+  id: number;
   staging_lane: string | null;
   pu_number: string;
   status: string;
-}
-
-interface LanePTStatusRow {
-  assigned_lane: string | null;
-  status: string | null;
+  updated_at: string | null;
 }
 
 function describeSupabaseError(error: { code?: string; message?: string; details?: string; hint?: string } | null) {
@@ -197,7 +195,7 @@ export default function LaneGrid({ readOnly = false }: LaneGridProps) {
       });
 
       const laneNumbers = laneRows.map((lane) => String(lane.lane_number));
-      const [assignmentResponse, shipmentResponse, ptStatusResponse] = await Promise.all([
+      const [assignmentResponse, shipmentResponse] = await Promise.all([
         laneNumbers.length > 0
           ? supabase
             .from('lane_assignments')
@@ -207,15 +205,9 @@ export default function LaneGrid({ readOnly = false }: LaneGridProps) {
         laneNumbers.length > 0
           ? supabase
             .from('shipments')
-            .select('staging_lane, pu_number, status')
+            .select('id, staging_lane, pu_number, status, updated_at')
             .eq('archived', false)
             .in('staging_lane', laneNumbers)
-          : Promise.resolve({ data: [], error: null }),
-        laneNumbers.length > 0
-          ? supabase
-            .from('picktickets')
-            .select('assigned_lane, status')
-            .in('assigned_lane', laneNumbers)
           : Promise.resolve({ data: [], error: null })
       ]);
 
@@ -224,9 +216,6 @@ export default function LaneGrid({ readOnly = false }: LaneGridProps) {
       }
       if (shipmentResponse.error) {
         console.error('Failed to load staging lanes:', shipmentResponse.error);
-      }
-      if (ptStatusResponse.error) {
-        console.error('Failed to load lane PT statuses:', ptStatusResponse.error);
       }
 
       const currentPalletsByLane = new Map<string, number>();
@@ -247,36 +236,23 @@ export default function LaneGrid({ readOnly = false }: LaneGridProps) {
           return;
         }
 
-        if (existing.status === 'cleared' && shipment.status !== 'cleared') {
+        const existingUpdatedAt = existing.updated_at ? new Date(existing.updated_at).getTime() : 0;
+        const candidateUpdatedAt = shipment.updated_at ? new Date(shipment.updated_at).getTime() : 0;
+        if (candidateUpdatedAt > existingUpdatedAt) {
           activeShipmentByLane.set(laneKey, shipment);
         }
-      });
-
-      const laneStatusCounts = new Map<string, { total: number; ready: number }>();
-      ((ptStatusResponse.data || []) as LanePTStatusRow[]).forEach((ptRow) => {
-        const laneKey = String(ptRow.assigned_lane || '').trim();
-        if (!laneKey) return;
-
-        const current = laneStatusCounts.get(laneKey) || { total: 0, ready: 0 };
-        current.total += 1;
-        if (String(ptRow.status || '').trim().toLowerCase() === 'ready_to_ship') {
-          current.ready += 1;
-        }
-        laneStatusCounts.set(laneKey, current);
       });
 
       const lanesWithCapacity = laneRows.map((lane) => {
         const laneKey = String(lane.lane_number);
         const activeShipment = activeShipmentByLane.get(laneKey);
-        const statusCounts = laneStatusCounts.get(laneKey);
-        const isReadyOnlyLane = !activeShipment && !!statusCounts && statusCounts.total > 0 && statusCounts.total === statusCounts.ready;
         const laneStorageAssignments = storageByLane.get(laneKey) || [];
 
         return {
           ...lane,
           current_pallets: currentPalletsByLane.get(laneKey) || 0,
-          isStaging: Boolean(activeShipment) || isReadyOnlyLane,
-          stagingPuNumber: activeShipment?.pu_number || null,
+          isStaging: Boolean(activeShipment),
+          stagingPuNumber: normalizePuNumber(activeShipment?.pu_number) || null,
           isFinalized: activeShipment?.status === 'finalized',
           hasStorage: laneStorageAssignments.length > 0,
           storageAssignments: laneStorageAssignments

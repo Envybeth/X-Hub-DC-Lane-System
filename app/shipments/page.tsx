@@ -9,6 +9,7 @@ import { exportShipmentSummaryPdf, ShipmentPdfLoad } from '@/lib/shipmentPdf';
 import { useAuth } from '@/components/AuthProvider';
 import { useRealtimeCoordinator } from '@/components/RealtimeProvider';
 import ActionToast from '@/components/ActionToast';
+import { buildPuLoadKey, normalizePuDate, normalizePuNumber } from '@/lib/shipmentIdentity';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const SHIPPED_TO_ARCHIVED_DAYS = 7;
@@ -61,7 +62,7 @@ type ShipmentPtRecordRow = {
 };
 
 function shipmentKey(shipment: Shipment) {
-  return `${shipment.pu_number}-${shipment.pu_date}`;
+  return buildPuLoadKey(shipment.pu_number, shipment.pu_date) || `${shipment.pu_number}-${shipment.pu_date}`;
 }
 
 function cloneShipmentSnapshot(shipment: Shipment): Shipment {
@@ -278,7 +279,9 @@ export default function ShipmentsPage() {
     const snapshotMap: ShipmentSnapshotMap = {};
     (data as StaleSnapshotRow[]).forEach((row) => {
       if (!row.snapshot) return;
-      snapshotMap[`${row.pu_number}-${row.pu_date}`] = row.snapshot;
+      const key = buildPuLoadKey(row.pu_number, row.pu_date);
+      if (!key) return;
+      snapshotMap[key] = row.snapshot;
     });
     setStaleSnapshots(snapshotMap);
     setStaleSnapshotStoreAvailable(true);
@@ -322,13 +325,16 @@ export default function ShipmentsPage() {
       }
 
       typedPTs.forEach(pt => {
-        const key = `${pt.pu_number}-${pt.pu_date}`;
+        const normalizedPuNumber = normalizePuNumber(pt.pu_number);
+        const normalizedPuDate = normalizePuDate(pt.pu_date);
+        const key = buildPuLoadKey(normalizedPuNumber, normalizedPuDate);
+        if (!normalizedPuNumber || !normalizedPuDate || !key) return;
         const isShipped = pt.status === 'shipped';
 
         if (!groupedShipments[key]) {
           groupedShipments[key] = {
-            pu_number: pt.pu_number!,
-            pu_date: pt.pu_date!,
+            pu_number: normalizedPuNumber,
+            pu_date: normalizedPuDate,
             carrier: pt.carrier || '',
             pts: [],
             staging_lane: null,
@@ -372,7 +378,8 @@ export default function ShipmentsPage() {
 
       const matchedShipmentRows: ShipmentRecordRow[] = [];
       ((shipmentRows || []) as ShipmentRecordRow[]).forEach((shipmentRow) => {
-        const key = `${shipmentRow.pu_number}-${shipmentRow.pu_date}`;
+        const key = buildPuLoadKey(shipmentRow.pu_number, shipmentRow.pu_date);
+        if (!key) return;
         const shipment = groupedShipments[key];
         if (!shipment) return;
 
@@ -402,7 +409,8 @@ export default function ShipmentsPage() {
         });
 
         matchedShipmentRows.forEach((shipmentRow) => {
-          const key = `${shipmentRow.pu_number}-${shipmentRow.pu_date}`;
+          const key = buildPuLoadKey(shipmentRow.pu_number, shipmentRow.pu_date);
+          if (!key) return;
           const shipment = groupedShipments[key];
           if (!shipment) return;
 
