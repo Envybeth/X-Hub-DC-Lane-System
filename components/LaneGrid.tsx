@@ -7,6 +7,9 @@ import AssignModal from './AssignModal';
 import StorageAddModal from './StorageAddModal';
 import StorageLaneModal from './StorageLaneModal';
 import { StorageAssignment, StorageGroup } from '@/types/storage';
+import { useRealtimeCoordinator } from './RealtimeProvider';
+
+const LANE_GRID_FALLBACK_FULL_SYNC_MS = 180000;
 
 interface Lane {
   id: number;
@@ -63,8 +66,10 @@ function isUnlabeledStatus(status?: string | null) {
 }
 
 export default function LaneGrid({ readOnly = false }: LaneGridProps) {
+  const { health: realtimeHealth, subscribeScope } = useRealtimeCoordinator();
   const [lanes, setLanes] = useState<Lane[]>([]);
   const [selectedLane, setSelectedLane] = useState<Lane | null>(null);
+  const [assignModalLaneTabs, setAssignModalLaneTabs] = useState<string[]>([]);
   const [showAssignModal, setShowAssignModal] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>('regular');
   const [storageAssignments, setStorageAssignments] = useState<StorageAssignment[]>([]);
@@ -303,62 +308,91 @@ export default function LaneGrid({ readOnly = false }: LaneGridProps) {
   }, [fetchLanes]);
 
   useEffect(() => {
-    const channel = supabase
-      .channel('lane-grid-realtime')
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'lanes' }, scheduleLaneRefresh)
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'lanes' }, scheduleLaneRefresh)
-      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'lanes' }, scheduleLaneRefresh)
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'lane_assignments' }, scheduleLaneRefresh)
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'lane_assignments' }, scheduleLaneRefresh)
-      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'lane_assignments' }, scheduleLaneRefresh)
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'picktickets' }, scheduleLaneRefresh)
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'picktickets' }, scheduleLaneRefresh)
-      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'picktickets' }, scheduleLaneRefresh)
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'shipments' }, scheduleLaneRefresh)
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'shipments' }, scheduleLaneRefresh)
-      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'shipments' }, scheduleLaneRefresh)
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'shipment_pts' }, scheduleLaneRefresh)
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'shipment_pts' }, scheduleLaneRefresh)
-      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'shipment_pts' }, scheduleLaneRefresh)
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'container_storage_assignments' }, scheduleLaneRefresh)
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'container_storage_assignments' }, scheduleLaneRefresh)
-      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'container_storage_assignments' }, scheduleLaneRefresh)
-      .subscribe();
+    const unsubscribe = subscribeScope('lane-grid', () => {
+      scheduleLaneRefresh();
+    });
+    return () => unsubscribe();
+  }, [scheduleLaneRefresh, subscribeScope]);
 
-    return () => {
-      if (laneRefreshTimerRef.current) {
-        window.clearTimeout(laneRefreshTimerRef.current);
-        laneRefreshTimerRef.current = null;
-      }
-      void supabase.removeChannel(channel);
-    };
-  }, [scheduleLaneRefresh]);
+  useEffect(() => {
+    if (realtimeHealth !== 'disconnected') return;
+    if (document.hidden) return;
+    void fetchLanes();
+  }, [fetchLanes, realtimeHealth]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (document.hidden) return;
+      void fetchLanes();
+    }, LANE_GRID_FALLBACK_FULL_SYNC_MS);
+
+    return () => window.clearInterval(timer);
+  }, [fetchLanes]);
 
   useEffect(() => {
     const laneQuery = searchParams.get('lane');
-    if (!laneQuery || lanes.length === 0) return;
+    const ptQuery = searchParams.get('pt');
+    if (!laneQuery || lanes.length === 0 || showAssignModal) return;
 
-    const targetLane = lanes.find((lane) => lane.lane_number === laneQuery);
-    if (!targetLane) return;
+    const targetLaneFromQuery = lanes.find((lane) => lane.lane_number === laneQuery);
+    if (!targetLaneFromQuery) return;
+    const targetLane = targetLaneFromQuery;
+    let cancelled = false;
+    let timer: number | null = null;
 
-    const timer = window.setTimeout(() => {
-      if (targetLane.hasStorage && targetLane.storageAssignments && targetLane.storageAssignments.length > 0) {
-        setStorageModalData({
-          mode: 'lane',
-          title: `Storage Lane ${targetLane.lane_number}`,
-          assignments: targetLane.storageAssignments
-        });
-        return;
+    async function openFromSearchResult() {
+      let laneTabs: string[] = [];
+
+      if (ptQuery) {
+        const ptId = Number.parseInt(ptQuery, 10);
+        if (Number.isFinite(ptId) && ptId > 0) {
+          const { data: assignmentRows, error: assignmentError } = await supabase
+            .from('lane_assignments')
+            .select('lane_number')
+            .eq('pt_id', ptId);
+
+          if (assignmentError) {
+            console.error('Failed to load PT lane tabs for assign modal:', assignmentError);
+          } else {
+            const uniqueLanes = Array.from(new Set(
+              (assignmentRows || [])
+                .map((row) => String(row.lane_number || '').trim())
+                .filter(Boolean)
+            ));
+            laneTabs = uniqueLanes.length > 1 ? sortLaneNumbers(uniqueLanes) : [];
+          }
+        }
       }
 
-      if (readOnly) return;
+      if (cancelled) return;
 
-      setSelectedLane(targetLane);
-      setShowAssignModal(true);
-    }, 0);
+      timer = window.setTimeout(() => {
+        if (targetLane.hasStorage && targetLane.storageAssignments && targetLane.storageAssignments.length > 0) {
+          setStorageModalData({
+            mode: 'lane',
+            title: `Storage Lane ${targetLane.lane_number}`,
+            assignments: targetLane.storageAssignments
+          });
+          return;
+        }
 
-    return () => window.clearTimeout(timer);
-  }, [searchParams, lanes, readOnly]);
+        if (readOnly) return;
+
+        setAssignModalLaneTabs(laneTabs);
+        setSelectedLane(targetLane);
+        setShowAssignModal(true);
+      }, 0);
+    }
+
+    void openFromSearchResult();
+
+    return () => {
+      cancelled = true;
+      if (timer !== null) {
+        window.clearTimeout(timer);
+      }
+    };
+  }, [searchParams, lanes, readOnly, showAssignModal]);
 
   const storageContainerGroups = useMemo(() => {
     const byContainer = new Map<string, { assignments: StorageAssignment[]; customers: Set<string>; laneNumbers: Set<string> }>();
@@ -432,13 +466,21 @@ export default function LaneGrid({ readOnly = false }: LaneGridProps) {
       return;
     }
 
+    setAssignModalLaneTabs([]);
     setSelectedLane(lane);
     setShowAssignModal(true);
+  }
+
+  function handleAssignModalLaneTabSelect(laneNumber: string) {
+    const targetLane = lanes.find((lane) => String(lane.lane_number) === String(laneNumber));
+    if (!targetLane) return;
+    setSelectedLane(targetLane);
   }
 
   function handleAssignModalClose() {
     setShowAssignModal(false);
     setSelectedLane(null);
+    setAssignModalLaneTabs([]);
     fetchLanes();
     router.replace('/', { scroll: false });
   }
@@ -642,6 +684,8 @@ export default function LaneGrid({ readOnly = false }: LaneGridProps) {
         <AssignModal
           lane={selectedLane}
           onClose={handleAssignModalClose}
+          laneTabs={assignModalLaneTabs}
+          onSelectLaneTab={assignModalLaneTabs.length > 1 ? handleAssignModalLaneTabSelect : undefined}
         />
       )}
 

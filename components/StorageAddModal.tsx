@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { supabase } from '@/lib/supabase';
+import ActionToast from './ActionToast';
 
 interface LaneOption {
   lane_number: string;
@@ -39,7 +40,7 @@ export default function StorageAddModal({ lanes, onClose, onSaved }: StorageAddM
 
   useEffect(() => {
     if (!toastMessage) return;
-    const timer = window.setTimeout(() => setToastMessage(''), 2200);
+    const timer = window.setTimeout(() => setToastMessage(''), 3000);
     return () => window.clearTimeout(timer);
   }, [toastMessage]);
 
@@ -434,11 +435,7 @@ export default function StorageAddModal({ lanes, onClose, onSaved }: StorageAddM
         </div>
       </div>
 
-      {toastMessage && (
-        <div className="fixed bottom-6 right-6 z-[90] bg-gray-900 border border-gray-600 text-gray-100 px-4 py-2 rounded-lg shadow-lg text-sm animate-fade-in">
-          {toastMessage}
-        </div>
-      )}
+      <ActionToast message={toastMessage || null} type="info" zIndexClass="z-[110]" />
     </div>
   );
 }

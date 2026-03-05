@@ -7,11 +7,14 @@ import ShipmentCard, { Shipment } from '@/components/ShipmentCard';
 import { isPTArchived } from '@/lib/utils';
 import { exportShipmentSummaryPdf, ShipmentPdfLoad } from '@/lib/shipmentPdf';
 import { useAuth } from '@/components/AuthProvider';
+import { useRealtimeCoordinator } from '@/components/RealtimeProvider';
+import ActionToast from '@/components/ActionToast';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const SHIPPED_TO_ARCHIVED_DAYS = 7;
 const HIDE_ARCHIVED_AFTER_DAYS = 21;
 const OCR_TOGGLE_STORAGE_KEY = 'shipments_ocr_required';
+const SHIPMENTS_FALLBACK_FULL_SYNC_MS = 180000;
 
 type ShipmentSnapshotMap = Record<string, Shipment>;
 type StaleSnapshotRow = {
@@ -84,6 +87,7 @@ function getDaysSince(timestamp?: string | null, fallbackDate?: string): number 
 
 export default function ShipmentsPage() {
   const { session, isGuest, isAdmin } = useAuth();
+  const { health: realtimeHealth, subscribeScope } = useRealtimeCoordinator();
   const [shipments, setShipments] = useState<Shipment[]>([]);
   const [loading, setLoading] = useState(true);
   const [mostRecentSync, setMostRecentSync] = useState<Date | null>(null);
@@ -92,6 +96,8 @@ export default function ShipmentsPage() {
   const [searchSelectedShipmentKey, setSearchSelectedShipmentKey] = useState<string | null>(null);
   const [staleSnapshots, setStaleSnapshots] = useState<ShipmentSnapshotMap>({});
   const [staleSnapshotStoreAvailable, setStaleSnapshotStoreAvailable] = useState(true);
+  const [historicalShipmentsLoaded, setHistoricalShipmentsLoaded] = useState(false);
+  const [historicalShipmentsLoading, setHistoricalShipmentsLoading] = useState(false);
   const [requireOCRForStaging, setRequireOCRForStaging] = useState(true);
   const [verifyingOCRTogglePassword, setVerifyingOCRTogglePassword] = useState(false);
   const [ocrToggleToast, setOcrToggleToast] = useState('');
@@ -99,6 +105,7 @@ export default function ShipmentsPage() {
   const shipmentFetchInFlightRef = useRef(false);
   const shipmentFetchQueuedRef = useRef(false);
   const hasLoadedShipmentsRef = useRef(false);
+  const includeHistoricalShipmentsRef = useRef(false);
   const staleRefreshRequestedRef = useRef(false);
   const focusedShipmentKeyRef = useRef<string | null>(null);
   const fetchShipmentsRef = useRef<() => Promise<void>>(async () => { });
@@ -132,6 +139,18 @@ export default function ShipmentsPage() {
       void fetchStaleSnapshotsRef.current();
     }
   }, []);
+
+  const ensureHistoricalShipmentsLoaded = useCallback(async () => {
+    if (includeHistoricalShipmentsRef.current || historicalShipmentsLoading) return;
+    includeHistoricalShipmentsRef.current = true;
+    setHistoricalShipmentsLoaded(true);
+    setHistoricalShipmentsLoading(true);
+    try {
+      await fetchShipmentsRef.current();
+    } finally {
+      setHistoricalShipmentsLoading(false);
+    }
+  }, [historicalShipmentsLoading]);
 
   useEffect(() => {
     const targetKey = focusedShipmentKeyRef.current;
@@ -215,30 +234,33 @@ export default function ShipmentsPage() {
   }, [staleSnapshotStoreAvailable]);
 
   useEffect(() => {
-    const channel = supabase
-      .channel('shipments-page-realtime')
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'shipments' }, () => scheduleShipmentRefresh(false))
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'shipments' }, () => scheduleShipmentRefresh(false))
-      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'shipments' }, () => scheduleShipmentRefresh(false))
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'shipment_pts' }, () => scheduleShipmentRefresh(false))
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'shipment_pts' }, () => scheduleShipmentRefresh(false))
-      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'shipment_pts' }, () => scheduleShipmentRefresh(false))
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'picktickets' }, () => scheduleShipmentRefresh(false))
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'picktickets' }, () => scheduleShipmentRefresh(false))
-      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'picktickets' }, () => scheduleShipmentRefresh(false))
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'stale_shipment_snapshots' }, () => scheduleShipmentRefresh(true))
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'stale_shipment_snapshots' }, () => scheduleShipmentRefresh(true))
-      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'stale_shipment_snapshots' }, () => scheduleShipmentRefresh(true))
-      .subscribe();
+    const unsubscribe = subscribeScope('shipments', (payload) => {
+      scheduleShipmentRefresh(Boolean(payload.includeStale));
+    });
 
-    return () => {
-      if (shipmentRefreshTimerRef.current) {
-        window.clearTimeout(shipmentRefreshTimerRef.current);
-        shipmentRefreshTimerRef.current = null;
+    return () => unsubscribe();
+  }, [scheduleShipmentRefresh, subscribeScope]);
+
+  useEffect(() => {
+    if (realtimeHealth !== 'disconnected') return;
+    if (document.hidden) return;
+    void fetchShipmentsRef.current();
+    if (staleSnapshotStoreAvailable) {
+      void fetchStaleSnapshotsRef.current();
+    }
+  }, [realtimeHealth, staleSnapshotStoreAvailable]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (document.hidden) return;
+      void fetchShipmentsRef.current();
+      if (staleSnapshotStoreAvailable) {
+        void fetchStaleSnapshotsRef.current();
       }
-      void supabase.removeChannel(channel);
-    };
-  }, [scheduleShipmentRefresh]);
+    }, SHIPMENTS_FALLBACK_FULL_SYNC_MS);
+
+    return () => window.clearInterval(timer);
+  }, [staleSnapshotStoreAvailable]);
 
   async function fetchStaleSnapshotsFromSupabase() {
     const { data, error } = await supabase
@@ -273,12 +295,18 @@ export default function ShipmentsPage() {
     }
 
     try {
-      const { data: pts, error } = await supabase
+      let pickticketQuery = supabase
         .from('picktickets')
         .select('id, pt_number, po_number, customer, assigned_lane, actual_pallet_count, container_number, store_dc, cancel_date, start_date, pu_number, pu_date, status, ctn, carrier, last_synced_at')
         .not('pu_number', 'is', null)
         .not('pu_date', 'is', null)
         .neq('customer', 'PAPER');
+
+      if (!includeHistoricalShipmentsRef.current) {
+        pickticketQuery = pickticketQuery.neq('status', 'shipped');
+      }
+
+      const { data: pts, error } = await pickticketQuery;
 
       if (error) throw error;
 
@@ -824,14 +852,29 @@ export default function ShipmentsPage() {
   </div>
 
   {/* Shipped Shipments */}
-  {shippedShipments.length > 0 && (
-    <div className="border-t-4 border-green-600 pt-8 mb-8">
-      <details className="bg-green-950/20 rounded-lg border border-green-700/40">
-        <summary className="cursor-pointer list-none p-4 md:p-5 flex items-center justify-between">
-          <span className="text-2xl font-bold text-green-400">✈️ Shipped ({shippedShipments.length})</span>
-          <span className="text-sm text-green-200/80">Closed by default</span>
-        </summary>
-        <div className="px-3 md:px-5 pb-5">
+  <div className="border-t-4 border-green-600 pt-8 mb-8">
+    <details
+      className="bg-green-950/20 rounded-lg border border-green-700/40"
+      onToggle={(event) => {
+        if (event.currentTarget.open) {
+          void ensureHistoricalShipmentsLoaded();
+        }
+      }}
+    >
+      <summary className="cursor-pointer list-none p-4 md:p-5 flex items-center justify-between">
+        <span className="text-2xl font-bold text-green-400">
+          ✈️ Shipped ({historicalShipmentsLoaded ? shippedShipments.length : 'Load'})
+        </span>
+        <span className="text-sm text-green-200/80">Closed by default</span>
+      </summary>
+      <div className="px-3 md:px-5 pb-5">
+        {historicalShipmentsLoading ? (
+          <div className="py-4 text-sm text-green-100/80 animate-pulse">Loading shipped shipments...</div>
+        ) : !historicalShipmentsLoaded ? (
+          <div className="py-4 text-sm text-green-100/80">Open this section to load shipped shipments.</div>
+        ) : shippedShipments.length === 0 ? (
+          <div className="bg-gray-900 p-6 rounded-lg text-center text-gray-300">No shipped shipments in view</div>
+        ) : (
           <div className="space-y-4 opacity-75">
             {shippedShipments.map((shipment) => {
               const currentKey = shipmentKey(shipment);
@@ -856,20 +899,35 @@ export default function ShipmentsPage() {
               );
             })}
           </div>
-        </div>
-      </details>
-    </div>
-  )}
+        )}
+      </div>
+    </details>
+  </div>
 
   {/* Archived Shipments */}
-  {archivedShipments.length > 0 && (
-    <div className="border-t-4 border-gray-600 pt-8">
-      <details className="bg-gray-800 rounded-lg border border-gray-700">
-        <summary className="cursor-pointer list-none p-4 md:p-5 flex items-center justify-between">
-          <span className="text-2xl font-bold text-gray-300">Archived ({archivedShipments.length})</span>
-          <span className="text-sm text-gray-400">Closed by default</span>
-        </summary>
-        <div className="px-3 md:px-5 pb-5">
+  <div className="border-t-4 border-gray-600 pt-8">
+    <details
+      className="bg-gray-800 rounded-lg border border-gray-700"
+      onToggle={(event) => {
+        if (event.currentTarget.open) {
+          void ensureHistoricalShipmentsLoaded();
+        }
+      }}
+    >
+      <summary className="cursor-pointer list-none p-4 md:p-5 flex items-center justify-between">
+        <span className="text-2xl font-bold text-gray-300">
+          Archived ({historicalShipmentsLoaded ? archivedShipments.length : 'Load'})
+        </span>
+        <span className="text-sm text-gray-400">Closed by default</span>
+      </summary>
+      <div className="px-3 md:px-5 pb-5">
+        {historicalShipmentsLoading ? (
+          <div className="py-4 text-sm text-gray-300 animate-pulse">Loading archived shipments...</div>
+        ) : !historicalShipmentsLoaded ? (
+          <div className="py-4 text-sm text-gray-300">Open this section to load archived shipments.</div>
+        ) : archivedShipments.length === 0 ? (
+          <div className="bg-gray-900 p-6 rounded-lg text-center text-gray-400">No archived shipments in view</div>
+        ) : (
           <div className="space-y-4 opacity-60">
             {archivedShipments.map((shipment) => {
               const currentKey = shipmentKey(shipment);
@@ -894,10 +952,10 @@ export default function ShipmentsPage() {
               );
             })}
           </div>
-        </div>
-      </details>
-    </div>
-  )}
+        )}
+      </div>
+    </details>
+  </div>
 
   <div className="border-t-2 border-gray-700 pt-8 mt-8">
     <details className="bg-gray-800 rounded-lg border border-gray-700">
@@ -979,11 +1037,7 @@ export default function ShipmentsPage() {
         </div>
       )}
 
-      {ocrToggleToast && (
-        <div className="fixed top-4 right-4 z-[120] bg-gray-900 border border-gray-600 px-4 py-2 rounded-lg text-sm text-white shadow-lg animate-fade-in">
-          {ocrToggleToast}
-        </div>
-      )}
+      <ActionToast message={ocrToggleToast} type="info" />
     </div>
   );
 }

@@ -4,6 +4,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { supabase } from '@/lib/supabase';
 import ConfirmModal from './ConfirmModal';
 import PTDetails from './PTDetails';
+import ActionToast from './ActionToast';
 import { Pickticket } from '@/types/pickticket';
 
 import { createCompiledPallet } from '@/lib/compiledPallets';
@@ -34,6 +35,8 @@ interface AssignModalProps {
   lane: Lane;
   onClose: () => void;
   onUpdated?: () => void;
+  laneTabs?: string[];
+  onSelectLaneTab?: (laneNumber: string) => void;
 }
 
 interface PTLaneAssignmentRow {
@@ -69,7 +72,13 @@ const ASSIGN_MODAL_PICKTICKET_SELECT_COLUMNS = `
   sample_shipped
 `;
 
-export default function AssignModal({ lane, onClose, onUpdated }: AssignModalProps) {
+export default function AssignModal({
+  lane,
+  onClose,
+  onUpdated,
+  laneTabs = [],
+  onSelectLaneTab
+}: AssignModalProps) {
   const [view, setView] = useState<'existing' | 'add'>('existing');
   const [searchMode, setSearchMode] = useState<'container' | 'pt'>('pt');
   const [existingPTs, setExistingPTs] = useState<LaneAssignment[]>([]);
@@ -97,6 +106,7 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
   const [selectedPTs, setSelectedPTs] = useState<{ [key: number]: string }>({});
   const [selectionOrder, setSelectionOrder] = useState<number[]>([]);
   const [loading, setLoading] = useState(false);
+  const [laneDataLoading, setLaneDataLoading] = useState(false);
   const [allLanes, setAllLanes] = useState<Lane[]>([]);
 
   const [viewingSearchPTDetails, setViewingSearchPTDetails] = useState<Pickticket | null>(null);
@@ -104,6 +114,7 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
   // archived pts
   const [mostRecentSync, setMostRecentSync] = useState<Date | null>(null);
   const mostRecentSyncLoadRef = useRef<Promise<Date | null> | null>(null);
+  const laneDataRequestIdRef = useRef(0);
 
   //compiling PTs
   const [compilingPTs, setCompilingPTs] = useState<Set<number>>(new Set());
@@ -130,8 +141,41 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
 
   useEffect(() => {
-    checkIfStagingLane();
-    fetchExistingPTs();
+    const laneRequestId = laneDataRequestIdRef.current + 1;
+    laneDataRequestIdRef.current = laneRequestId;
+    setLaneDataLoading(true);
+
+    setSelectedPTDetails(null);
+    setViewingSearchPTDetails(null);
+    setEditingPT(null);
+    setMovingPT(null);
+    setMoveLaneInput('');
+    setMoveLaneError('');
+    setMobileControlsIndex(null);
+    setSelectedPTs({});
+    setSelectionOrder([]);
+    setPreviewCompiledGroups([]);
+    setPtSearchQuery('');
+    setSelectedContainer('');
+    setContainerSearch('');
+    setCompilingPTs(new Set());
+    setCompilingConfirm(null);
+    setCompiledPalletCount('');
+
+    const activeLaneNumber = String(lane.lane_number);
+    void (async () => {
+      await Promise.all([
+        checkIfStagingLane(activeLaneNumber, laneRequestId),
+        fetchExistingPTs(activeLaneNumber, laneRequestId)
+      ]);
+      if (!isLaneDataRequestStale(laneRequestId)) {
+        setLaneDataLoading(false);
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lane.lane_number]);
+
+  useEffect(() => {
     fetchContainers();
     fetchAllUnassignedPTs();
     fetchAllLanes();
@@ -162,10 +206,11 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
   }, [ptSearchQuery, searchMode]);
 
   useEffect(() => {
+    if (laneDataLoading) return;
     if (existingPTs.length === 0 && !isStaging) {
       setView('add');
     }
-  }, [existingPTs, isStaging]);
+  }, [existingPTs, isStaging, laneDataLoading]);
 
   useEffect(() => {
     if (toast) {
@@ -179,12 +224,6 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
       setMobileControlsIndex(null);
     }
   }, [existingPTs, mobileControlsIndex]);
-
-  useEffect(() => {
-    // Refresh capacity display when existingPTs changes
-    fetchExistingPTs();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedPTs]);
 
   async function handleCompile() {
     if (!compilingConfirm || compilingPTs.size === 0) return;
@@ -317,32 +356,40 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
     };
   }
 
-  async function checkIfStagingLane() {
+  function isLaneDataRequestStale(requestId?: number) {
+    return typeof requestId === 'number' && requestId !== laneDataRequestIdRef.current;
+  }
+
+  async function checkIfStagingLane(targetLaneNumber: string = String(lane.lane_number), requestId?: number) {
     const { data } = await supabase
       .from('shipments')
       .select('id, pu_number, staging_lane, status')
-      .eq('staging_lane', lane.lane_number)
+      .eq('staging_lane', targetLaneNumber)
       .eq('archived', false)
       .maybeSingle();
+
+    if (isLaneDataRequestStale(requestId)) return;
 
     if (data) {
       setIsStaging(true);
       setStagingPUs([data.pu_number]);
-      setView('existing'); // Force to existing view
     } else {
       // ALSO check if ANY PTs in this lane have staged/ready_to_ship status
       const { data: stagedPTs } = await supabase
         .from('picktickets')
         .select('pu_number, status')
-        .eq('assigned_lane', lane.lane_number)
+        .eq('assigned_lane', targetLaneNumber)
         .in('status', ['staged', 'ready_to_ship'])
         .limit(1);
 
+      if (isLaneDataRequestStale(requestId)) return;
+
       if (stagedPTs && stagedPTs.length > 0) {
         setIsStaging(true);
-        setView('existing');
+        setStagingPUs([]);
       } else {
         setIsStaging(false);
+        setStagingPUs([]);
       }
     }
   }
@@ -356,7 +403,7 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
     if (data) setAllLanes(data as Lane[]);
   }
 
-  async function fetchExistingPTs() {
+  async function fetchExistingPTs(targetLaneNumber: string = String(lane.lane_number), requestId?: number) {
     const { data: assignments } = await supabase
       .from('lane_assignments')
       .select(`
@@ -383,8 +430,10 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
         compiled_pallet_id
       )
     `)
-      .eq('lane_number', lane.lane_number)
+      .eq('lane_number', targetLaneNumber)
       .order('order_position', { ascending: true });
+
+    if (isLaneDataRequestStale(requestId)) return;
 
     if (assignments) {
       const rawAssignments = assignments as Array<{
@@ -419,6 +468,8 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
       // Fetch compiled PT info
       const ptIds = formattedAssignments.map(a => a.pickticket.id);
       const compiledInfo = await fetchCompiledPTInfo(ptIds);
+
+      if (isLaneDataRequestStale(requestId)) return;
 
       // Attach compiled_with info to each PT
       formattedAssignments.forEach(assignment => {
@@ -862,78 +913,16 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
       const ptToMove = existingPTs.find(pt => pt.id === movingPT.assignmentId);
       if (!ptToMove) return;
 
-      const { data: targetAssignments, error: targetAssignmentsError } = await supabase
-        .from('lane_assignments')
-        .select('id, order_position, pt_id, pallet_count, compiled_pallet_id')
-        .eq('lane_number', String(targetLane.lane_number));
+      const { data: moveResult, error: moveError } = await supabase.rpc('move_lane_assignment_transactional', {
+        p_assignment_id: movingPT.assignmentId,
+        p_target_lane: String(targetLane.lane_number)
+      });
+      throwIfSupabaseError(moveError, 'Failed to move lane assignment');
 
-      if (targetAssignmentsError) throw targetAssignmentsError;
+      const resultRow = Array.isArray(moveResult) ? moveResult[0] : moveResult;
+      const merged = Boolean(resultRow && typeof resultRow === 'object' && 'merged' in resultRow && resultRow.merged);
 
-      const typedTargetAssignments = (targetAssignments || []) as PTLaneAssignmentRow[];
-      const mergeTarget = ptToMove.compiled_pallet_id
-        ? null
-        : typedTargetAssignments.find((assignment) =>
-          !assignment.compiled_pallet_id && Number(assignment.pt_id) === Number(movingPT.ptId)
-        );
-
-      // Move target lane PTs back so moved PT lands at the front.
-      for (const targetAssignment of typedTargetAssignments) {
-        if (mergeTarget && targetAssignment.id === mergeTarget.id) {
-          continue;
-        }
-        const { error: shiftTargetError } = await supabase
-          .from('lane_assignments')
-          .update({ order_position: (targetAssignment.order_position || 1) + 1 })
-          .eq('id', targetAssignment.id);
-        throwIfSupabaseError(shiftTargetError, 'Failed to shift target lane order');
-      }
-
-      if (mergeTarget) {
-        const mergedPalletCount = (mergeTarget.pallet_count || 0) + (ptToMove.pallet_count || 0);
-        const { error: mergeUpdateError } = await supabase
-          .from('lane_assignments')
-          .update({
-            pallet_count: mergedPalletCount,
-            order_position: 1
-          })
-          .eq('id', mergeTarget.id);
-        throwIfSupabaseError(mergeUpdateError, 'Failed to merge PT lane assignments');
-
-        const { error: deleteMovedAssignmentError } = await supabase
-          .from('lane_assignments')
-          .delete()
-          .eq('id', movingPT.assignmentId);
-        throwIfSupabaseError(deleteMovedAssignmentError, 'Failed to delete merged lane assignment');
-      } else {
-        const { error: updateAssignmentError } = await supabase
-          .from('lane_assignments')
-          .update({
-            lane_number: String(targetLane.lane_number),
-            order_position: 1
-          })
-          .eq('id', movingPT.assignmentId);
-        throwIfSupabaseError(updateAssignmentError, 'Failed to move lane assignment');
-      }
-
-      // If compiled, update ALL PTs in the group
-      if (ptToMove.compiled_pallet_id) {
-        const { data: compiledLinks } = await supabase
-          .from('compiled_pallet_pts')
-          .select('pt_id')
-          .eq('compiled_pallet_id', ptToMove.compiled_pallet_id);
-
-        const ptIds = compiledLinks?.map(l => l.pt_id) || [];
-
-        const { error: compiledLaneUpdateError } = await supabase
-          .from('picktickets')
-          .update({ assigned_lane: String(targetLane.lane_number) })
-          .in('id', ptIds);
-        throwIfSupabaseError(compiledLaneUpdateError, 'Failed to move compiled PTs to target lane');
-      } else {
-        await syncPickticketWithAssignments(movingPT.ptId);
-      }
-
-      if (mergeTarget) {
+      if (merged) {
         showToast(`PT merged into Lane ${targetLane.lane_number}`, 'success');
       } else {
         showToast(`PT moved to Lane ${targetLane.lane_number}`, 'success');
@@ -1171,6 +1160,28 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
             </div>
             <button onClick={onClose} className="text-3xl md:text-4xl hover:text-red-500 self-end sm:self-auto">&times;</button>
           </div>
+
+          {laneTabs.length > 1 && onSelectLaneTab && (
+            <div className="mb-4 md:mb-6 bg-gray-900 border border-gray-700 rounded-lg p-2 md:p-3">
+              <div className="text-[11px] md:text-xs font-semibold text-gray-300 mb-2 uppercase tracking-wide">
+                PT is assigned in multiple lanes
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {laneTabs.map((laneNumber) => {
+                  const isActive = String(laneNumber) === String(lane.lane_number);
+                  return (
+                    <button
+                      key={`lane-tab-${laneNumber}`}
+                      onClick={() => onSelectLaneTab(laneNumber)}
+                      className={`px-3 py-1.5 rounded-lg text-xs md:text-sm font-bold transition-colors ${isActive ? 'bg-blue-600 text-white' : 'bg-gray-700 text-gray-200 hover:bg-gray-600'}`}
+                    >
+                      Lane {laneNumber}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
 
           {/* Tab switcher */}
           {existingPTs.length > 0 && !isStaging && (
@@ -1893,12 +1904,7 @@ export default function AssignModal({ lane, onClose, onUpdated }: AssignModalPro
       </div>
 
       {/* Toast */}
-      {toast && (
-        <div className={`fixed top-4 right-4 z-[110] px-4 md:px-6 py-2 md:py-3 rounded-lg font-semibold shadow-lg animate-fade-in text-sm md:text-base ${toast.type === 'success' ? 'bg-green-600' : 'bg-red-600'
-          }`}>
-          {toast.message}
-        </div>
-      )}
+      <ActionToast message={toast?.message ?? null} type={toast?.type} zIndexClass="z-[110]" />
 
       {/* Confirm Modal */}
       <ConfirmModal

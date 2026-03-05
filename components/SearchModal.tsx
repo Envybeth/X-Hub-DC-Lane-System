@@ -429,8 +429,11 @@ export default function SearchModal({ onClose, mostRecentSync }: SearchModalProp
                     if (primaryLane) {
                       // Close the search modal immediately
                       onClose();
-                      // Navigate to the main page with the lane query
-                      router.push(`/?lane=${primaryLane}`);
+                      const params = new URLSearchParams({ lane: primaryLane });
+                      if (laneLocations.length > 1) {
+                        params.set('pt', String(pt.id));
+                      }
+                      router.push(`/?${params.toString()}`);
                     } else {
                       void openQuickAssign(pt);
                     }
@@ -499,7 +502,11 @@ export default function SearchModal({ onClose, mostRecentSync }: SearchModalProp
                   onClick={() => {
                     if (primaryLane) {
                       onClose();
-                      router.push(`/?lane=${primaryLane}`);
+                      const params = new URLSearchParams({ lane: primaryLane });
+                      if (laneLocations.length > 1) {
+                        params.set('pt', String(pt.id));
+                      }
+                      router.push(`/?${params.toString()}`);
                     } else {
                       void openQuickAssign(pt);
                     }

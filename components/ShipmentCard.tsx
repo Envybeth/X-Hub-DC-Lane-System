@@ -4,6 +4,7 @@ import { useState, useEffect } from 'react';
 import { supabase } from '@/lib/supabase';
 import ConfirmModal from './ConfirmModal';
 import PTDetails from './PTDetails';
+import ActionToast from './ActionToast';
 import { isPTArchived } from '@/lib/utils';
 import { fetchCompiledPTInfo } from '@/lib/compiledPallets';
 import { exportShipmentSummaryPdf, ShipmentPdfLoad } from '@/lib/shipmentPdf';
@@ -220,53 +221,15 @@ export default function ShipmentCard({
     showToast(`Staging PT ${pt.pt_number}...`, 'success');
 
     try {
-      const { data: shipmentData } = await supabase
-        .from('shipments')
-        .select('id, status')
-        .eq('pu_number', shipment.pu_number)
-        .eq('pu_date', shipment.pu_date)
-        .single();
-
-      if (!shipmentData) throw new Error('Shipment not found');
       if (!shipment.staging_lane) throw new Error('Staging lane not set');
-      const targetStagingLane = shipment.staging_lane;
 
-      // Add to shipment_pts
-      await supabase
-        .from('shipment_pts')
-        .upsert({
-          shipment_id: shipmentData.id,
-          pt_id: pt.id,
-          original_lane: pt.assigned_lane,
-          removed_from_staging: false
-        }, {
-          onConflict: 'shipment_id,pt_id'
-        });
-
-      // Determine status based on shipment state
-      const ptStatus = shipmentData.status === 'finalized' ? 'ready_to_ship' : 'staged';
-
-      // Update PT
-      await supabase
-        .from('picktickets')
-        .update({
-          assigned_lane: targetStagingLane,
-          status: ptStatus
-        })
-        .eq('id', pt.id);
-
-      const { data: ptAssignments, error: ptAssignmentsError } = await supabase
-        .from('lane_assignments')
-        .select('pallet_count')
-        .eq('pt_id', pt.id);
-      if (ptAssignmentsError) throw ptAssignmentsError;
-
-      const fallbackPalletCount = (ptAssignments || []).reduce(
-        (sum, assignment) => sum + Number(assignment.pallet_count || 0),
-        0
-      );
-      const stagePalletCount = (pt.actual_pallet_count || 0) > 0 ? pt.actual_pallet_count : fallbackPalletCount;
-      await normalizeStagedPTLaneAssignments(pt.id, targetStagingLane, stagePalletCount);
+      const { error: stageError } = await supabase.rpc('stage_pickticket_into_shipment_lane', {
+        p_pu_number: shipment.pu_number,
+        p_pu_date: shipment.pu_date,
+        p_pt_id: pt.id,
+        p_original_lane: pt.assigned_lane
+      });
+      if (stageError) throw stageError;
 
       showToast(`✅ PT ${pt.pt_number} staged`, 'success');
       onUpdate();
@@ -1480,12 +1443,7 @@ export default function ShipmentCard({
       </div>
 
       {/* Toast */}
-      {toast && (
-        <div className={`fixed top-4 left-1/2 -translate-x-1/2 z-[110] px-5 md:px-8 py-3 md:py-4 rounded-xl font-semibold shadow-2xl animate-toast-fade-in-out text-base md:text-lg text-center max-w-[92vw] ${toast.type === 'success' ? 'bg-green-600' : 'bg-red-600'
-          }`}>
-          {toast.message}
-        </div>
-      )}
+      <ActionToast message={toast?.message ?? null} type={toast?.type} zIndexClass="z-[110]" />
 
       {/* Confirm Modal */}
       <ConfirmModal
