@@ -88,6 +88,7 @@ export default function ShipmentCard({
   const [deletingShipment, setDeletingShipment] = useState(false);
   const [deleteConfirmText, setDeleteConfirmText] = useState('');
   const [laneOrderByPtId, setLaneOrderByPtId] = useState<Record<number, number>>({});
+  const [laneLocationsByPtId, setLaneLocationsByPtId] = useState<Record<number, string[]>>({});
   const [stagingPTIds, setStagingPTIds] = useState<number[]>([]);
   const [adminShipmentStatus, setAdminShipmentStatus] = useState<Shipment['status']>(shipment.status);
   const [adminShipmentArchived, setAdminShipmentArchived] = useState(Boolean(shipment.archived));
@@ -467,12 +468,13 @@ export default function ShipmentCard({
     const ptIds = shipment.pts.map((pt) => pt.id);
     if (ptIds.length === 0) {
       setLaneOrderByPtId({});
+      setLaneLocationsByPtId({});
       return;
     }
 
     const { data: assignments, error } = await supabase
       .from('lane_assignments')
-      .select('pt_id, order_position')
+      .select('pt_id, lane_number, order_position')
       .in('pt_id', ptIds);
 
     if (error) {
@@ -481,10 +483,30 @@ export default function ShipmentCard({
     }
 
     const orderMap: Record<number, number> = {};
+    const laneMap: Record<number, string[]> = {};
     (assignments || []).forEach((assignment) => {
-      orderMap[assignment.pt_id] = assignment.order_position || Number.MAX_SAFE_INTEGER;
+      const ptId = Number(assignment.pt_id);
+      const orderPosition = assignment.order_position || Number.MAX_SAFE_INTEGER;
+      orderMap[ptId] = Math.min(orderMap[ptId] ?? Number.MAX_SAFE_INTEGER, orderPosition);
+
+      const laneNumber = String(assignment.lane_number || '').trim();
+      if (!laneNumber) return;
+      if (!laneMap[ptId]) laneMap[ptId] = [];
+      if (!laneMap[ptId].includes(laneNumber)) {
+        laneMap[ptId].push(laneNumber);
+      }
+    });
+    Object.keys(laneMap).forEach((ptIdKey) => {
+      const ptId = Number(ptIdKey);
+      laneMap[ptId] = laneMap[ptId].sort((a, b) => {
+        const aNum = Number(a);
+        const bNum = Number(b);
+        if (!Number.isNaN(aNum) && !Number.isNaN(bNum)) return aNum - bNum;
+        return a.localeCompare(b);
+      });
     });
     setLaneOrderByPtId(orderMap);
+    setLaneLocationsByPtId(laneMap);
   }
 
   async function fetchDepthInfo() {
@@ -1296,8 +1318,11 @@ export default function ShipmentCard({
                       const depthColor = depthInfo
                         ? getDepthColor(depthInfo.palletsInFront, depthInfo.maxCapacity)
                         : '';
+                      const laneLocations = laneLocationsByPtId[pt.id] && laneLocationsByPtId[pt.id].length > 0
+                        ? laneLocationsByPtId[pt.id]
+                        : (pt.assigned_lane ? [pt.assigned_lane] : []);
 
-                      const hasLaneAssigned = pt.assigned_lane && pt.assigned_lane !== shipment.staging_lane;
+                      const hasLaneAssigned = laneLocations.some((laneNumber) => laneNumber !== shipment.staging_lane);
                       const isCurrentlyStaged = pt.moved_to_staging && !pt.removed_from_staging;
                       const canMoveToStaging = hasLaneAssigned && !isCurrentlyStaged && shipment.staging_lane && shipment.status !== 'finalized';
                       const isStagingInProgress = stagingPTIds.includes(pt.id);
@@ -1308,11 +1333,11 @@ export default function ShipmentCard({
                           className={`p-2 md:p-4 rounded-lg border-2 ${isCompiled ? 'border-orange-500' :
                             isShipped
                               ? 'bg-gray-800 border-gray-600 opacity-75'
-                              : isCurrentlyStaged
-                                ? 'bg-green-900 border-green-600'
-                                : !pt.assigned_lane
-                                  ? 'bg-gray-700 border-gray-600'
-                                  : 'bg-gray-700 border-gray-600'
+                                : isCurrentlyStaged
+                                  ? 'bg-green-900 border-green-600'
+                                  : laneLocations.length === 0
+                                    ? 'bg-gray-700 border-gray-600'
+                                    : 'bg-gray-700 border-gray-600'
                             }`}
                         >
                           <div className="flex flex-col md:flex-row md:items-center justify-between gap-2 md:gap-4">
@@ -1326,7 +1351,7 @@ export default function ShipmentCard({
                                 {!isShipped && isCurrentlyStaged && (
                                   <div className="text-lg md:text-2xl text-green-400 flex-shrink-0">✓</div>
                                 )}
-                                {!isShipped && !pt.assigned_lane && (
+                                {!isShipped && laneLocations.length === 0 && (
                                   <div className="text-lg md:text-2xl text-yellow-400 flex-shrink-0">⚠️</div>
                                 )}
                                 <div className="flex-1 min-w-0">
@@ -1357,10 +1382,10 @@ export default function ShipmentCard({
                                     <div className="bg-gray-700 px-3 py-1 rounded-lg font-bold text-white inline-block mt-1">
                                       ARCHIVED
                                     </div>
-                                  ) : pt.assigned_lane ? (
+                                  ) : laneLocations.length > 0 ? (
                                     <div className="flex flex-wrap items-center gap-2 mt-1 md:mt-2">
                                       <div className="text-l md:text-lg font-bold text-white bg-purple-700 border border-purple-800 rounded-lg p-1 px-2">
-                                        L{pt.assigned_lane}
+                                        L{laneLocations.join('/')}
                                       </div>
                                       {!isShipped && depthInfo && (
                                         <span className={`px-2 py-0.5 md:px-3 md:py-1 rounded-full text-[10px] md:text-xs font-bold ${depthColor}`}>
@@ -1394,7 +1419,7 @@ export default function ShipmentCard({
                                       {isStagingInProgress ? '⏳ Staging...' : '✓ Stage'}
                                     </button>
                                   )}
-                                  {!pt.assigned_lane && (
+                                  {laneLocations.length === 0 && (
                                     <div className="bg-yellow-700 px-2 md:px-4 py-1.5 md:py-2 rounded-lg text-xs md:text-sm font-semibold whitespace-nowrap">
                                       Assign first
                                     </div>

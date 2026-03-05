@@ -57,12 +57,6 @@ type ShipmentPtRecordRow = {
   removed_from_staging: boolean;
 };
 
-type RealtimeRow = Record<string, unknown> | null | undefined;
-type RealtimePayload = {
-  new: Record<string, unknown>;
-  old: Record<string, unknown>;
-};
-
 function shipmentKey(shipment: Shipment) {
   return `${shipment.pu_number}-${shipment.pu_date}`;
 }
@@ -86,33 +80,6 @@ function getDaysSince(timestamp?: string | null, fallbackDate?: string): number 
   const fallback = new Date(fallbackDate);
   if (Number.isNaN(fallback.getTime())) return null;
   return Math.floor((Date.now() - fallback.getTime()) / DAY_MS);
-}
-
-function readRealtimeText(row: RealtimeRow, key: string): string {
-  if (!row) return '';
-  const raw = row[key];
-  if (typeof raw === 'string') return raw.trim();
-  if (raw === null || raw === undefined) return '';
-  return String(raw).trim();
-}
-
-function isShipmentPickticketRowRelevant(row: RealtimeRow): boolean {
-  const puNumber = readRealtimeText(row, 'pu_number');
-  const puDate = readRealtimeText(row, 'pu_date');
-  const customer = readRealtimeText(row, 'customer').toUpperCase();
-  return puNumber !== '' && puDate !== '' && customer !== 'PAPER';
-}
-
-function isShipmentRowRelevant(row: RealtimeRow): boolean {
-  const puNumber = readRealtimeText(row, 'pu_number');
-  const puDate = readRealtimeText(row, 'pu_date');
-  return puNumber !== '' && puDate !== '';
-}
-
-function isShipmentPtRowRelevant(row: RealtimeRow): boolean {
-  const shipmentId = readRealtimeText(row, 'shipment_id');
-  const ptId = readRealtimeText(row, 'pt_id');
-  return shipmentId !== '' && ptId !== '';
 }
 
 export default function ShipmentsPage() {
@@ -248,32 +215,17 @@ export default function ShipmentsPage() {
   }, [staleSnapshotStoreAvailable]);
 
   useEffect(() => {
-    const handleShipmentTableChange = (payload: RealtimePayload) => {
-      if (!isShipmentRowRelevant(payload.new) && !isShipmentRowRelevant(payload.old)) return;
-      scheduleShipmentRefresh(false);
-    };
-
-    const handleShipmentPtTableChange = (payload: RealtimePayload) => {
-      if (!isShipmentPtRowRelevant(payload.new) && !isShipmentPtRowRelevant(payload.old)) return;
-      scheduleShipmentRefresh(false);
-    };
-
-    const handlePickticketTableChange = (payload: RealtimePayload) => {
-      if (!isShipmentPickticketRowRelevant(payload.new) && !isShipmentPickticketRowRelevant(payload.old)) return;
-      scheduleShipmentRefresh(false);
-    };
-
     const channel = supabase
       .channel('shipments-page-realtime')
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'shipments' }, handleShipmentTableChange)
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'shipments' }, handleShipmentTableChange)
-      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'shipments' }, handleShipmentTableChange)
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'shipment_pts' }, handleShipmentPtTableChange)
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'shipment_pts' }, handleShipmentPtTableChange)
-      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'shipment_pts' }, handleShipmentPtTableChange)
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'picktickets' }, handlePickticketTableChange)
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'picktickets' }, handlePickticketTableChange)
-      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'picktickets' }, handlePickticketTableChange)
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'shipments' }, () => scheduleShipmentRefresh(false))
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'shipments' }, () => scheduleShipmentRefresh(false))
+      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'shipments' }, () => scheduleShipmentRefresh(false))
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'shipment_pts' }, () => scheduleShipmentRefresh(false))
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'shipment_pts' }, () => scheduleShipmentRefresh(false))
+      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'shipment_pts' }, () => scheduleShipmentRefresh(false))
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'picktickets' }, () => scheduleShipmentRefresh(false))
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'picktickets' }, () => scheduleShipmentRefresh(false))
+      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'picktickets' }, () => scheduleShipmentRefresh(false))
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'stale_shipment_snapshots' }, () => scheduleShipmentRefresh(true))
       .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'stale_shipment_snapshots' }, () => scheduleShipmentRefresh(true))
       .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'stale_shipment_snapshots' }, () => scheduleShipmentRefresh(true))
