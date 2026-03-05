@@ -92,7 +92,7 @@ export default function Home() {
       <div className="bg-gray-800 border-b border-gray-700 p-3 md:p-6">
         <div className="max-w-7xl mx-auto">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-            <h1 className="text-xl md:text-3xl font-bold">Lane Management System</h1>
+            <h1 className="text-xl md:text-3xl font-bold ml-8 md:ml-0">Lane Management System</h1>
             {isGuest && (
               <div className="text-xs md:text-sm text-yellow-300">Guest mode: read-only</div>
             )}
