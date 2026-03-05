@@ -43,6 +43,12 @@ interface LanePTStatusRow {
   status: string | null;
 }
 
+type RealtimeRow = Record<string, unknown> | null | undefined;
+type RealtimePayload = {
+  new: Record<string, unknown>;
+  old: Record<string, unknown>;
+};
+
 function describeSupabaseError(error: { code?: string; message?: string; details?: string; hint?: string } | null) {
   if (!error) return 'Unknown Supabase error';
   return [error.code, error.message, error.details, error.hint].filter(Boolean).join(' | ') || 'Unknown Supabase error';
@@ -60,6 +66,35 @@ function sortLaneNumbers(values: string[]) {
 function isUnlabeledStatus(status?: string | null) {
   const normalized = (status || '').trim().toLowerCase();
   return normalized === '' || normalized === 'unlabeled';
+}
+
+function readRealtimeText(row: RealtimeRow, key: string): string {
+  if (!row) return '';
+  const raw = row[key];
+  if (typeof raw === 'string') return raw.trim();
+  if (raw === null || raw === undefined) return '';
+  return String(raw).trim();
+}
+
+function isLaneAssignmentRealtimeRelevant(row: RealtimeRow): boolean {
+  return readRealtimeText(row, 'lane_number') !== '';
+}
+
+function isShipmentRealtimeRelevantForLaneGrid(row: RealtimeRow): boolean {
+  return readRealtimeText(row, 'staging_lane') !== '';
+}
+
+function isStorageAssignmentRealtimeRelevant(row: RealtimeRow): boolean {
+  const laneNumber = readRealtimeText(row, 'lane_number');
+  const active = readRealtimeText(row, 'active');
+  return laneNumber !== '' || active !== '';
+}
+
+function isPickticketRealtimeRelevantForLaneGrid(row: RealtimeRow, trackedContainerNumbers: Set<string>): boolean {
+  const assignedLane = readRealtimeText(row, 'assigned_lane');
+  if (assignedLane !== '') return true;
+  const containerNumber = readRealtimeText(row, 'container_number');
+  return containerNumber !== '' && trackedContainerNumbers.has(containerNumber);
 }
 
 export default function LaneGrid({ readOnly = false }: LaneGridProps) {
@@ -303,14 +338,54 @@ export default function LaneGrid({ readOnly = false }: LaneGridProps) {
   }, [fetchLanes]);
 
   useEffect(() => {
+    const trackedContainerNumbers = new Set(
+      storageAssignments
+        .map((assignment) => String(assignment.container_number || '').trim())
+        .filter((value) => value !== '')
+    );
+
+    const handleLaneAssignmentChange = (payload: RealtimePayload) => {
+      if (!isLaneAssignmentRealtimeRelevant(payload.new) && !isLaneAssignmentRealtimeRelevant(payload.old)) return;
+      scheduleLaneRefresh();
+    };
+
+    const handleShipmentChange = (payload: RealtimePayload) => {
+      if (!isShipmentRealtimeRelevantForLaneGrid(payload.new) && !isShipmentRealtimeRelevantForLaneGrid(payload.old)) return;
+      scheduleLaneRefresh();
+    };
+
+    const handlePickticketChange = (payload: RealtimePayload) => {
+      if (
+        !isPickticketRealtimeRelevantForLaneGrid(payload.new, trackedContainerNumbers) &&
+        !isPickticketRealtimeRelevantForLaneGrid(payload.old, trackedContainerNumbers)
+      ) {
+        return;
+      }
+      scheduleLaneRefresh();
+    };
+
+    const handleStorageAssignmentChange = (payload: RealtimePayload) => {
+      if (!isStorageAssignmentRealtimeRelevant(payload.new) && !isStorageAssignmentRealtimeRelevant(payload.old)) return;
+      scheduleLaneRefresh();
+    };
+
     const channel = supabase
       .channel('lane-grid-realtime')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'lanes' }, scheduleLaneRefresh)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'lane_assignments' }, scheduleLaneRefresh)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'picktickets' }, scheduleLaneRefresh)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'shipments' }, scheduleLaneRefresh)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'shipment_pts' }, scheduleLaneRefresh)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'container_storage_assignments' }, scheduleLaneRefresh)
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'lanes' }, scheduleLaneRefresh)
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'lanes' }, scheduleLaneRefresh)
+      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'lanes' }, scheduleLaneRefresh)
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'lane_assignments' }, handleLaneAssignmentChange)
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'lane_assignments' }, handleLaneAssignmentChange)
+      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'lane_assignments' }, handleLaneAssignmentChange)
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'picktickets' }, handlePickticketChange)
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'picktickets' }, handlePickticketChange)
+      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'picktickets' }, handlePickticketChange)
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'shipments' }, handleShipmentChange)
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'shipments' }, handleShipmentChange)
+      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'shipments' }, handleShipmentChange)
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'container_storage_assignments' }, handleStorageAssignmentChange)
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'container_storage_assignments' }, handleStorageAssignmentChange)
+      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'container_storage_assignments' }, handleStorageAssignmentChange)
       .subscribe();
 
     return () => {
@@ -320,7 +395,7 @@ export default function LaneGrid({ readOnly = false }: LaneGridProps) {
       }
       void supabase.removeChannel(channel);
     };
-  }, [scheduleLaneRefresh]);
+  }, [scheduleLaneRefresh, storageAssignments]);
 
   useEffect(() => {
     const laneQuery = searchParams.get('lane');

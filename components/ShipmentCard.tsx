@@ -152,6 +152,52 @@ export default function ShipmentCard({
     setAdminShipmentArchived(Boolean(shipment.archived));
   }, [shipment.status, shipment.archived, shipment.pu_number, shipment.pu_date]);
 
+  async function normalizeStagedPTLaneAssignments(ptId: number, targetLane: string, palletCount: number) {
+    const normalizedPalletCount = Number.isFinite(palletCount) ? Math.max(0, Math.trunc(palletCount)) : 0;
+
+    const { data: existingPtAssignments, error: existingPtAssignmentsError } = await supabase
+      .from('lane_assignments')
+      .select('id')
+      .eq('pt_id', ptId);
+    if (existingPtAssignmentsError) throw existingPtAssignmentsError;
+
+    if (existingPtAssignments && existingPtAssignments.length > 0) {
+      const assignmentIds = existingPtAssignments.map((assignment) => assignment.id);
+      const { error: deleteAssignmentsError } = await supabase
+        .from('lane_assignments')
+        .delete()
+        .in('id', assignmentIds);
+      if (deleteAssignmentsError) throw deleteAssignmentsError;
+    }
+
+    const { data: existingLaneAssignments, error: existingLaneAssignmentsError } = await supabase
+      .from('lane_assignments')
+      .select('id, order_position')
+      .eq('lane_number', targetLane)
+      .order('order_position', { ascending: true });
+    if (existingLaneAssignmentsError) throw existingLaneAssignmentsError;
+
+    if (existingLaneAssignments) {
+      for (const assignment of existingLaneAssignments) {
+        const { error: shiftAssignmentError } = await supabase
+          .from('lane_assignments')
+          .update({ order_position: (assignment.order_position || 0) + 1 })
+          .eq('id', assignment.id);
+        if (shiftAssignmentError) throw shiftAssignmentError;
+      }
+    }
+
+    const { error: insertAssignmentError } = await supabase
+      .from('lane_assignments')
+      .insert({
+        lane_number: targetLane,
+        pt_id: ptId,
+        pallet_count: normalizedPalletCount,
+        order_position: 1
+      });
+    if (insertAssignmentError) throw insertAssignmentError;
+  }
+
   // THE WATCHDOG: Automatically syncs PTs in the staging lane to staged/ready_to_ship based on shipment status.
   useEffect(() => {
     if (readOnly) return;
@@ -181,6 +227,8 @@ export default function ShipmentCard({
         .single();
 
       if (!shipmentData) throw new Error('Shipment not found');
+      if (!shipment.staging_lane) throw new Error('Staging lane not set');
+      const targetStagingLane = shipment.staging_lane;
 
       // Add to shipment_pts
       await supabase
@@ -201,53 +249,23 @@ export default function ShipmentCard({
       await supabase
         .from('picktickets')
         .update({
-          assigned_lane: shipment.staging_lane,
+          assigned_lane: targetStagingLane,
           status: ptStatus
         })
         .eq('id', pt.id);
 
-      // Remove old lane assignment if exists
-      if (pt.assigned_lane) {
-        const { data: oldAssignment } = await supabase
-          .from('lane_assignments')
-          .select('id')
-          .eq('pt_id', pt.id)
-          .eq('lane_number', pt.assigned_lane)
-          .maybeSingle();
-
-        if (oldAssignment) {
-          await supabase
-            .from('lane_assignments')
-            .delete()
-            .eq('id', oldAssignment.id);
-        }
-      }
-
-      // Shift existing staging PTs back so newly staged PT is always #1.
-      const { data: existingAssignments } = await supabase
+      const { data: ptAssignments, error: ptAssignmentsError } = await supabase
         .from('lane_assignments')
-        .select('id, order_position')
-        .eq('lane_number', shipment.staging_lane)
-        .order('order_position', { ascending: true });
+        .select('pallet_count')
+        .eq('pt_id', pt.id);
+      if (ptAssignmentsError) throw ptAssignmentsError;
 
-      if (existingAssignments) {
-        for (const assignment of existingAssignments) {
-          await supabase
-            .from('lane_assignments')
-            .update({ order_position: (assignment.order_position || 0) + 1 })
-            .eq('id', assignment.id);
-        }
-      }
-
-      // Add to staging lane
-      await supabase
-        .from('lane_assignments')
-        .insert({
-          lane_number: shipment.staging_lane,
-          pt_id: pt.id,
-          pallet_count: pt.actual_pallet_count,
-          order_position: 1
-        });
+      const fallbackPalletCount = (ptAssignments || []).reduce(
+        (sum, assignment) => sum + Number(assignment.pallet_count || 0),
+        0
+      );
+      const stagePalletCount = (pt.actual_pallet_count || 0) > 0 ? pt.actual_pallet_count : fallbackPalletCount;
+      await normalizeStagedPTLaneAssignments(pt.id, targetStagingLane, stagePalletCount);
 
       showToast(`✅ PT ${pt.pt_number} staged`, 'success');
       onUpdate();
@@ -672,6 +690,9 @@ export default function ShipmentCard({
           .from('picktickets')
           .update({ status: 'ready_to_ship', assigned_lane: laneNumber.toString() })
           .eq('id', ptId);
+
+        const palletCount = shipment.pts.find((pt) => pt.id === ptId)?.actual_pallet_count || 0;
+        await normalizeStagedPTLaneAssignments(ptId, laneNumber.toString(), palletCount);
       }
 
       if (ptsArray.length > 0) {
@@ -751,11 +772,7 @@ export default function ShipmentCard({
           .update({ assigned_lane: targetLaneNumber.toString() })
           .eq('id', pt.id);
 
-        await supabase
-          .from('lane_assignments')
-          .update({ lane_number: targetLaneNumber.toString() })
-          .eq('pt_id', pt.id)
-          .eq('lane_number', shipment.staging_lane);
+        await normalizeStagedPTLaneAssignments(pt.id, targetLaneNumber.toString(), pt.actual_pallet_count || 0);
       }
 
       showToast(`Moved to Lane ${targetLaneNumber}`, 'success');
@@ -791,8 +808,7 @@ export default function ShipmentCard({
         await supabase
           .from('lane_assignments')
           .delete()
-          .eq('pt_id', pt.id)
-          .eq('lane_number', shipment.staging_lane);
+          .eq('pt_id', pt.id);
 
         await supabase
           .from('picktickets')

@@ -57,6 +57,12 @@ type ShipmentPtRecordRow = {
   removed_from_staging: boolean;
 };
 
+type RealtimeRow = Record<string, unknown> | null | undefined;
+type RealtimePayload = {
+  new: Record<string, unknown>;
+  old: Record<string, unknown>;
+};
+
 function shipmentKey(shipment: Shipment) {
   return `${shipment.pu_number}-${shipment.pu_date}`;
 }
@@ -80,6 +86,33 @@ function getDaysSince(timestamp?: string | null, fallbackDate?: string): number 
   const fallback = new Date(fallbackDate);
   if (Number.isNaN(fallback.getTime())) return null;
   return Math.floor((Date.now() - fallback.getTime()) / DAY_MS);
+}
+
+function readRealtimeText(row: RealtimeRow, key: string): string {
+  if (!row) return '';
+  const raw = row[key];
+  if (typeof raw === 'string') return raw.trim();
+  if (raw === null || raw === undefined) return '';
+  return String(raw).trim();
+}
+
+function isShipmentPickticketRowRelevant(row: RealtimeRow): boolean {
+  const puNumber = readRealtimeText(row, 'pu_number');
+  const puDate = readRealtimeText(row, 'pu_date');
+  const customer = readRealtimeText(row, 'customer').toUpperCase();
+  return puNumber !== '' && puDate !== '' && customer !== 'PAPER';
+}
+
+function isShipmentRowRelevant(row: RealtimeRow): boolean {
+  const puNumber = readRealtimeText(row, 'pu_number');
+  const puDate = readRealtimeText(row, 'pu_date');
+  return puNumber !== '' && puDate !== '';
+}
+
+function isShipmentPtRowRelevant(row: RealtimeRow): boolean {
+  const shipmentId = readRealtimeText(row, 'shipment_id');
+  const ptId = readRealtimeText(row, 'pt_id');
+  return shipmentId !== '' && ptId !== '';
 }
 
 export default function ShipmentsPage() {
@@ -215,12 +248,35 @@ export default function ShipmentsPage() {
   }, [staleSnapshotStoreAvailable]);
 
   useEffect(() => {
+    const handleShipmentTableChange = (payload: RealtimePayload) => {
+      if (!isShipmentRowRelevant(payload.new) && !isShipmentRowRelevant(payload.old)) return;
+      scheduleShipmentRefresh(false);
+    };
+
+    const handleShipmentPtTableChange = (payload: RealtimePayload) => {
+      if (!isShipmentPtRowRelevant(payload.new) && !isShipmentPtRowRelevant(payload.old)) return;
+      scheduleShipmentRefresh(false);
+    };
+
+    const handlePickticketTableChange = (payload: RealtimePayload) => {
+      if (!isShipmentPickticketRowRelevant(payload.new) && !isShipmentPickticketRowRelevant(payload.old)) return;
+      scheduleShipmentRefresh(false);
+    };
+
     const channel = supabase
       .channel('shipments-page-realtime')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'shipments' }, () => scheduleShipmentRefresh(false))
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'shipment_pts' }, () => scheduleShipmentRefresh(false))
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'picktickets' }, () => scheduleShipmentRefresh(false))
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'stale_shipment_snapshots' }, () => scheduleShipmentRefresh(true))
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'shipments' }, handleShipmentTableChange)
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'shipments' }, handleShipmentTableChange)
+      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'shipments' }, handleShipmentTableChange)
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'shipment_pts' }, handleShipmentPtTableChange)
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'shipment_pts' }, handleShipmentPtTableChange)
+      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'shipment_pts' }, handleShipmentPtTableChange)
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'picktickets' }, handlePickticketTableChange)
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'picktickets' }, handlePickticketTableChange)
+      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'picktickets' }, handlePickticketTableChange)
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'stale_shipment_snapshots' }, () => scheduleShipmentRefresh(true))
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'stale_shipment_snapshots' }, () => scheduleShipmentRefresh(true))
+      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'stale_shipment_snapshots' }, () => scheduleShipmentRefresh(true))
       .subscribe();
 
     return () => {
@@ -818,62 +874,76 @@ export default function ShipmentsPage() {
   {/* Shipped Shipments */}
   {shippedShipments.length > 0 && (
     <div className="border-t-4 border-green-600 pt-8 mb-8">
-      <h2 className="text-2xl font-bold mb-4 text-green-400">✈️ Shipped ({shippedShipments.length})</h2>
-      <div className="space-y-4 opacity-75">
-        {shippedShipments.map((shipment) => {
-          const currentKey = shipmentKey(shipment);
-          return (
-            <div key={currentKey} data-shipment-card-key={currentKey}>
-              <ShipmentCard
-                shipment={shipment}
-                onUpdate={() => refreshShipmentView(currentKey)}
-                mostRecentSync={mostRecentSync}
-                isExpanded={expandedShipmentKey === currentKey}
-                onToggleExpand={(isExpanded) => {
-                  setExpandedShipmentKey(isExpanded ? currentKey : null);
-                  if (isExpanded) {
-                    focusedShipmentKeyRef.current = currentKey;
-                  }
-                }}
-                requireOCRForStaging={requireOCRForStaging}
-                readOnly={isGuest}
-                allowAdminStatusEdit={isAdmin}
-              />
-            </div>
-          );
-        })}
-      </div>
+      <details className="bg-green-950/20 rounded-lg border border-green-700/40">
+        <summary className="cursor-pointer list-none p-4 md:p-5 flex items-center justify-between">
+          <span className="text-2xl font-bold text-green-400">✈️ Shipped ({shippedShipments.length})</span>
+          <span className="text-sm text-green-200/80">Closed by default</span>
+        </summary>
+        <div className="px-3 md:px-5 pb-5">
+          <div className="space-y-4 opacity-75">
+            {shippedShipments.map((shipment) => {
+              const currentKey = shipmentKey(shipment);
+              return (
+                <div key={currentKey} data-shipment-card-key={currentKey}>
+                  <ShipmentCard
+                    shipment={shipment}
+                    onUpdate={() => refreshShipmentView(currentKey)}
+                    mostRecentSync={mostRecentSync}
+                    isExpanded={expandedShipmentKey === currentKey}
+                    onToggleExpand={(isExpanded) => {
+                      setExpandedShipmentKey(isExpanded ? currentKey : null);
+                      if (isExpanded) {
+                        focusedShipmentKeyRef.current = currentKey;
+                      }
+                    }}
+                    requireOCRForStaging={requireOCRForStaging}
+                    readOnly={isGuest}
+                    allowAdminStatusEdit={isAdmin}
+                  />
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </details>
     </div>
   )}
 
   {/* Archived Shipments */}
   {archivedShipments.length > 0 && (
     <div className="border-t-4 border-gray-600 pt-8">
-      <h2 className="text-2xl font-bold mb-4 text-gray-300">Archived ({archivedShipments.length})</h2>
-      <div className="space-y-4 opacity-60">
-        {archivedShipments.map((shipment) => {
-          const currentKey = shipmentKey(shipment);
-          return (
-            <div key={currentKey} data-shipment-card-key={currentKey}>
-              <ShipmentCard
-                shipment={shipment}
-                onUpdate={() => refreshShipmentView(currentKey)}
-                mostRecentSync={mostRecentSync}
-                isExpanded={expandedShipmentKey === currentKey}
-                onToggleExpand={(isExpanded) => {
-                  setExpandedShipmentKey(isExpanded ? currentKey : null);
-                  if (isExpanded) {
-                    focusedShipmentKeyRef.current = currentKey;
-                  }
-                }}
-                requireOCRForStaging={requireOCRForStaging}
-                readOnly={isGuest}
-                allowAdminStatusEdit={isAdmin}
-              />
-            </div>
-          );
-        })}
-      </div>
+      <details className="bg-gray-800 rounded-lg border border-gray-700">
+        <summary className="cursor-pointer list-none p-4 md:p-5 flex items-center justify-between">
+          <span className="text-2xl font-bold text-gray-300">Archived ({archivedShipments.length})</span>
+          <span className="text-sm text-gray-400">Closed by default</span>
+        </summary>
+        <div className="px-3 md:px-5 pb-5">
+          <div className="space-y-4 opacity-60">
+            {archivedShipments.map((shipment) => {
+              const currentKey = shipmentKey(shipment);
+              return (
+                <div key={currentKey} data-shipment-card-key={currentKey}>
+                  <ShipmentCard
+                    shipment={shipment}
+                    onUpdate={() => refreshShipmentView(currentKey)}
+                    mostRecentSync={mostRecentSync}
+                    isExpanded={expandedShipmentKey === currentKey}
+                    onToggleExpand={(isExpanded) => {
+                      setExpandedShipmentKey(isExpanded ? currentKey : null);
+                      if (isExpanded) {
+                        focusedShipmentKeyRef.current = currentKey;
+                      }
+                    }}
+                    requireOCRForStaging={requireOCRForStaging}
+                    readOnly={isGuest}
+                    allowAdminStatusEdit={isAdmin}
+                  />
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </details>
     </div>
   )}
 
