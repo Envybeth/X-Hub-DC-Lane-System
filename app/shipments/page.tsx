@@ -109,6 +109,7 @@ export default function ShipmentsPage() {
   const hasLoadedShipmentsRef = useRef(false);
   const includeHistoricalShipmentsRef = useRef(false);
   const staleRefreshRequestedRef = useRef(false);
+  const pendingVisibleRefreshRef = useRef(false);
   const focusedShipmentKeyRef = useRef<string | null>(null);
   const fetchShipmentsRef = useRef<() => Promise<void>>(async () => { });
   const fetchStaleSnapshotsRef = useRef<() => Promise<void>>(async () => { });
@@ -222,6 +223,10 @@ export default function ShipmentsPage() {
     if (includeStale) {
       staleRefreshRequestedRef.current = true;
     }
+    if (document.hidden) {
+      pendingVisibleRefreshRef.current = true;
+      return;
+    }
     if (shipmentRefreshTimerRef.current) {
       window.clearTimeout(shipmentRefreshTimerRef.current);
     }
@@ -233,6 +238,22 @@ export default function ShipmentsPage() {
       }
       shipmentRefreshTimerRef.current = null;
     }, 450);
+  }, [staleSnapshotStoreAvailable]);
+
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.visibilityState !== 'visible') return;
+      if (!pendingVisibleRefreshRef.current) return;
+      pendingVisibleRefreshRef.current = false;
+      void fetchShipmentsRef.current();
+      if (staleSnapshotStoreAvailable && staleRefreshRequestedRef.current) {
+        staleRefreshRequestedRef.current = false;
+        void fetchStaleSnapshotsRef.current();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
   }, [staleSnapshotStoreAvailable]);
 
   useEffect(() => {

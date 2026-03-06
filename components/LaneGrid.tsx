@@ -85,6 +85,7 @@ export default function LaneGrid({ readOnly = false }: LaneGridProps) {
   const laneRefreshTimerRef = useRef<number | null>(null);
   const laneFetchInFlightRef = useRef(false);
   const laneFetchQueuedRef = useRef(false);
+  const pendingVisibleRefreshRef = useRef(false);
 
   const fetchLanes = useCallback(async () => {
     if (laneFetchInFlightRef.current) {
@@ -270,6 +271,10 @@ export default function LaneGrid({ readOnly = false }: LaneGridProps) {
   }, []);
 
   const scheduleLaneRefresh = useCallback(() => {
+    if (document.hidden) {
+      pendingVisibleRefreshRef.current = true;
+      return;
+    }
     if (laneRefreshTimerRef.current) {
       window.clearTimeout(laneRefreshTimerRef.current);
     }
@@ -277,6 +282,18 @@ export default function LaneGrid({ readOnly = false }: LaneGridProps) {
       void fetchLanes();
       laneRefreshTimerRef.current = null;
     }, 450);
+  }, [fetchLanes]);
+
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.visibilityState !== 'visible') return;
+      if (!pendingVisibleRefreshRef.current) return;
+      pendingVisibleRefreshRef.current = false;
+      void fetchLanes();
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
   }, [fetchLanes]);
 
   useEffect(() => {

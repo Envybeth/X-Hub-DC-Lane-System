@@ -10,7 +10,7 @@ const REALTIME_LEADER_STALE_MS = 7500;
 const REALTIME_SIGNAL_STALE_MS = 12000;
 const REALTIME_SIGNAL_DISCONNECTED_MS = 30000;
 
-type RealtimeScope = 'shipments' | 'lane-grid';
+type RealtimeScope = 'shipments' | 'lane-grid' | 'notifications';
 type RealtimeHealth = 'live' | 'reconnecting' | 'disconnected';
 
 type RealtimeMessage =
@@ -50,7 +50,7 @@ function normalizeMessage(data: unknown): RealtimeMessage | null {
   if (
     candidate.type === 'realtime_scope_event' &&
     typeof candidate.leaderTabId === 'string' &&
-    (candidate.scope === 'shipments' || candidate.scope === 'lane-grid')
+    (candidate.scope === 'shipments' || candidate.scope === 'lane-grid' || candidate.scope === 'notifications')
   ) {
     return {
       type: 'realtime_scope_event',
@@ -61,6 +61,32 @@ function normalizeMessage(data: unknown): RealtimeMessage | null {
     };
   }
   return null;
+}
+
+type RealtimeDbPayload = {
+  eventType?: string;
+  new?: Record<string, unknown> | null;
+  old?: Record<string, unknown> | null;
+  commit_timestamp?: string | null;
+};
+
+function asTrimmedText(value: unknown): string {
+  if (value === null || value === undefined) return '';
+  const text = String(value).trim();
+  return text;
+}
+
+function asBoolean(value: unknown): boolean {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value !== 0;
+  const normalized = asTrimmedText(value).toLowerCase();
+  return normalized === 'true' || normalized === 't' || normalized === '1' || normalized === 'yes';
+}
+
+function safeIsoTimestamp(value: unknown): string {
+  const candidate = asTrimmedText(value);
+  if (candidate && Number.isFinite(Date.parse(candidate))) return candidate;
+  return new Date().toISOString();
 }
 
 function RealtimeStatusDot({ health }: { health: RealtimeHealth }) {
@@ -92,7 +118,8 @@ export function RealtimeProvider({ children }: { children: React.ReactNode }) {
   const broadcastRef = useRef<BroadcastChannel | null>(null);
   const listenersRef = useRef<Record<RealtimeScope, Set<ScopeListener>>>({
     shipments: new Set<ScopeListener>(),
-    'lane-grid': new Set<ScopeListener>()
+    'lane-grid': new Set<ScopeListener>(),
+    notifications: new Set<ScopeListener>()
   });
 
   const markSignal = useCallback(() => {
@@ -242,7 +269,35 @@ export function RealtimeProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     if (!isLeader) return;
 
-    const handleShipmentLikeChange = () => {
+    const emitNotification = (message: string, timestamp?: string | null) => {
+      const createdAt = safeIsoTimestamp(timestamp);
+      const id = `notif-${createdAt}-${Math.random().toString(36).slice(2, 8)}`;
+      emitScopeEvent('notifications', { id, message, createdAt });
+    };
+
+    const handleShipmentChange = (payload: RealtimeDbPayload) => {
+      emitScopeEvent('shipments', {});
+      emitScopeEvent('lane-grid', {});
+
+      if (payload.eventType !== 'UPDATE') return;
+
+      const wasArchived = asBoolean(payload.old?.archived);
+      const isArchived = asBoolean(payload.new?.archived);
+      if (!wasArchived && isArchived) {
+        const puNumber = asTrimmedText(payload.new?.pu_number);
+        const message = puNumber
+          ? `PU ${puNumber} moved to archived/shipped.`
+          : 'A shipment moved to archived/shipped.';
+        emitNotification(message, payload.commit_timestamp);
+      }
+    };
+
+    const handleShipmentPtChange = () => {
+      emitScopeEvent('shipments', {});
+      emitScopeEvent('lane-grid', {});
+    };
+
+    const handlePickticketChange = () => {
       emitScopeEvent('shipments', {});
       emitScopeEvent('lane-grid', {});
     };
@@ -255,15 +310,36 @@ export function RealtimeProvider({ children }: { children: React.ReactNode }) {
       emitScopeEvent('lane-grid', {});
     };
 
+    const handleSyncSummaryLogInsert = (payload: RealtimeDbPayload) => {
+      const details = payload.new?.details;
+      let errorCount = 0;
+      if (details && typeof details === 'object') {
+        const raw = (details as Record<string, unknown>).error_count;
+        const parsed = Number(raw);
+        if (Number.isFinite(parsed)) {
+          errorCount = parsed;
+        }
+      }
+      emitNotification(
+        errorCount > 0 ? 'A sync completed with errors.' : 'A sync completed.',
+        payload.commit_timestamp || asTrimmedText(payload.new?.created_at)
+      );
+    };
+
     const channel = supabase
       .channel('sitewide-realtime-leader')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'shipments' }, handleShipmentLikeChange)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'shipment_pts' }, handleShipmentLikeChange)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'picktickets' }, handleShipmentLikeChange)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'shipments' }, handleShipmentChange)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'shipment_pts' }, handleShipmentPtChange)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'picktickets' }, handlePickticketChange)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'stale_shipment_snapshots' }, handleStaleSnapshotChange)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'lanes' }, handleLaneLikeChange)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'lane_assignments' }, handleLaneLikeChange)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'container_storage_assignments' }, handleLaneLikeChange)
+      .on(
+        'postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'user_action_logs', filter: 'target_table=eq.sync_jobs' },
+        handleSyncSummaryLogInsert
+      )
       .subscribe((status) => {
         if (status === 'SUBSCRIBED') {
           markSignal();

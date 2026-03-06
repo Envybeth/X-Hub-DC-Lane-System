@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { useAuth } from './AuthProvider';
@@ -13,33 +13,10 @@ type NotificationItem = {
   createdAt: string;
 };
 
-type AuditNotificationRow = {
-  id: number;
-  target_table: string;
-  created_at: string;
-  summary: string;
-  actor_username: string | null;
-  actor_display_name: string | null;
-};
-
-const NOTIFICATION_POLL_MS = 20000;
-const NOTIFICATION_CLEAR_BEFORE_KEY = 'lane.notification.clear_before_iso';
-
-function toText(value: unknown): string | null {
-  if (value === null || value === undefined) return null;
-  const trimmed = String(value).trim();
-  return trimmed.length > 0 ? trimmed : null;
-}
-
-function actorLabel(row: AuditNotificationRow): string {
-  return toText(row.actor_display_name) || toText(row.actor_username) || 'system';
-}
-
 export default function AppAuthMenu() {
   const pathname = usePathname();
-  const { loading, isAuthenticated, isAdmin, isGuest, profile, session, signOut } = useAuth();
+  const { loading, isAuthenticated, isAdmin, isGuest, profile, signOut } = useAuth();
   const { subscribeScope } = useRealtimeCoordinator();
-  const accessToken = session?.access_token || null;
   const displayName = profile?.display_name || profile?.username || 'user';
   const username = profile?.username || displayName;
   const profileId = profile?.id || null;
@@ -48,18 +25,15 @@ export default function AppAuthMenu() {
   const [notificationOpen, setNotificationOpen] = useState(false);
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [seenById, setSeenById] = useState<Record<string, true>>({});
-  const [dismissedById, setDismissedById] = useState<Record<string, true>>({});
   const mobileMenuRef = useRef<HTMLDivElement | null>(null);
   const notificationMenuRef = useRef<HTMLDivElement | null>(null);
   const notificationButtonRef = useRef<HTMLButtonElement | null>(null);
-  const dismissedByIdRef = useRef<Record<string, true>>({});
-  const clearBeforeIsoRef = useRef<string | null>(null);
-  const notificationsHydratedRef = useRef(false);
+  const notificationOpenRef = useRef(false);
   const isCreatorAdmin = Boolean(isAdmin && profileId && creatorAdminId && profileId === creatorAdminId);
 
   useEffect(() => {
-    dismissedByIdRef.current = dismissedById;
-  }, [dismissedById]);
+    notificationOpenRef.current = notificationOpen;
+  }, [notificationOpen]);
 
   useEffect(() => {
     if (!mobileMenuOpen && !notificationOpen) return;
@@ -126,108 +100,28 @@ export default function AppAuthMenu() {
   useEffect(() => {
     if (!isCreatorAdmin) return;
 
-    const storedCutoff = window.sessionStorage.getItem(NOTIFICATION_CLEAR_BEFORE_KEY);
-    if (storedCutoff && Number.isFinite(Date.parse(storedCutoff))) {
-      clearBeforeIsoRef.current = storedCutoff;
-      return;
-    }
+    const unsubscribe = subscribeScope('notifications', (payload) => {
+      const id = typeof payload.id === 'string' ? payload.id.trim() : '';
+      const message = typeof payload.message === 'string' ? payload.message.trim() : '';
+      if (!id || !message) return;
 
-    const baseline = new Date().toISOString();
-    window.sessionStorage.setItem(NOTIFICATION_CLEAR_BEFORE_KEY, baseline);
-    clearBeforeIsoRef.current = baseline;
-  }, [isCreatorAdmin]);
+      const createdAtCandidate = typeof payload.createdAt === 'string' ? payload.createdAt : '';
+      const createdAt = Number.isFinite(Date.parse(createdAtCandidate))
+        ? createdAtCandidate
+        : new Date().toISOString();
 
-  const refreshNotifications = useCallback(async () => {
-    if (!isCreatorAdmin || !accessToken || !clearBeforeIsoRef.current) return;
-    const clearBeforeTimeMs = Date.parse(clearBeforeIsoRef.current);
-
-    const response = await fetch('/api/admin/audit-logs?view=notifications&limit=120', {
-      headers: {
-        Authorization: `Bearer ${accessToken}`
-      }
-    });
-    if (!response.ok) {
-      const message = await response.text().catch(() => response.statusText);
-      throw new Error(`Notification fetch failed: ${message}`);
-    }
-
-    const payload = (await response.json().catch(() => ({}))) as { logs?: AuditNotificationRow[] };
-    const logs = Array.isArray(payload.logs) ? payload.logs : [];
-    const rows = logs
-      .filter((row) => {
-        if (!Number.isFinite(clearBeforeTimeMs)) return true;
-        const createdAtMs = Date.parse(row.created_at);
-        if (!Number.isFinite(createdAtMs)) return true;
-        return createdAtMs > clearBeforeTimeMs;
-      })
-      .map((row) => {
-        const id = `audit-${row.id}`;
-        return {
-          id,
-          createdAt: row.created_at,
-          message: `${actorLabel(row)}: ${toText(row.summary) || 'Updated shipment data'}`
-        } satisfies NotificationItem;
-      })
-      .filter((item) => !dismissedByIdRef.current[item.id])
-      .slice(0, 80);
-
-    setNotifications(rows);
-    if (!notificationsHydratedRef.current) {
-      setSeenById((previous) => {
-        const next = { ...previous };
-        rows.forEach((item) => {
-          next[item.id] = true;
-        });
-        return next;
+      setNotifications((previous) => {
+        if (previous.some((item) => item.id === id)) return previous;
+        return [{ id, message, createdAt }, ...previous].slice(0, 80);
       });
-      notificationsHydratedRef.current = true;
-    }
-  }, [accessToken, isCreatorAdmin]);
 
-  useEffect(() => {
-    if (!isCreatorAdmin) return;
-    let cancelled = false;
-    let timer: number | null = null;
-
-    const refresh = async () => {
-      try {
-        await refreshNotifications();
-      } catch (error) {
-        if (!cancelled) {
-          console.error('Failed to refresh account notifications:', error);
-        }
+      if (notificationOpenRef.current) {
+        setSeenById((previous) => ({ ...previous, [id]: true }));
       }
-    };
-
-    void refresh();
-    timer = window.setInterval(() => {
-      void refresh();
-    }, NOTIFICATION_POLL_MS);
-
-    const handleVisibility = () => {
-      if (document.visibilityState === 'visible') {
-        void refresh();
-      }
-    };
-    document.addEventListener('visibilitychange', handleVisibility);
-
-    const unsubscribeShipments = subscribeScope('shipments', () => {
-      void refresh();
-    });
-    const unsubscribeLaneGrid = subscribeScope('lane-grid', () => {
-      void refresh();
     });
 
-    return () => {
-      cancelled = true;
-      if (timer !== null) {
-        window.clearInterval(timer);
-      }
-      document.removeEventListener('visibilitychange', handleVisibility);
-      unsubscribeShipments();
-      unsubscribeLaneGrid();
-    };
-  }, [isCreatorAdmin, refreshNotifications, subscribeScope]);
+    return () => unsubscribe();
+  }, [isCreatorAdmin, subscribeScope]);
 
   if (loading || !isAuthenticated || pathname === '/login') {
     return null;
@@ -252,13 +146,8 @@ export default function AppAuthMenu() {
   }
 
   function handleClearAllNotifications() {
-    const nextCutoff = new Date().toISOString();
-    window.sessionStorage.setItem(NOTIFICATION_CLEAR_BEFORE_KEY, nextCutoff);
-    clearBeforeIsoRef.current = nextCutoff;
     setNotifications([]);
     setSeenById({});
-    setDismissedById({});
-    notificationsHydratedRef.current = true;
   }
 
   return (
@@ -310,10 +199,6 @@ export default function AppAuthMenu() {
                         <button
                           type="button"
                           onClick={() => {
-                            setDismissedById((previous) => ({
-                              ...previous,
-                              [item.id]: true
-                            }));
                             setNotifications((previous) => previous.filter((row) => row.id !== item.id));
                             setSeenById((previous) => {
                               const next = { ...previous };
