@@ -41,6 +41,7 @@ type PickticketShipmentRow = {
   ctn: string | null;
   carrier: string | null;
   last_synced_at: string | null;
+  compiled_pallet_id: number | null;
 };
 
 type ShipmentRecordRow = {
@@ -300,7 +301,7 @@ export default function ShipmentsPage() {
     try {
       let pickticketQuery = supabase
         .from('picktickets')
-        .select('id, pt_number, po_number, customer, assigned_lane, actual_pallet_count, container_number, store_dc, cancel_date, start_date, pu_number, pu_date, status, ctn, carrier, last_synced_at')
+        .select('id, pt_number, po_number, customer, assigned_lane, actual_pallet_count, container_number, store_dc, cancel_date, start_date, pu_number, pu_date, status, ctn, carrier, last_synced_at, compiled_pallet_id')
         .not('pu_number', 'is', null)
         .not('pu_date', 'is', null)
         .neq('customer', 'PAPER');
@@ -363,7 +364,8 @@ export default function ShipmentsPage() {
           removed_from_staging: false,
           status: isShipped ? 'shipped' : pt.status,
           ctn: pt.ctn || undefined,
-          last_synced_at: pt.last_synced_at || undefined
+          last_synced_at: pt.last_synced_at || undefined,
+          compiled_pallet_id: pt.compiled_pallet_id
         });
         if (isShipped) {
           groupedShipments[key].archived = true;

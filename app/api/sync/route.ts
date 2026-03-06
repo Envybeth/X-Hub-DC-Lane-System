@@ -9,7 +9,7 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    const result = await syncGoogleSheetData();
+    const result = await syncGoogleSheetData({ actorUserId: authResult.userId });
     return NextResponse.json(result);
   } catch (error) {
     console.error('Sync failed:', error);
@@ -27,7 +27,7 @@ export async function GET(request: NextRequest) {
   }
 
   try {
-    const result = await syncGoogleSheetData();
+    const result = await syncGoogleSheetData({ actorUserId: authResult.userId });
     return NextResponse.json(result);
   } catch (error) {
     console.error('Sync failed:', error);

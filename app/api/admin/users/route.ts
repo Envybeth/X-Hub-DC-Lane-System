@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { requireAdmin } from '@/lib/serverAuth';
+import { getCreatorAdminId, requireAdmin } from '@/lib/serverAuth';
 import { getSupabaseAdmin } from '@/lib/supabaseAdmin';
 import { AppRole, isValidUsername, normalizeUsername } from '@/lib/auth';
 import { UserProfile } from '@/types/auth';
@@ -119,6 +119,19 @@ export async function POST(request: NextRequest) {
 
   if (!isRole(role)) {
     return NextResponse.json({ error: 'Invalid role.' }, { status: 400 });
+  }
+
+  if (role === 'admin') {
+    const { creatorAdminId, error: creatorLookupError } = await getCreatorAdminId();
+    if (creatorLookupError) {
+      return NextResponse.json({ error: creatorLookupError }, { status: 500 });
+    }
+    if (!creatorAdminId || creatorAdminId !== authResult.userId) {
+      return NextResponse.json(
+        { error: 'Only the creator account can create admin accounts.' },
+        { status: 403 }
+      );
+    }
   }
 
   const existingProfile = await supabaseAdmin

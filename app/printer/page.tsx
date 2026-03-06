@@ -13,6 +13,8 @@ interface PrintData {
   cancel_date: string;
   has_been_printed: boolean;
   ctn?: string;
+  source_pt_numbers?: string[];
+  source_po_numbers?: string[];
 }
 
 // CHANGE THIS PASSWORD TO WHATEVER YOU WANT
@@ -22,6 +24,7 @@ export default function PrinterPage() {
   const [inputVal, setInputVal] = useState('');
   const [loading, setLoading] = useState(false);
   const [printData, setPrintData] = useState<PrintData | null>(null);
+  const [multiPTMode, setMultiPTMode] = useState(false);
   const [palletCount, setPalletCount] = useState<number>(1);
   const [printing, setPrinting] = useState(false);
   const [statusMsg, setStatusMsg] = useState('');
@@ -62,6 +65,37 @@ export default function PrinterPage() {
     const nameOnly = originalName.slice(0, dotIndex);
     const ext = originalName.slice(dotIndex);
     return `${nameOnly}-annie-utd${ext}`;
+  }
+
+  function compareTicketByPt(a: { pt_number: string }, b: { pt_number: string }) {
+    const aDigits = a.pt_number.replace(/\D/g, '');
+    const bDigits = b.pt_number.replace(/\D/g, '');
+    if (aDigits && bDigits) {
+      const aNum = Number(aDigits);
+      const bNum = Number(bDigits);
+      if (Number.isFinite(aNum) && Number.isFinite(bNum) && aNum !== bNum) {
+        return aNum - bNum;
+      }
+    }
+    return a.pt_number.localeCompare(b.pt_number, undefined, { numeric: true, sensitivity: 'base' });
+  }
+
+  function parseMultiTokens(rawValue: string): string[] {
+    return Array.from(
+      new Set(
+        rawValue
+          .split(',')
+          .map((part) => part.trim())
+          .filter(Boolean)
+      )
+    );
+  }
+
+  function buildPtRange(ptNumbers: string[]): string {
+    if (ptNumbers.length === 0) return '';
+    if (ptNumbers.length === 1) return ptNumbers[0];
+    const sorted = [...ptNumbers].sort((a, b) => compareTicketByPt({ pt_number: a }, { pt_number: b }));
+    return `${sorted[0]} - ${sorted[sorted.length - 1]}`;
   }
 
   async function handleAnnieFile(file: File) {
@@ -169,34 +203,118 @@ export default function PrinterPage() {
     setStatusMsg('');
 
     try {
-      // Check if PT exists
-      const { data, error } = await supabase
-        .from('picktickets')
-        .select('id, pt_number, po_number, customer, store_dc, cancel_date, ctn')
-        .or(`pt_number.eq.${inputVal.trim()},po_number.eq.${inputVal.trim()}`)
-        .limit(1)
-        .single();
+      if (multiPTMode) {
+        const tokens = parseMultiTokens(inputVal);
+        if (tokens.length < 2) {
+          setStatusMsg('❌ Multi-PT mode requires 2+ PT/PO values separated by commas.');
+          return;
+        }
 
-      if (error || !data) {
-        setStatusMsg('❌ No Pick Ticket found');
-        return;
+        const [byPtResponse, byPoResponse] = await Promise.all([
+          supabase
+            .from('picktickets')
+            .select('id, pt_number, po_number, customer, store_dc, cancel_date, ctn')
+            .in('pt_number', tokens),
+          supabase
+            .from('picktickets')
+            .select('id, pt_number, po_number, customer, store_dc, cancel_date, ctn')
+            .in('po_number', tokens)
+        ]);
+
+        if (byPtResponse.error || byPoResponse.error) {
+          throw byPtResponse.error || byPoResponse.error;
+        }
+
+        const matchedById = new Map<number, {
+          id: number;
+          pt_number: string;
+          po_number: string;
+          customer: string;
+          store_dc: string;
+          cancel_date: string;
+          ctn: string | null;
+        }>();
+
+        (byPtResponse.data || []).forEach((row) => matchedById.set(row.id, row));
+        (byPoResponse.data || []).forEach((row) => matchedById.set(row.id, row));
+
+        const matches = Array.from(matchedById.values());
+        if (matches.length === 0) {
+          setStatusMsg('❌ No Pick Tickets found for the entered PT/PO values.');
+          return;
+        }
+
+        const unmatchedTokens = tokens.filter((token) => !matches.some((row) => row.pt_number === token || row.po_number === token));
+        if (unmatchedTokens.length > 0) {
+          setStatusMsg(`❌ Missing in system: ${unmatchedTokens.join(', ')}`);
+          return;
+        }
+
+        const sortedMatches = [...matches].sort(compareTicketByPt);
+        const first = sortedMatches[0];
+
+        const mismatch = sortedMatches.find((row) =>
+          row.customer !== first.customer ||
+          row.store_dc !== first.store_dc ||
+          row.cancel_date !== first.cancel_date ||
+          (row.ctn || '') !== (first.ctn || '')
+        );
+        if (mismatch) {
+          setStatusMsg('❌ Multi-PT rows must share customer, DC, cancel date, and CTN.');
+          return;
+        }
+
+        const ptNumbers = sortedMatches.map((row) => row.pt_number);
+        const poNumbers = sortedMatches.map((row) => row.po_number);
+        const ptRange = buildPtRange(ptNumbers);
+
+        const { data: historyData } = await supabase
+          .from('print_history')
+          .select('id')
+          .in('pt_number', ptNumbers);
+
+        setPrintData({
+          id: first.id,
+          pt_number: ptRange,
+          po_number: first.po_number,
+          customer: first.customer,
+          store_dc: first.store_dc,
+          cancel_date: first.cancel_date,
+          ctn: first.ctn || undefined,
+          has_been_printed: Boolean(historyData && historyData.length > 0),
+          source_pt_numbers: ptNumbers,
+          source_po_numbers: poNumbers
+        });
+        setPalletCount(1);
+        setStatusMsg('');
+      } else {
+        const { data, error } = await supabase
+          .from('picktickets')
+          .select('id, pt_number, po_number, customer, store_dc, cancel_date, ctn')
+          .or(`pt_number.eq.${inputVal.trim()},po_number.eq.${inputVal.trim()}`)
+          .limit(1)
+          .single();
+
+        if (error || !data) {
+          setStatusMsg('❌ No Pick Ticket found');
+          return;
+        }
+
+        const { data: historyData } = await supabase
+          .from('print_history')
+          .select('id')
+          .eq('pt_number', data.pt_number)
+          .limit(1);
+
+        const hasPrinted = historyData && historyData.length > 0;
+
+        setPrintData({
+          ...data,
+          has_been_printed: hasPrinted || false
+        });
+        setPalletCount(1);
+        setStatusMsg('');
       }
-
-      // Check if already printed
-      const { data: historyData } = await supabase
-        .from('print_history')
-        .select('id')
-        .eq('pt_number', data.pt_number)
-        .limit(1);
-
-      const hasPrinted = historyData && historyData.length > 0;
-
-      setPrintData({
-        ...data,
-        has_been_printed: hasPrinted || false
-      });
-      setPalletCount(1);
-      setStatusMsg('');
 
     } catch (err) {
       console.error(err);
@@ -256,14 +374,20 @@ export default function PrinterPage() {
 
       // Add to print history if first time
       if (!isReprint) {
+        const sourcePtNumbers = printData.source_pt_numbers && printData.source_pt_numbers.length > 0
+          ? printData.source_pt_numbers
+          : [printData.pt_number];
+
         await supabase
           .from('print_history')
-          .insert({
-            pt_number: printData.pt_number,
-            po_number: printData.po_number,
-            customer: printData.customer,
-            pallet_count: palletCount
-          });
+          .insert(
+            sourcePtNumbers.map((ptNumber) => ({
+              pt_number: ptNumber,
+              po_number: printData.po_number,
+              customer: printData.customer,
+              pallet_count: palletCount
+            }))
+          );
       }
 
       setStatusMsg(`✅ Sent to printer! ${palletCount * 2} labels queued.`);
@@ -310,15 +434,29 @@ export default function PrinterPage() {
 
         <div className="bg-gray-800 p-4 md:p-6 rounded-lg border border-gray-700 mb-6">
           <form onSubmit={handleSearch} className="flex flex-col gap-4">
-            <label className="text-sm font-semibold text-gray-400">
-              Scan or Type PT# / PO#
-            </label>
+            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+              <label className="text-sm font-semibold text-gray-400">
+                {multiPTMode ? 'Enter PT#/PO# list (comma separated)' : 'Scan or Type PT# / PO#'}
+              </label>
+              <label className="flex items-center gap-2 text-xs md:text-sm text-gray-300">
+                <input
+                  type="checkbox"
+                  checked={multiPTMode}
+                  onChange={(event) => {
+                    setMultiPTMode(event.target.checked);
+                    setPrintData(null);
+                    setStatusMsg('');
+                  }}
+                />
+                Multi-PT mode
+              </label>
+            </div>
             <div className="flex flex-col sm:flex-row gap-2">
               <input
                 type="text"
                 value={inputVal}
                 onChange={(e) => setInputVal(e.target.value)}
-                placeholder="Ex: 12345 or 123456789"
+                placeholder={multiPTMode ? 'Ex: 4756676, 4756677, 4756678' : 'Ex: 12345 or 123456789'}
                 className="flex-1 bg-gray-900 border border-gray-600 rounded-lg p-3 text-lg md:text-xl focus:border-blue-500 outline-none"
                 autoFocus
               />
@@ -330,6 +468,11 @@ export default function PrinterPage() {
                 {loading ? 'Searching...' : 'Search'}
               </button>
             </div>
+            {multiPTMode && (
+              <div className="text-xs text-gray-400">
+                Uses the lowest PT as reference row, prints PT range (min-max), and keeps PO/customer/DC/date/CTN from that reference.
+              </div>
+            )}
           </form>
           {statusMsg && (
             <div className={`mt-4 text-center font-bold text-base md:text-lg ${statusMsg.includes('❌') ? 'text-red-400' : statusMsg.includes('✅') ? 'text-green-400' : 'text-blue-400'}`}>
@@ -375,6 +518,14 @@ export default function PrinterPage() {
                 <p className="text-gray-400 text-xs md:text-sm">CTN</p>
                 <p className="font-bold text-lg md:text-xl">{printData.ctn || 'N/A'}</p>
               </div>
+              {printData.source_pt_numbers && printData.source_pt_numbers.length > 1 && (
+                <div className="sm:col-span-2">
+                  <p className="text-gray-400 text-xs md:text-sm">Included PTs</p>
+                  <p className="font-semibold text-sm md:text-base break-all">
+                    {printData.source_pt_numbers.join(', ')}
+                  </p>
+                </div>
+              )}
             </div>
 
             <div className="flex flex-col gap-4">

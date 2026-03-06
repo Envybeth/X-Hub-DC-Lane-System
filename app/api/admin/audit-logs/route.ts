@@ -33,6 +33,9 @@ type AuditLogResponseRow = AuditLogRow & {
   summary: string;
 };
 
+const SYNC_NOISE_TABLES = new Set(['picktickets', 'containers', 'shipment_pts', 'shipments']);
+const SYNC_LOOKBACK_MS = 15 * 60 * 1000;
+
 function toText(value: unknown): string | null {
   if (typeof value === 'string') {
     const trimmed = value.trim();
@@ -71,6 +74,79 @@ function readDetail(row: AuditLogRow, key: string, snapshot?: 'before' | 'after'
 
 function readDetailAny(row: AuditLogRow, key: string): string | null {
   return readDetail(row, key, 'after') || readDetail(row, key) || readDetail(row, key, 'before');
+}
+
+function parseTimestampMs(timestamp: string): number | null {
+  const parsed = Date.parse(timestamp);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function isGoogleSheetSyncLog(row: AuditLogRow): boolean {
+  if ((row.target_table || '').toLowerCase() !== 'sync_jobs') return false;
+  const operation = (readDetailAny(row, 'operation') || '').toLowerCase();
+  if (operation) return operation === 'google_sheet_sync';
+  return row.action === 'INSERT';
+}
+
+function isCriticalShipmentTransition(row: AuditLogRow): boolean {
+  if ((row.target_table || '').toLowerCase() !== 'shipments') return false;
+
+  const statusBefore = readDetail(row, 'status', 'before');
+  const statusAfter = readDetail(row, 'status', 'after') || readDetailAny(row, 'status');
+  if (statusBefore && statusAfter && statusBefore !== statusAfter) {
+    return true;
+  }
+
+  const archivedBefore = readDetail(row, 'archived', 'before');
+  const archivedAfter = readDetail(row, 'archived', 'after') || readDetailAny(row, 'archived');
+  if ((archivedBefore || archivedAfter) && archivedBefore !== archivedAfter) {
+    return true;
+  }
+
+  return false;
+}
+
+function compactSyncNoise(logs: AuditLogRow[]): AuditLogRow[] {
+  const syncMarkers = logs
+    .filter((row) => isGoogleSheetSyncLog(row))
+    .map((row) => ({
+      userId: row.user_id || null,
+      createdAtMs: parseTimestampMs(row.created_at)
+    }))
+    .filter((row): row is { userId: string | null; createdAtMs: number } => row.createdAtMs !== null);
+
+  if (syncMarkers.length === 0) return logs;
+
+  return logs.filter((row) => {
+    if (isGoogleSheetSyncLog(row)) return true;
+
+    const tableName = (row.target_table || '').toLowerCase();
+    if (!SYNC_NOISE_TABLES.has(tableName)) return true;
+    if (tableName === 'shipments' && isCriticalShipmentTransition(row)) return true;
+
+    const rowTimeMs = parseTimestampMs(row.created_at);
+    if (rowTimeMs === null) return true;
+
+    for (const marker of syncMarkers) {
+      const deltaMs = marker.createdAtMs - rowTimeMs;
+      if (deltaMs < 0 || deltaMs > SYNC_LOOKBACK_MS) continue;
+
+      if (row.user_id && marker.userId && row.user_id !== marker.userId) {
+        continue;
+      }
+      if (row.user_id && !marker.userId) {
+        continue;
+      }
+
+      return false;
+    }
+
+    return true;
+  });
+}
+
+function filterNotificationRows(logs: AuditLogRow[]): AuditLogRow[] {
+  return logs.filter((row) => isGoogleSheetSyncLog(row) || isCriticalShipmentTransition(row));
 }
 
 function extractPtId(row: AuditLogRow): string | null {
@@ -180,6 +256,17 @@ function buildAuditSummary(
   const ptLabel = ptNumber
     ? `PT ${ptNumber}${poNumber ? ` / PO ${poNumber}` : ''}`
     : (ptId ? `PT ID ${ptId}` : 'PT');
+
+  if (isGoogleSheetSyncLog(row)) {
+    const sourceSheet = readDetailAny(row, 'source_sheet') || row.target_id || 'Unknown sheet';
+    const syncedCount = readDetailAny(row, 'synced_count') || '0';
+    const skippedCount = readDetailAny(row, 'skipped_count') || '0';
+    const errorCount = readDetailAny(row, 'error_count') || '0';
+    if (errorCount !== '0') {
+      return `Google Sheet sync completed with errors (${syncedCount} synced, ${skippedCount} skipped, ${errorCount} errors)`;
+    }
+    return `Google Sheet sync completed (${syncedCount} synced, ${skippedCount} skipped) from ${sourceSheet}`;
+  }
 
   if (row.target_table === 'lane_assignments') {
     const laneBefore = readDetail(row, 'lane_number', 'before') || readDetailAny(row, 'from_lane');
@@ -294,15 +381,17 @@ export async function GET(request: NextRequest) {
 
   const userId = searchParams.get('userId')?.trim() || '';
   const date = searchParams.get('date')?.trim() || '';
+  const view = searchParams.get('view')?.trim().toLowerCase() || 'history';
   const limitRaw = Number.parseInt(searchParams.get('limit') || '200', 10);
   const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(limitRaw, 1000)) : 200;
+  const expandedLimit = Math.min(Math.max(limit * 6, limit), 5000);
 
   let query = supabaseAdmin
     .from('user_action_logs')
     .select('id, user_id, action, target_table, target_id, details, created_at')
     .gte('created_at', new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString())
     .order('created_at', { ascending: false })
-    .limit(limit);
+    .limit(expandedLimit);
 
   if (userId) {
     query = query.eq('user_id', userId);
@@ -324,7 +413,10 @@ export async function GET(request: NextRequest) {
   }
 
   const rawLogs = (logsData || []) as AuditLogRow[];
-  const logs = combineLaneMoveLogs(rawLogs);
+  const combinedLogs = combineLaneMoveLogs(rawLogs);
+  const compactedLogs = compactSyncNoise(combinedLogs);
+  const scopedLogs = view === 'notifications' ? filterNotificationRows(compactedLogs) : compactedLogs;
+  const logs = scopedLogs.slice(0, limit);
   const actorIds = Array.from(new Set(logs.map((row) => row.user_id).filter((id): id is string => Boolean(id))));
 
   let profilesById = new Map<string, UserProfileRow>();

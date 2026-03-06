@@ -38,7 +38,7 @@ interface AuditLogEntry {
 }
 
 export default function AccountsPage() {
-  const { loading, isAdmin, session, signOut } = useAuth();
+  const { loading, isAdmin, profile, session, signOut } = useAuth();
   const [accounts, setAccounts] = useState<AccountRow[]>([]);
   const [accountSearch, setAccountSearch] = useState('');
   const [loadingAccounts, setLoadingAccounts] = useState(false);
@@ -59,6 +59,12 @@ export default function AccountsPage() {
   const [historyDate, setHistoryDate] = useState('');
   const [historyUserIdFilter, setHistoryUserIdFilter] = useState<'all' | string>('all');
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [creatorAdminId, setCreatorAdminId] = useState<string | null>(null);
+  const [resolvingCreatorAdmin, setResolvingCreatorAdmin] = useState(false);
+  const [showCreatePassword, setShowCreatePassword] = useState(false);
+  const [passwordDraftById, setPasswordDraftById] = useState<Record<string, string>>({});
+  const [showPasswordById, setShowPasswordById] = useState<Record<string, boolean>>({});
+  const isCreatorAdmin = Boolean(isAdmin && profile?.id && creatorAdminId && profile.id === creatorAdminId);
 
   useEffect(() => {
     if (!loading && isAdmin) {
@@ -67,6 +73,49 @@ export default function AccountsPage() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loading, isAdmin]);
+
+  useEffect(() => {
+    if (loading || !isAdmin) {
+      setCreatorAdminId(null);
+      setResolvingCreatorAdmin(false);
+      return;
+    }
+
+    let alive = true;
+    setResolvingCreatorAdmin(true);
+
+    async function resolveCreatorAdmin() {
+      const { data, error } = await supabase
+        .from('user_profiles')
+        .select('id')
+        .eq('role', 'admin')
+        .order('created_at', { ascending: true })
+        .limit(1)
+        .maybeSingle();
+
+      if (!alive) return;
+      if (error) {
+        console.error('Failed to resolve creator admin account:', error);
+        setCreatorAdminId(null);
+        setResolvingCreatorAdmin(false);
+        return;
+      }
+
+      setCreatorAdminId(data?.id || null);
+      setResolvingCreatorAdmin(false);
+    }
+
+    void resolveCreatorAdmin();
+
+    return () => {
+      alive = false;
+    };
+  }, [loading, isAdmin]);
+
+  useEffect(() => {
+    if (isCreatorAdmin) return;
+    setCreateForm((prev) => (prev.role === 'admin' ? { ...prev, role: 'guest' } : prev));
+  }, [isCreatorAdmin]);
 
   async function getAccessToken(): Promise<string | null> {
     const { data } = await supabase.auth.getSession();
@@ -202,6 +251,10 @@ export default function AccountsPage() {
     event.preventDefault();
 
     setErrorText('');
+    if (createForm.role === 'admin' && !isCreatorAdmin) {
+      setErrorText('Only the creator account can create admin accounts.');
+      return;
+    }
     setCreating(true);
     try {
       const { response, payload } = await requestAdminApi('/api/admin/users', {
@@ -243,6 +296,15 @@ export default function AccountsPage() {
   async function handleSaveAccount(accountId: string) {
     const edits = editsById[accountId];
     if (!edits) return;
+    const account = accounts.find((candidate) => candidate.id === accountId);
+    if (!account) return;
+
+    const editingOtherAdminAccount = account.role === 'admin' && account.id !== profile?.id;
+    const promotingToAdmin = account.role !== 'admin' && edits.role === 'admin';
+    if ((editingOtherAdminAccount || promotingToAdmin) && !isCreatorAdmin) {
+      setErrorText('Only the creator account can edit other admin accounts.');
+      return;
+    }
 
     setSavingId(accountId);
     setErrorText('');
@@ -282,8 +344,19 @@ export default function AccountsPage() {
   }
 
   async function handleResetPassword(accountId: string) {
-    const nextPassword = window.prompt('Enter new password (min 8 chars):');
-    if (nextPassword === null) return;
+    const account = accounts.find((candidate) => candidate.id === accountId);
+    if (!account) return;
+    const editingOtherAdminAccount = account.role === 'admin' && account.id !== profile?.id;
+    if (editingOtherAdminAccount && !isCreatorAdmin) {
+      setErrorText('Only the creator account can reset passwords for other admin accounts.');
+      return;
+    }
+
+    const nextPassword = (passwordDraftById[accountId] || '').trim();
+    if (nextPassword.length < 8) {
+      setErrorText('Password must be at least 8 characters.');
+      return;
+    }
 
     setSavingId(accountId);
     setErrorText('');
@@ -307,6 +380,8 @@ export default function AccountsPage() {
         setErrorText(message);
         return;
       }
+      setPasswordDraftById((prev) => ({ ...prev, [accountId]: '' }));
+      setShowPasswordById((prev) => ({ ...prev, [accountId]: false }));
     } catch (error) {
       console.error('Failed to reset password:', error);
       setErrorText('Failed to reset password.');
@@ -316,6 +391,14 @@ export default function AccountsPage() {
   }
 
   async function handleDeleteAccount(accountId: string, username: string) {
+    const account = accounts.find((candidate) => candidate.id === accountId);
+    if (!account) return;
+    const deletingAdminAccount = account.role === 'admin';
+    if (deletingAdminAccount && !isCreatorAdmin) {
+      setErrorText('Only the creator account can delete admin accounts.');
+      return;
+    }
+
     const confirmed = window.confirm(`Delete account "${username}"? This cannot be undone.`);
     if (!confirmed) return;
 
@@ -348,13 +431,23 @@ export default function AccountsPage() {
   }
 
   const normalizedSearch = accountSearch.trim().toLowerCase();
-  const visibleAccounts = normalizedSearch
+  const filteredAccounts = normalizedSearch
     ? accounts.filter((account) => {
       const username = account.username.toLowerCase();
       const displayName = (account.display_name || '').toLowerCase();
       return username.includes(normalizedSearch) || displayName.includes(normalizedSearch);
     })
     : accounts;
+  const myAccountId = profile?.id || null;
+  const myAccount = myAccountId
+    ? accounts.find((account) => account.id === myAccountId) || null
+    : null;
+  const visibleAccounts = filteredAccounts.filter((account) => account.id !== myAccountId);
+  const accountSections: Array<{ role: AppRole; label: string; accounts: AccountRow[] }> = [
+    { role: 'admin', label: 'Admin', accounts: visibleAccounts.filter((account) => account.role === 'admin') },
+    { role: 'worker', label: 'Worker', accounts: visibleAccounts.filter((account) => account.role === 'worker') },
+    { role: 'guest', label: 'Viewer', accounts: visibleAccounts.filter((account) => account.role === 'guest') }
+  ];
   const selectedHistoryAccount = historyUserIdFilter === 'all'
     ? null
     : accounts.find((account) => account.id === historyUserIdFilter) || null;
@@ -399,6 +492,137 @@ export default function AccountsPage() {
     return JSON.stringify(details, null, 2);
   }
 
+  function renderAccountEditor(account: AccountRow, options?: { pinned?: boolean }) {
+    const edits = editsById[account.id];
+    if (!edits) return null;
+
+    const isOwnAccount = account.id === myAccountId;
+    const isOtherAdminAccount = account.role === 'admin' && !isOwnAccount;
+    const adminAccountLocked = isOtherAdminAccount && !isCreatorAdmin;
+    const canChooseAdminRole = isCreatorAdmin || account.role === 'admin';
+    const isBusy = savingId === account.id;
+    const passwordDraft = passwordDraftById[account.id] || '';
+    const showPassword = Boolean(showPasswordById[account.id]);
+
+    return (
+      <div
+        key={account.id}
+        className={`p-4 space-y-2 ${options?.pinned ? 'bg-indigo-950/30 border border-indigo-700 rounded-lg' : ''}`}
+      >
+        <div className="flex items-center justify-between gap-2">
+          <div className="text-xs text-gray-400">{account.id}</div>
+          <div className="text-xs text-gray-500">
+            Last sign in: {account.last_sign_in_at ? new Date(account.last_sign_in_at).toLocaleString() : 'Never'}
+          </div>
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-2">
+          <input
+            name={`edit-username-${account.id}`}
+            autoComplete="off"
+            value={edits.username}
+            disabled={adminAccountLocked || isBusy}
+            onChange={(e) => setEditsById((prev) => ({
+              ...prev,
+              [account.id]: { ...prev[account.id], username: e.target.value }
+            }))}
+            className="bg-gray-700 border border-gray-600 rounded px-3 py-2 disabled:opacity-60"
+          />
+          <input
+            name={`edit-display-${account.id}`}
+            autoComplete="off"
+            value={edits.display_name}
+            disabled={adminAccountLocked || isBusy}
+            onChange={(e) => setEditsById((prev) => ({
+              ...prev,
+              [account.id]: { ...prev[account.id], display_name: e.target.value }
+            }))}
+            className="bg-gray-700 border border-gray-600 rounded px-3 py-2 disabled:opacity-60"
+          />
+          <select
+            value={edits.role}
+            disabled={adminAccountLocked || isBusy}
+            onChange={(e) => setEditsById((prev) => ({
+              ...prev,
+              [account.id]: { ...prev[account.id], role: e.target.value as AppRole }
+            }))}
+            className="bg-gray-700 border border-gray-600 rounded px-3 py-2 disabled:opacity-60"
+          >
+            <option value="guest">viewer</option>
+            <option value="worker">worker</option>
+            {canChooseAdminRole && <option value="admin">admin</option>}
+          </select>
+          <label className="flex items-center gap-2 px-2">
+            <input
+              type="checkbox"
+              checked={edits.active}
+              disabled={adminAccountLocked || isBusy}
+              onChange={(e) => setEditsById((prev) => ({
+                ...prev,
+                [account.id]: { ...prev[account.id], active: e.target.checked }
+              }))}
+            />
+            <span>Active</span>
+          </label>
+        </div>
+        {adminAccountLocked && (
+          <div className="text-xs text-yellow-300">
+            Locked: only the creator account can edit this admin profile.
+          </div>
+        )}
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            onClick={() => {
+              setHistoryUserIdFilter(account.id);
+              void fetchHistory(account.id, historyDate);
+            }}
+            className="bg-gray-600 hover:bg-gray-500 px-3 py-1.5 rounded font-semibold text-sm"
+          >
+            History
+          </button>
+          <button
+            onClick={() => void handleSaveAccount(account.id)}
+            disabled={isBusy || adminAccountLocked}
+            className="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 px-3 py-1.5 rounded font-semibold text-sm"
+          >
+            Save
+          </button>
+          <div className="flex items-center gap-2 bg-gray-900/70 border border-gray-700 rounded px-2 py-1.5">
+            <input
+              type={showPassword ? 'text' : 'password'}
+              value={passwordDraft}
+              disabled={isBusy || adminAccountLocked}
+              onChange={(e) => setPasswordDraftById((prev) => ({ ...prev, [account.id]: e.target.value }))}
+              placeholder="new password (min 8)"
+              className="bg-transparent outline-none text-sm w-40 disabled:opacity-60"
+            />
+            <button
+              type="button"
+              disabled={isBusy}
+              onClick={() => setShowPasswordById((prev) => ({ ...prev, [account.id]: !showPassword }))}
+              className="text-xs bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded disabled:opacity-60"
+            >
+              {showPassword ? 'Hide' : 'Show'}
+            </button>
+          </div>
+          <button
+            onClick={() => void handleResetPassword(account.id)}
+            disabled={isBusy || adminAccountLocked || passwordDraft.trim().length < 8}
+            className="bg-yellow-600 hover:bg-yellow-700 disabled:bg-gray-600 px-3 py-1.5 rounded font-semibold text-sm"
+          >
+            Set Password
+          </button>
+          <button
+            onClick={() => void handleDeleteAccount(account.id, account.username)}
+            disabled={isBusy || adminAccountLocked || isOwnAccount}
+            className="bg-red-600 hover:bg-red-700 disabled:bg-gray-600 px-3 py-1.5 rounded font-semibold text-sm"
+          >
+            Delete
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   if (loading) {
     return (
       <div className="min-h-screen bg-gray-900 text-white flex items-center justify-center">
@@ -433,6 +657,11 @@ export default function AccountsPage() {
 
         <form onSubmit={handleCreateAccount} className="bg-gray-800 border border-gray-700 rounded-xl p-4 md:p-5 space-y-3">
           <h2 className="text-lg md:text-xl font-bold">Create Account</h2>
+          {!isCreatorAdmin && (
+            <div className="text-xs text-yellow-300">
+              Only the creator account can create admin accounts.
+            </div>
+          )}
           <div className="grid grid-cols-1 md:grid-cols-5 gap-2">
             <input
               name="new-account-username"
@@ -450,27 +679,36 @@ export default function AccountsPage() {
               placeholder="display name"
               className="bg-gray-700 border border-gray-600 rounded px-3 py-2"
             />
-            <input
-              name="new-account-password"
-              type="password"
-              autoComplete="new-password"
-              value={createForm.password}
-              onChange={(e) => setCreateForm((prev) => ({ ...prev, password: e.target.value }))}
-              placeholder="password"
-              className="bg-gray-700 border border-gray-600 rounded px-3 py-2"
-            />
+            <div className="relative">
+              <input
+                name="new-account-password"
+                type={showCreatePassword ? 'text' : 'password'}
+                autoComplete="new-password"
+                value={createForm.password}
+                onChange={(e) => setCreateForm((prev) => ({ ...prev, password: e.target.value }))}
+                placeholder="password"
+                className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 pr-16"
+              />
+              <button
+                type="button"
+                onClick={() => setShowCreatePassword((prev) => !prev)}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-xs bg-gray-600 hover:bg-gray-500 px-2 py-1 rounded"
+              >
+                {showCreatePassword ? 'Hide' : 'Show'}
+              </button>
+            </div>
             <select
               value={createForm.role}
               onChange={(e) => setCreateForm((prev) => ({ ...prev, role: e.target.value as AppRole }))}
               className="bg-gray-700 border border-gray-600 rounded px-3 py-2"
             >
-              <option value="guest">guest</option>
+              <option value="guest">viewer</option>
               <option value="worker">worker</option>
-              <option value="admin">admin</option>
+              {isCreatorAdmin && <option value="admin">admin</option>}
             </select>
             <button
               type="submit"
-              disabled={creating}
+              disabled={creating || (createForm.role === 'admin' && !isCreatorAdmin)}
               className="bg-green-600 hover:bg-green-700 disabled:bg-gray-600 rounded px-3 py-2 font-semibold"
             >
               {creating ? 'Creating...' : 'Create'}
@@ -595,11 +833,29 @@ export default function AccountsPage() {
           </div>
         )}
 
+        {resolvingCreatorAdmin && (
+          <div className="bg-gray-800 border border-gray-700 rounded-xl p-3 text-sm text-gray-300">
+            Resolving creator-account permissions...
+          </div>
+        )}
+
+        {myAccount && (
+          <div className="bg-gray-800 border border-indigo-700 rounded-xl overflow-hidden">
+            <div className="px-4 py-3 border-b border-indigo-700 font-semibold">
+              My Profile
+            </div>
+            <div className="p-4">
+              {renderAccountEditor(myAccount, { pinned: true })}
+            </div>
+          </div>
+        )}
+
         <div className="bg-gray-800 border border-gray-700 rounded-xl overflow-hidden">
           <div className="px-4 py-3 border-b border-gray-700 space-y-3">
             <div className="font-semibold">
-              Accounts ({visibleAccounts.length}{visibleAccounts.length !== accounts.length ? ` / ${accounts.length}` : ''})
+              Accounts By Role ({visibleAccounts.length}{visibleAccounts.length !== Math.max(0, accounts.length - (myAccount ? 1 : 0)) ? ` / ${Math.max(0, accounts.length - (myAccount ? 1 : 0))}` : ''})
             </div>
+            <div className="text-xs text-gray-400">Passwords are masked by default. Use Show/Hide next to each password field when setting a new password.</div>
             <input
               type="text"
               value={accountSearch}
@@ -615,97 +871,21 @@ export default function AccountsPage() {
               {accounts.length === 0 ? 'No accounts found.' : 'No matching accounts.'}
             </div>
           ) : (
-            <div className="divide-y divide-gray-700">
-              {visibleAccounts.map((account) => {
-                const edits = editsById[account.id];
-                if (!edits) return null;
-
-                return (
-                  <div key={account.id} className="p-4 space-y-2">
-                    <div className="text-xs text-gray-400">{account.id}</div>
-                    <div className="text-xs text-gray-500">
-                      Last sign in: {account.last_sign_in_at ? new Date(account.last_sign_in_at).toLocaleString() : 'Never'}
-                    </div>
-                    <div className="grid grid-cols-1 md:grid-cols-4 gap-2">
-                      <input
-                        name={`edit-username-${account.id}`}
-                        autoComplete="off"
-                        value={edits.username}
-                        onChange={(e) => setEditsById((prev) => ({
-                          ...prev,
-                          [account.id]: { ...prev[account.id], username: e.target.value }
-                        }))}
-                        className="bg-gray-700 border border-gray-600 rounded px-3 py-2"
-                      />
-                      <input
-                        name={`edit-display-${account.id}`}
-                        autoComplete="off"
-                        value={edits.display_name}
-                        onChange={(e) => setEditsById((prev) => ({
-                          ...prev,
-                          [account.id]: { ...prev[account.id], display_name: e.target.value }
-                        }))}
-                        className="bg-gray-700 border border-gray-600 rounded px-3 py-2"
-                      />
-                      <select
-                        value={edits.role}
-                        onChange={(e) => setEditsById((prev) => ({
-                          ...prev,
-                          [account.id]: { ...prev[account.id], role: e.target.value as AppRole }
-                        }))}
-                        className="bg-gray-700 border border-gray-600 rounded px-3 py-2"
-                      >
-                        <option value="guest">guest</option>
-                        <option value="worker">worker</option>
-                        <option value="admin">admin</option>
-                      </select>
-                      <label className="flex items-center gap-2 px-2">
-                        <input
-                          type="checkbox"
-                          checked={edits.active}
-                          onChange={(e) => setEditsById((prev) => ({
-                            ...prev,
-                            [account.id]: { ...prev[account.id], active: e.target.checked }
-                          }))}
-                        />
-                        <span>Active</span>
-                      </label>
-                    </div>
-                    <div className="flex flex-wrap gap-2">
-                      <button
-                        onClick={() => {
-                          setHistoryUserIdFilter(account.id);
-                          void fetchHistory(account.id, historyDate);
-                        }}
-                        className="bg-gray-600 hover:bg-gray-500 px-3 py-1.5 rounded font-semibold text-sm"
-                      >
-                        History
-                      </button>
-                      <button
-                        onClick={() => void handleSaveAccount(account.id)}
-                        disabled={savingId === account.id}
-                        className="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 px-3 py-1.5 rounded font-semibold text-sm"
-                      >
-                        Save
-                      </button>
-                      <button
-                        onClick={() => void handleResetPassword(account.id)}
-                        disabled={savingId === account.id}
-                        className="bg-yellow-600 hover:bg-yellow-700 disabled:bg-gray-600 px-3 py-1.5 rounded font-semibold text-sm"
-                      >
-                        Reset Password
-                      </button>
-                      <button
-                        onClick={() => void handleDeleteAccount(account.id, account.username)}
-                        disabled={savingId === account.id}
-                        className="bg-red-600 hover:bg-red-700 disabled:bg-gray-600 px-3 py-1.5 rounded font-semibold text-sm"
-                      >
-                        Delete
-                      </button>
-                    </div>
+            <div className="p-4 space-y-4">
+              {accountSections.map((section) => (
+                <div key={section.role} className="rounded-lg border border-gray-700 overflow-hidden">
+                  <div className="px-3 py-2 bg-gray-900/60 border-b border-gray-700 font-semibold text-sm">
+                    {section.label} ({section.accounts.length})
                   </div>
-                );
-              })}
+                  {section.accounts.length === 0 ? (
+                    <div className="p-3 text-sm text-gray-500">No {section.label.toLowerCase()} accounts.</div>
+                  ) : (
+                    <div className="divide-y divide-gray-700">
+                      {section.accounts.map((account) => renderAccountEditor(account))}
+                    </div>
+                  )}
+                </div>
+              ))}
             </div>
           )}
         </div>

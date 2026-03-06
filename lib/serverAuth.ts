@@ -90,3 +90,20 @@ export async function requireAdmin(request: NextRequest): Promise<AdminAuthResul
 export async function requireStaff(request: NextRequest): Promise<AdminAuthResult> {
   return requireAnyRole(request, ['admin', 'worker']);
 }
+
+export async function getCreatorAdminId(): Promise<{ creatorAdminId: string | null; error: string | null }> {
+  const supabaseAdmin = getSupabaseAdmin();
+  const { data, error } = await supabaseAdmin
+    .from('user_profiles')
+    .select('id')
+    .eq('role', 'admin')
+    .order('created_at', { ascending: true })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    return { creatorAdminId: null, error: error.message };
+  }
+
+  return { creatorAdminId: data?.id || null, error: null };
+}

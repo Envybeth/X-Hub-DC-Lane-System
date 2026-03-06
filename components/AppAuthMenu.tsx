@@ -23,7 +23,7 @@ type AuditNotificationRow = {
 };
 
 const NOTIFICATION_POLL_MS = 20000;
-const NOTIFICATION_TABLES = new Set(['shipments', 'shipment_pts', 'picktickets']);
+const NOTIFICATION_CLEAR_BEFORE_KEY = 'lane.notification.clear_before_iso';
 
 function toText(value: unknown): string | null {
   if (value === null || value === undefined) return null;
@@ -39,6 +39,7 @@ export default function AppAuthMenu() {
   const pathname = usePathname();
   const { loading, isAuthenticated, isAdmin, isGuest, profile, session, signOut } = useAuth();
   const { subscribeScope } = useRealtimeCoordinator();
+  const accessToken = session?.access_token || null;
   const displayName = profile?.display_name || profile?.username || 'user';
   const username = profile?.username || displayName;
   const profileId = profile?.id || null;
@@ -52,6 +53,7 @@ export default function AppAuthMenu() {
   const notificationMenuRef = useRef<HTMLDivElement | null>(null);
   const notificationButtonRef = useRef<HTMLButtonElement | null>(null);
   const dismissedByIdRef = useRef<Record<string, true>>({});
+  const clearBeforeIsoRef = useRef<string | null>(null);
   const notificationsHydratedRef = useRef(false);
   const isCreatorAdmin = Boolean(isAdmin && profileId && creatorAdminId && profileId === creatorAdminId);
 
@@ -121,12 +123,27 @@ export default function AppAuthMenu() {
     };
   }, [isAdmin, profileId]);
 
-  const refreshNotifications = useCallback(async () => {
-    if (!isCreatorAdmin || !session?.access_token) return;
+  useEffect(() => {
+    if (!isCreatorAdmin) return;
 
-    const response = await fetch('/api/admin/audit-logs?limit=120', {
+    const storedCutoff = window.sessionStorage.getItem(NOTIFICATION_CLEAR_BEFORE_KEY);
+    if (storedCutoff && Number.isFinite(Date.parse(storedCutoff))) {
+      clearBeforeIsoRef.current = storedCutoff;
+      return;
+    }
+
+    const baseline = new Date().toISOString();
+    window.sessionStorage.setItem(NOTIFICATION_CLEAR_BEFORE_KEY, baseline);
+    clearBeforeIsoRef.current = baseline;
+  }, [isCreatorAdmin]);
+
+  const refreshNotifications = useCallback(async () => {
+    if (!isCreatorAdmin || !accessToken || !clearBeforeIsoRef.current) return;
+    const clearBeforeTimeMs = Date.parse(clearBeforeIsoRef.current);
+
+    const response = await fetch('/api/admin/audit-logs?view=notifications&limit=120', {
       headers: {
-        Authorization: `Bearer ${session.access_token}`
+        Authorization: `Bearer ${accessToken}`
       }
     });
     if (!response.ok) {
@@ -137,7 +154,12 @@ export default function AppAuthMenu() {
     const payload = (await response.json().catch(() => ({}))) as { logs?: AuditNotificationRow[] };
     const logs = Array.isArray(payload.logs) ? payload.logs : [];
     const rows = logs
-      .filter((row) => NOTIFICATION_TABLES.has((row.target_table || '').toLowerCase()))
+      .filter((row) => {
+        if (!Number.isFinite(clearBeforeTimeMs)) return true;
+        const createdAtMs = Date.parse(row.created_at);
+        if (!Number.isFinite(createdAtMs)) return true;
+        return createdAtMs > clearBeforeTimeMs;
+      })
       .map((row) => {
         const id = `audit-${row.id}`;
         return {
@@ -160,7 +182,7 @@ export default function AppAuthMenu() {
       });
       notificationsHydratedRef.current = true;
     }
-  }, [isCreatorAdmin, session]);
+  }, [accessToken, isCreatorAdmin]);
 
   useEffect(() => {
     if (!isCreatorAdmin) return;
@@ -229,6 +251,16 @@ export default function AppAuthMenu() {
     });
   }
 
+  function handleClearAllNotifications() {
+    const nextCutoff = new Date().toISOString();
+    window.sessionStorage.setItem(NOTIFICATION_CLEAR_BEFORE_KEY, nextCutoff);
+    clearBeforeIsoRef.current = nextCutoff;
+    setNotifications([]);
+    setSeenById({});
+    setDismissedById({});
+    notificationsHydratedRef.current = true;
+  }
+
   return (
     <>
       {isCreatorAdmin && (
@@ -254,8 +286,15 @@ export default function AppAuthMenu() {
               ref={notificationMenuRef}
               className="absolute right-0 mt-2 w-[22rem] max-w-[90vw] max-h-[26rem] overflow-hidden bg-gray-900/95 border border-gray-700 rounded-xl shadow-2xl"
             >
-              <div className="px-3 py-2 border-b border-gray-700 text-xs text-gray-300 font-semibold">
-                Activity Notifications
+              <div className="px-3 py-2 border-b border-gray-700 flex items-center justify-between gap-2">
+                <span className="text-xs text-gray-300 font-semibold">Activity Notifications</span>
+                <button
+                  type="button"
+                  onClick={handleClearAllNotifications}
+                  className="text-[11px] px-2 py-0.5 rounded bg-gray-800 hover:bg-gray-700 border border-gray-700"
+                >
+                  Clear all
+                </button>
               </div>
               <div className="max-h-[22rem] overflow-y-auto">
                 {notifications.length === 0 ? (

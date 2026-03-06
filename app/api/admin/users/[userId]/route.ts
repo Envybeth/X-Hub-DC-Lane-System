@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { requireAdmin } from '@/lib/serverAuth';
+import { getCreatorAdminId, requireAdmin } from '@/lib/serverAuth';
 import { getSupabaseAdmin } from '@/lib/supabaseAdmin';
 import { AppRole, isValidUsername, normalizeUsername } from '@/lib/auth';
 
@@ -49,7 +49,7 @@ export async function PATCH(request: NextRequest, context: RouteContext) {
 
   const { data: currentProfile, error: profileLookupError } = await supabaseAdmin
     .from('user_profiles')
-    .select('id, username')
+    .select('id, username, role')
     .eq('id', userId)
     .maybeSingle();
 
@@ -70,6 +70,23 @@ export async function PATCH(request: NextRequest, context: RouteContext) {
 
   if (body.role !== undefined && !isRole(body.role)) {
     return NextResponse.json({ error: 'Invalid role.' }, { status: 400 });
+  }
+
+  const nextRole = body.role !== undefined ? body.role : currentProfile.role;
+  const editingOtherAdminAccount = currentProfile.role === 'admin' && userId !== authResult.userId;
+  const promotingToAdmin = currentProfile.role !== 'admin' && nextRole === 'admin';
+
+  if (editingOtherAdminAccount || promotingToAdmin) {
+    const { creatorAdminId, error: creatorLookupError } = await getCreatorAdminId();
+    if (creatorLookupError) {
+      return NextResponse.json({ error: creatorLookupError }, { status: 500 });
+    }
+    if (!creatorAdminId || creatorAdminId !== authResult.userId) {
+      return NextResponse.json(
+        { error: 'Only the creator account can edit other admin accounts.' },
+        { status: 403 }
+      );
+    }
   }
 
   if (body.password !== undefined && body.password.trim() !== '' && body.password.trim().length < 8) {
@@ -160,6 +177,29 @@ export async function DELETE(request: NextRequest, context: RouteContext) {
 
   if (userId === authResult.userId) {
     return NextResponse.json({ error: 'You cannot delete your own account.' }, { status: 400 });
+  }
+
+  const { data: targetProfile, error: targetProfileError } = await supabaseAdmin
+    .from('user_profiles')
+    .select('id, role')
+    .eq('id', userId)
+    .maybeSingle();
+
+  if (targetProfileError || !targetProfile) {
+    return NextResponse.json({ error: 'User profile not found.' }, { status: 404 });
+  }
+
+  if (targetProfile.role === 'admin') {
+    const { creatorAdminId, error: creatorLookupError } = await getCreatorAdminId();
+    if (creatorLookupError) {
+      return NextResponse.json({ error: creatorLookupError }, { status: 500 });
+    }
+    if (!creatorAdminId || creatorAdminId !== authResult.userId) {
+      return NextResponse.json(
+        { error: 'Only the creator account can delete admin accounts.' },
+        { status: 403 }
+      );
+    }
   }
 
   const { error } = await supabaseAdmin.auth.admin.deleteUser(userId);

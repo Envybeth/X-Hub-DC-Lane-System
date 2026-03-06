@@ -83,6 +83,10 @@ type ReconcileResult = {
   finalizedReopened: number;
 };
 
+type SyncGoogleSheetOptions = {
+  actorUserId?: string | null;
+};
+
 function chunkArray<T>(items: T[], chunkSize: number): T[][] {
   if (chunkSize <= 0) return [items];
   const chunks: T[][] = [];
@@ -396,6 +400,37 @@ async function reconcileShipmentIdentityAndStatus(
   return result;
 }
 
+async function logSyncSummaryEvent(
+  supabaseAdmin: SupabaseAdminClient,
+  options: SyncGoogleSheetOptions,
+  payload: {
+    sourceSheetName: string;
+    syncedCount: number;
+    skippedCount: number;
+    errorCount: number;
+  }
+) {
+  const actorUserId = trimToNull(options.actorUserId);
+  const { error } = await supabaseAdmin
+    .from('user_action_logs')
+    .insert({
+      user_id: actorUserId,
+      action: 'INSERT',
+      target_table: 'sync_jobs',
+      target_id: payload.sourceSheetName,
+      details: {
+        operation: 'google_sheet_sync',
+        source_sheet: payload.sourceSheetName,
+        synced_count: payload.syncedCount,
+        skipped_count: payload.skippedCount,
+        error_count: payload.errorCount
+      }
+    });
+  if (error) {
+    console.warn('Failed to log sync summary event:', error.message);
+  }
+}
+
 async function resolveSourceSheetName(spreadsheetId: string): Promise<string> {
   const metadata = await sheets.spreadsheets.get({
     spreadsheetId,
@@ -409,7 +444,7 @@ async function resolveSourceSheetName(spreadsheetId: string): Promise<string> {
   return firstSheetName;
 }
 
-export async function syncGoogleSheetData() {
+export async function syncGoogleSheetData(options: SyncGoogleSheetOptions = {}) {
   try {
     const spreadsheetId = process.env.GOOGLE_SHEET_ID;
     if (!spreadsheetId) {
@@ -595,6 +630,13 @@ export async function syncGoogleSheetData() {
     const message = success
       ? `Synced ${syncedCount} picktickets from "${sourceSheetName}"`
       : `Sync completed with errors from "${sourceSheetName}"`;
+
+    await logSyncSummaryEvent(supabaseAdmin, options, {
+      sourceSheetName,
+      syncedCount,
+      skippedCount,
+      errorCount
+    });
 
     console.log(`✅ ${message}. skipped=${skippedCount} errors=${errorCount}`);
     return {

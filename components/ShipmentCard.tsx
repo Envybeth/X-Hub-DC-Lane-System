@@ -1,12 +1,11 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { supabase } from '@/lib/supabase';
 import ConfirmModal from './ConfirmModal';
 import PTDetails from './PTDetails';
 import ActionToast from './ActionToast';
 import { isPTArchived } from '@/lib/utils';
-import { fetchCompiledPTInfo } from '@/lib/compiledPallets';
 import { exportShipmentSummaryPdf, ShipmentPdfLoad } from '@/lib/shipmentPdf';
 
 import OCRCamera from './OCRCamera';
@@ -55,6 +54,65 @@ function normalizeAdminPtStatus(status?: string | null): PickticketStatusOption 
   return 'unlabeled';
 }
 
+type ShipmentLaneDisplayGroup = {
+  key: string;
+  primary: ShipmentPT;
+  members: ShipmentPT[];
+};
+
+function normalizeDigits(value?: string | null): string {
+  return (value || '').replace(/\D/g, '');
+}
+
+function compareTextNumeric(a: string, b: string): number {
+  const aDigits = normalizeDigits(a);
+  const bDigits = normalizeDigits(b);
+  if (aDigits && bDigits) {
+    const aNum = Number(aDigits);
+    const bNum = Number(bDigits);
+    if (Number.isFinite(aNum) && Number.isFinite(bNum) && aNum !== bNum) {
+      return aNum - bNum;
+    }
+  }
+  return a.localeCompare(b, undefined, { sensitivity: 'base', numeric: true });
+}
+
+function getSortedUniqueLabels(values: Array<string | null | undefined>): string[] {
+  return Array.from(
+    new Set(
+      values
+        .map((value) => String(value || '').trim())
+        .filter(Boolean)
+    )
+  ).sort(compareTextNumeric);
+}
+
+function getRangeLabel(values: Array<string | null | undefined>): string {
+  const labels = getSortedUniqueLabels(values);
+  if (labels.length === 0) return '-';
+  if (labels.length === 1) return labels[0];
+  return `${labels[0]} - ${labels[labels.length - 1]}`;
+}
+
+function sumUniquePallets(pts: ShipmentPT[], predicate: (pt: ShipmentPT) => boolean): number {
+  const seenCompiledIds = new Set<number>();
+  let total = 0;
+
+  pts.forEach((pt) => {
+    if (!predicate(pt)) return;
+
+    const compiledId = pt.compiled_pallet_id;
+    if (compiledId !== null && compiledId !== undefined) {
+      if (seenCompiledIds.has(compiledId)) return;
+      seenCompiledIds.add(compiledId);
+    }
+
+    total += Number(pt.actual_pallet_count || 0);
+  });
+
+  return total;
+}
+
 export interface ShipmentCardProps {
   shipment: Shipment;
   onUpdate: () => void;
@@ -99,6 +157,9 @@ export default function ShipmentCard({
 
   //ocr
   const [scanningPT, setScanningPT] = useState<ShipmentPT | null>(null);
+  const [manualCompiledStagePTs, setManualCompiledStagePTs] = useState<ShipmentPT[] | null>(null);
+  const [manualCompiledInput, setManualCompiledInput] = useState('');
+  const [manualCompiledError, setManualCompiledError] = useState('');
 
   const [confirmModal, setConfirmModal] = useState<{
     isOpen: boolean;
@@ -112,9 +173,15 @@ export default function ShipmentCard({
     onConfirm: () => { }
   });
 
-  const totalPallets = shipment.pts.reduce((sum, pt) => sum + pt.actual_pallet_count, 0);
+  const totalPallets = useMemo(
+    () => sumUniquePallets(shipment.pts, () => true),
+    [shipment.pts]
+  );
   const movedCount = shipment.pts.filter(pt => pt.moved_to_staging && !pt.removed_from_staging).length;
-  const movedPTsTotalPallets = shipment.pts.filter(pt => pt.moved_to_staging && !pt.removed_from_staging).reduce((sum, pt) => sum + pt.actual_pallet_count, 0);
+  const movedPTsTotalPallets = useMemo(
+    () => sumUniquePallets(shipment.pts, (pt) => pt.moved_to_staging && !pt.removed_from_staging),
+    [shipment.pts]
+  );
   const hasShippedPT = shipment.pts.some(pt => pt.status === 'shipped');
   const hasReadyToShipPT = shipment.pts.some(pt => pt.status === 'ready_to_ship');
   const isReadyToShipLoad = shipment.status === 'finalized' && hasReadyToShipPT && !hasShippedPT && !shipment.archived;
@@ -386,6 +453,46 @@ export default function ShipmentCard({
     }
   }
 
+  const compiledMembersById = useMemo(() => {
+    const groups = new Map<number, ShipmentPT[]>();
+    shipment.pts.forEach((pt) => {
+      const compiledId = pt.compiled_pallet_id;
+      if (compiledId === null || compiledId === undefined) return;
+      const existing = groups.get(compiledId) || [];
+      existing.push(pt);
+      groups.set(compiledId, existing);
+    });
+
+    groups.forEach((members, compiledId) => {
+      groups.set(
+        compiledId,
+        [...members].sort((a, b) => compareTextNumeric(a.pt_number, b.pt_number))
+      );
+    });
+
+    return groups;
+  }, [shipment.pts]);
+
+  function getCompiledMembers(pt: ShipmentPT): ShipmentPT[] {
+    const compiledId = pt.compiled_pallet_id;
+    if (compiledId === null || compiledId === undefined) return [pt];
+    return compiledMembersById.get(compiledId) || [pt];
+  }
+
+  function getCompiledRepresentativeId(ptId: number): number {
+    const target = shipment.pts.find((pt) => pt.id === ptId);
+    if (!target) return ptId;
+    const compiledId = target.compiled_pallet_id;
+    if (compiledId === null || compiledId === undefined) return ptId;
+
+    const members = compiledMembersById.get(compiledId);
+    if (!members || members.length === 0) return ptId;
+
+    return [...members]
+      .sort((a, b) => compareTextNumeric(a.pt_number, b.pt_number))[0]
+      .id;
+  }
+
   const ptsByLane = shipment.pts.reduce((acc, pt) => {
     if (pt.moved_to_staging && !pt.removed_from_staging && shipment.staging_lane) {
       const stagingKey = `staging_${shipment.staging_lane}`;
@@ -418,6 +525,44 @@ export default function ShipmentCard({
     if (b === 'unassigned') return -1;
     return parseInt(a) - parseInt(b);
   });
+
+  const displayGroupsByLane = useMemo(() => {
+    return Object.fromEntries(
+      sortedLanes.map((laneKey) => {
+        const lanePts = sortedPtsByLane[laneKey] || [];
+        const groups: ShipmentLaneDisplayGroup[] = [];
+        const seenCompiledIds = new Set<number>();
+
+        lanePts.forEach((pt) => {
+          const compiledId = pt.compiled_pallet_id;
+          if (compiledId !== null && compiledId !== undefined) {
+            if (seenCompiledIds.has(compiledId)) return;
+            seenCompiledIds.add(compiledId);
+
+            const members = lanePts
+              .filter((candidate) => candidate.compiled_pallet_id === compiledId)
+              .sort((a, b) => compareTextNumeric(a.pt_number, b.pt_number));
+
+            const primary = members.find((member) => member.id === pt.id) || members[0] || pt;
+            groups.push({
+              key: `compiled-${compiledId}`,
+              primary,
+              members
+            });
+            return;
+          }
+
+          groups.push({
+            key: `pt-${pt.id}`,
+            primary: pt,
+            members: [pt]
+          });
+        });
+
+        return [laneKey, groups];
+      })
+    ) as Record<string, ShipmentLaneDisplayGroup[]>;
+  }, [sortedLanes, sortedPtsByLane]);
 
   useEffect(() => {
     if (expanded) {
@@ -474,17 +619,6 @@ export default function ShipmentCard({
 
   async function fetchDepthInfo() {
     const depthMap: { [key: number]: { palletsInFront: number; maxCapacity: number } } = {};
-
-    // Fetch compiled info for all PTs
-    const ptIds = shipment.pts.map(pt => pt.id);
-    const compiledInfo = await fetchCompiledPTInfo(ptIds);
-
-    // Attach compiled_with info to each PT
-    shipment.pts.forEach(pt => {
-      if (compiledInfo[pt.id]) {
-        pt.compiled_with = compiledInfo[pt.id] as ShipmentPT[];
-      }
-    });
 
     const assignedLaneNumbers = Array.from(
       new Set(
@@ -658,6 +792,7 @@ export default function ShipmentCard({
       });
 
       const ptsArray = Array.from(ptsToMarkAsStaged);
+      const normalizedRepresentativeIds = new Set<number>();
 
       for (const ptId of ptsArray) {
         await supabase
@@ -676,8 +811,12 @@ export default function ShipmentCard({
           .update({ status: 'ready_to_ship', assigned_lane: laneNumber.toString() })
           .eq('id', ptId);
 
-        const palletCount = shipment.pts.find((pt) => pt.id === ptId)?.actual_pallet_count || 0;
-        await normalizeStagedPTLaneAssignments(ptId, laneNumber.toString(), palletCount);
+        const representativeId = getCompiledRepresentativeId(ptId);
+        if (!normalizedRepresentativeIds.has(representativeId)) {
+          normalizedRepresentativeIds.add(representativeId);
+          const palletCount = shipment.pts.find((pt) => pt.id === representativeId)?.actual_pallet_count || 0;
+          await normalizeStagedPTLaneAssignments(representativeId, laneNumber.toString(), palletCount);
+        }
       }
 
       if (ptsArray.length > 0) {
@@ -751,13 +890,19 @@ export default function ShipmentCard({
         .eq('pu_number', shipment.pu_number)
         .eq('pu_date', shipment.pu_date);
 
+      const normalizedRepresentativeIds = new Set<number>();
       for (const pt of stagedPTs) {
         await supabase
           .from('picktickets')
           .update({ assigned_lane: targetLaneNumber.toString() })
           .eq('id', pt.id);
 
-        await normalizeStagedPTLaneAssignments(pt.id, targetLaneNumber.toString(), pt.actual_pallet_count || 0);
+        const representativeId = getCompiledRepresentativeId(pt.id);
+        if (!normalizedRepresentativeIds.has(representativeId)) {
+          normalizedRepresentativeIds.add(representativeId);
+          const palletCount = shipment.pts.find((candidate) => candidate.id === representativeId)?.actual_pallet_count || 0;
+          await normalizeStagedPTLaneAssignments(representativeId, targetLaneNumber.toString(), palletCount);
+        }
       }
 
       showToast(`Moved to Lane ${targetLaneNumber}`, 'success');
@@ -830,19 +975,157 @@ export default function ShipmentCard({
     }
   }
 
+  function getRepresentativePTForCompiledGroup(pts: ShipmentPT[]): ShipmentPT {
+    return [...pts].sort((a, b) => {
+      const aLaneCount = laneLocationsByPtId[a.id]?.length || 0;
+      const bLaneCount = laneLocationsByPtId[b.id]?.length || 0;
+      if (aLaneCount !== bLaneCount) return bLaneCount - aLaneCount;
+      return compareTextNumeric(a.pt_number, b.pt_number);
+    })[0] || pts[0];
+  }
+
+  async function performMoveCompiledGroup(pts: ShipmentPT[]) {
+    if (!shipment.staging_lane) throw new Error('Staging lane not set');
+    if (pts.length === 0) return;
+
+    const uniquePts = Array.from(new Map(pts.map((pt) => [pt.id, pt])).values());
+    const ptIds = uniquePts.map((pt) => pt.id);
+    const representative = getRepresentativePTForCompiledGroup(uniquePts);
+
+    setStagingPTIds((previous) => Array.from(new Set([...previous, ...ptIds])));
+    showToast(`Staging compiled pallet (${uniquePts.length} PTs)...`, 'success');
+
+    try {
+      const { data: stageRows, error: stageError } = await supabase.rpc('stage_pickticket_into_shipment_lane', {
+        p_pu_number: shipment.pu_number,
+        p_pu_date: shipment.pu_date,
+        p_pt_id: representative.id,
+        p_original_lane: representative.assigned_lane
+      });
+      if (stageError) throw stageError;
+
+      const stageRow = Array.isArray(stageRows) ? stageRows[0] : stageRows;
+      let shipmentId = stageRow?.shipment_id ? Number(stageRow.shipment_id) : null;
+      const stagedLane = stageRow?.staging_lane
+        ? String(stageRow.staging_lane)
+        : (shipment.staging_lane ? String(shipment.staging_lane) : null);
+      const stagedStatus = String(stageRow?.pt_status || (shipment.status === 'finalized' ? 'ready_to_ship' : 'staged'));
+
+      if (!shipmentId) {
+        const { data: shipmentRow, error: shipmentLookupError } = await supabase
+          .from('shipments')
+          .select('id')
+          .eq('pu_number', shipment.pu_number)
+          .eq('pu_date', shipment.pu_date)
+          .order('id', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        if (shipmentLookupError) throw shipmentLookupError;
+        shipmentId = shipmentRow?.id || null;
+      }
+
+      const nonRepresentativePtIds = uniquePts
+        .filter((pt) => pt.id !== representative.id)
+        .map((pt) => pt.id);
+
+      if (nonRepresentativePtIds.length > 0) {
+        const { error: cleanupAssignmentsError } = await supabase
+          .from('lane_assignments')
+          .delete()
+          .in('pt_id', nonRepresentativePtIds);
+        if (cleanupAssignmentsError) throw cleanupAssignmentsError;
+      }
+
+      if (shipmentId) {
+        const upsertRows = uniquePts.map((pt) => ({
+          shipment_id: shipmentId as number,
+          pt_id: pt.id,
+          original_lane: pt.assigned_lane,
+          removed_from_staging: false
+        }));
+        const { error: upsertShipmentPtsError } = await supabase
+          .from('shipment_pts')
+          .upsert(upsertRows, {
+            onConflict: 'shipment_id,pt_id'
+          });
+        if (upsertShipmentPtsError) throw upsertShipmentPtsError;
+      }
+
+      const { error: updateGroupPtError } = await supabase
+        .from('picktickets')
+        .update({
+          assigned_lane: stagedLane,
+          status: stagedStatus
+        })
+        .in('id', ptIds);
+      if (updateGroupPtError) throw updateGroupPtError;
+
+      showToast(`✅ Compiled pallet staged (${uniquePts.length} PTs)`, 'success');
+      onUpdate();
+    } catch (error) {
+      console.error('Error staging compiled pallet:', error);
+      showToast('Failed to stage compiled pallet', 'error');
+    } finally {
+      setStagingPTIds((previous) => previous.filter((id) => !ptIds.includes(id)));
+    }
+  }
+
   async function handleMovePT(pt: ShipmentPT) {
     if (!shipment.staging_lane) {
       showToast('Select staging lane first', 'error');
       return;
     }
 
+    const groupedPTs = getCompiledMembers(pt);
+    const isCompiledGroup = groupedPTs.length > 1;
+
+    if (isCompiledGroup) {
+      if (requireOCRForStaging) {
+        setManualCompiledStagePTs(groupedPTs);
+        setManualCompiledInput('');
+        setManualCompiledError('');
+        return;
+      }
+
+      await performMoveCompiledGroup(groupedPTs);
+      return;
+    }
+
     if (requireOCRForStaging) {
-      // Trigger OCR flow before allowing stage.
       setScanningPT(pt);
       return;
     }
 
     await performMovePT(pt);
+  }
+
+  async function confirmManualCompiledStage() {
+    if (!manualCompiledStagePTs || manualCompiledStagePTs.length === 0) return;
+
+    const entered = normalizeDigits(manualCompiledInput);
+    if (!entered) {
+      setManualCompiledError('Enter any PT or PO from this compiled pallet.');
+      return;
+    }
+
+    const allowedTokens = new Set<string>();
+    manualCompiledStagePTs.forEach((pt) => {
+      const ptDigits = normalizeDigits(pt.pt_number);
+      const poDigits = normalizeDigits(pt.po_number);
+      if (ptDigits) allowedTokens.add(ptDigits);
+      if (poDigits) allowedTokens.add(poDigits);
+    });
+
+    if (!allowedTokens.has(entered)) {
+      setManualCompiledError('Input does not match any PT/PO in this compiled pallet.');
+      return;
+    }
+
+    const groupedPTs = [...manualCompiledStagePTs];
+    setManualCompiledStagePTs(null);
+    setManualCompiledInput('');
+    setManualCompiledError('');
+    await performMoveCompiledGroup(groupedPTs);
   }
 
   async function handleFinalizeShipment() {
@@ -1248,126 +1531,155 @@ export default function ShipmentCard({
             {/* PT List */}
             <div className="space-y-4 md:space-y-6">
               <h3 className="text-base md:text-xl font-bold">Picktickets</h3>
-              {sortedLanes.map(laneKey => {
+              {sortedLanes.map((laneKey) => {
                 const isStaging = laneKey.startsWith('staging_');
                 const actualLaneNumber = isStaging ? laneKey.replace('staging_', '') : laneKey;
                 const isUnassigned = laneKey === 'unassigned';
-
-                // Check if this group has any shipped PTs
-                const hasShippedPTs = sortedPtsByLane[laneKey].some(pt => pt.status === 'shipped');
+                const laneGroups = displayGroupsByLane[laneKey] || [];
+                const lanePtCount = ptsByLane[laneKey]?.length || 0;
+                const laneCardCount = laneGroups.length;
+                const allShippedInLane = laneGroups.length > 0 && laneGroups.every((group) =>
+                  group.members.every((member) => member.status === 'shipped')
+                );
 
                 return (
                   <div key={laneKey} className="space-y-2 md:space-y-3">
-                    {/* ONLY show header if NOT all shipped */}
-                    {!hasShippedPTs && (
+                    {!allShippedInLane && (
                       <>
                         {isStaging ? (
                           <h4 className="text-lg md:text-2xl font-bold text-purple-400 border-b-2 border-purple-700 pb-2">
-                            📦 STAGING (L{actualLaneNumber}) - {ptsByLane[laneKey].length}
+                            📦 STAGING (L{actualLaneNumber}) - {laneCardCount} cards / {lanePtCount} PTs
                           </h4>
                         ) : (
                           <h4 className="text-sm md:text-lg font-semibold text-blue-400 border-b border-blue-700 pb-2">
-                            {isUnassigned ? '⚠️ Unassigned' : `L${laneKey} (${ptsByLane[laneKey].length})`}
+                            {isUnassigned
+                              ? `⚠️ Unassigned (${laneCardCount} cards / ${lanePtCount} PTs)`
+                              : `L${laneKey} (${laneCardCount} cards / ${lanePtCount} PTs)`}
                           </h4>
                         )}
                       </>
                     )}
 
-                    {sortedPtsByLane[laneKey].map(pt => {
-                      const isShipped = pt.status === 'shipped';
-                      const isArchived = isPTArchived(pt, mostRecentSync);
-                      const isCompiled = pt.compiled_with && pt.compiled_with.length > 0;
-                      const depthInfo = ptDepthInfo[pt.id];
-                      const depthColor = depthInfo
-                        ? getDepthColor(depthInfo.palletsInFront, depthInfo.maxCapacity)
-                        : '';
-                      const laneLocations = laneLocationsByPtId[pt.id] && laneLocationsByPtId[pt.id].length > 0
-                        ? laneLocationsByPtId[pt.id]
-                        : (pt.assigned_lane ? [pt.assigned_lane] : []);
+                    {laneGroups.map((group) => {
+                      const primary = group.primary;
+                      const members = group.members;
+                      const isCompiled = members.length > 1;
+                      const isShipped = members.some((member) => member.status === 'shipped');
+                      const isArchived = members.every((member) => isPTArchived(member, mostRecentSync));
+                      const isCurrentlyStaged = members.every((member) => member.moved_to_staging && !member.removed_from_staging);
+                      const isStagingInProgress = members.some((member) => stagingPTIds.includes(member.id));
+
+                      const laneLocations = Array.from(
+                        new Set(
+                          members.flatMap((member) => {
+                            const explicit = laneLocationsByPtId[member.id];
+                            if (explicit && explicit.length > 0) return explicit;
+                            if (member.assigned_lane) return [member.assigned_lane];
+                            return [];
+                          })
+                        )
+                      );
 
                       const hasLaneAssigned = laneLocations.some((laneNumber) => laneNumber !== shipment.staging_lane);
-                      const isCurrentlyStaged = pt.moved_to_staging && !pt.removed_from_staging;
-                      const canMoveToStaging = hasLaneAssigned && !isCurrentlyStaged && shipment.staging_lane && shipment.status !== 'finalized';
-                      const isStagingInProgress = stagingPTIds.includes(pt.id);
+                      const canMoveToStaging =
+                        hasLaneAssigned &&
+                        !isCurrentlyStaged &&
+                        Boolean(shipment.staging_lane) &&
+                        shipment.status !== 'finalized';
+
+                      const representativeDepth = ptDepthInfo[primary.id];
+                      const depthColor = representativeDepth
+                        ? getDepthColor(representativeDepth.palletsInFront, representativeDepth.maxCapacity)
+                        : '';
+
+                      const customerNames = Array.from(new Set(members.map((member) => member.customer).filter(Boolean)));
+                      const customerLabel = customerNames.length <= 1
+                        ? (customerNames[0] || 'No customer')
+                        : `${customerNames.length} customers`;
+                      const groupPalletCount = Math.max(...members.map((member) => Number(member.actual_pallet_count || 0)));
+                      const ptRangeLabel = getRangeLabel(members.map((member) => member.pt_number));
+                      const poRangeLabel = getRangeLabel(members.map((member) => member.po_number));
 
                       return (
                         <div
-                          key={pt.id}
-                          className={`p-2 md:p-4 rounded-lg border-2 ${isCompiled ? 'border-orange-500' :
+                          key={group.key}
+                          className={`p-3 md:p-4 rounded-lg border-2 ${isCompiled ? 'bg-orange-950/35 border-orange-500' :
                             isShipped
                               ? 'bg-gray-800 border-gray-600 opacity-75'
-                                : isCurrentlyStaged
-                                  ? 'bg-green-900 border-green-600'
-                                  : laneLocations.length === 0
-                                    ? 'bg-gray-700 border-gray-600'
-                                    : 'bg-gray-700 border-gray-600'
+                              : isCurrentlyStaged
+                                ? 'bg-green-900 border-green-600'
+                                : laneLocations.length === 0
+                                  ? 'bg-gray-700 border-gray-600'
+                                  : 'bg-gray-700 border-gray-600'
                             }`}
                         >
-                          <div className="flex flex-col md:flex-row md:items-center justify-between gap-2 md:gap-4">
+                          <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-3">
                             <div className="flex-1 min-w-0">
                               {isCompiled && (
-                                <div className="bg-orange-600 px-3 py-1 rounded font-bold text-xs mb-2 inline-block">
-                                  COMPILED ({1 + pt.compiled_with!.length} PTs)
+                                <div className="inline-block bg-orange-600 px-2.5 py-1 rounded font-bold text-[11px] md:text-xs mb-2">
+                                  COMPILED PALLET · {members.length} PTs
                                 </div>
                               )}
-                              <div className="flex items-start gap-2">
-                                {!isShipped && isCurrentlyStaged && (
-                                  <div className="text-lg md:text-2xl text-green-400 flex-shrink-0">✓</div>
-                                )}
-                                {!isShipped && laneLocations.length === 0 && (
-                                  <div className="text-lg md:text-2xl text-yellow-400 flex-shrink-0">⚠️</div>
-                                )}
-                                <div className="flex-1 min-w-0">
-                                  <div className="text-2xl md:text-2xl font-bold break-all">
-                                    PT #{pt.pt_number} | PO: {pt.po_number}
-                                  </div>
-                                  <div className="text-l md:text-sm text-gray-200 break-all">
-                                    {pt.customer} | <span className='text-lg md:text-xl font-bold text-yellow-300'>{pt.actual_pallet_count}p</span>
-                                  </div>
 
-                                  {/* Show compiled PTs */}
-                                  {isCompiled && (
-                                    <div className="mt-2 space-y-1">
-                                      {pt.compiled_with!.map((cpt: ShipmentPT) => (
-                                        <div key={cpt.id} className="text-xs text-gray-400 pl-3 border-l-2 border-orange-500">
-                                          + PT #{cpt.pt_number} ({cpt.customer})
-                                        </div>
-                                      ))}
+                              <div className="space-y-1">
+                                {isCompiled ? (
+                                  <>
+                                    <div className="text-sm md:text-base font-semibold break-all">
+                                      PT Range: {ptRangeLabel}
                                     </div>
-                                  )}
-
-                                  {/* Show location/status */}
-                                  {isShipped ? (
-                                    <div className="text-base md:text-xl font-bold text-green-400 mt-1">
-                                      ✈️ Shipped
+                                    <div className="text-sm md:text-base text-gray-200 break-all">
+                                      PO Range: {poRangeLabel}
                                     </div>
-                                  ) : isArchived ? (
-                                    <div className="bg-gray-700 px-3 py-1 rounded-lg font-bold text-white inline-block mt-1">
-                                      ARCHIVED
-                                    </div>
-                                  ) : laneLocations.length > 0 ? (
-                                    <div className="flex flex-wrap items-center gap-2 mt-1 md:mt-2">
-                                      <div className="text-l md:text-lg font-bold text-white bg-purple-700 border border-purple-800 rounded-lg p-1 px-2">
-                                        L{laneLocations.join('/')}
+                                    <details className="mt-1 rounded border border-orange-700/60 bg-orange-950/35 px-2 py-1">
+                                      <summary className="cursor-pointer text-xs md:text-sm text-orange-200">
+                                        Show PT/PO list
+                                      </summary>
+                                      <div className="mt-2 space-y-1">
+                                        {members.map((member) => (
+                                          <div key={member.id} className="text-xs md:text-sm text-gray-100 break-all">
+                                            PT #{member.pt_number} | PO {member.po_number}
+                                          </div>
+                                        ))}
                                       </div>
-                                      {!isShipped && depthInfo && (
-                                        <span className={`px-2 py-0.5 md:px-3 md:py-1 rounded-full text-[10px] md:text-xs font-bold ${depthColor}`}>
-                                          {depthInfo.palletsInFront}p ({Math.round((depthInfo.palletsInFront / depthInfo.maxCapacity) * 100)}%)
-                                        </span>
-                                      )}
-                                    </div>
-                                  ) : !isShipped && (
-                                    <div className="text-xs md:text-sm text-gray-400 mt-1">
-                                      NOT ASSIGNED
-                                    </div>
+                                    </details>
+                                  </>
+                                ) : (
+                                  <div className="text-sm md:text-base font-semibold break-all">
+                                    PT #{primary.pt_number} | PO {primary.po_number}
+                                  </div>
+                                )}
+                              </div>
+
+                              <div className="text-xs md:text-sm text-gray-200 mt-2 break-all">
+                                {customerLabel} | <span className="text-yellow-300 font-bold">{groupPalletCount}p</span>
+                              </div>
+
+                              {isShipped ? (
+                                <div className="text-sm md:text-base font-bold text-green-400 mt-2">✈️ Shipped</div>
+                              ) : isArchived ? (
+                                <div className="bg-gray-700 px-2.5 py-1 rounded-lg font-bold text-white inline-block mt-2 text-xs md:text-sm">
+                                  ARCHIVED
+                                </div>
+                              ) : laneLocations.length > 0 ? (
+                                <div className="flex flex-wrap items-center gap-2 mt-2">
+                                  <div className="text-sm md:text-base font-bold text-white bg-purple-700 border border-purple-800 rounded-lg px-2 py-1">
+                                    L{laneLocations.join('/')}
+                                  </div>
+                                  {representativeDepth && (
+                                    <span className={`px-2 py-0.5 rounded-full text-[10px] md:text-xs font-bold ${depthColor}`}>
+                                      {representativeDepth.palletsInFront}p ({Math.round((representativeDepth.palletsInFront / representativeDepth.maxCapacity) * 100)}%)
+                                    </span>
                                   )}
                                 </div>
-                              </div>
+                              ) : (
+                                <div className="text-xs md:text-sm text-gray-400 mt-2">NOT ASSIGNED</div>
+                              )}
                             </div>
-                            <div className="flex gap-2 justify-end">
+
+                            <div className="flex gap-2 justify-end lg:justify-start">
                               <button
-                                onClick={() => setSelectedPTDetails(pt)}
-                                className="bg-blue-600 hover:bg-blue-700 px-2 md:px-4 py-1.5 md:py-2 rounded-lg font-semibold text-xs md:text-base"
+                                onClick={() => setSelectedPTDetails(primary)}
+                                className="bg-blue-600 hover:bg-blue-700 px-3 py-2 rounded-lg font-semibold text-xs md:text-sm whitespace-nowrap"
                               >
                                 Details
                               </button>
@@ -1375,15 +1687,15 @@ export default function ShipmentCard({
                                 <>
                                   {canMoveToStaging && (
                                     <button
-                                      onClick={() => handleMovePT(pt)}
+                                      onClick={() => handleMovePT(primary)}
                                       disabled={isStagingInProgress}
-                                      className="bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed px-2 md:px-4 py-1.5 md:py-2 rounded-lg font-semibold text-xs md:text-base whitespace-nowrap"
+                                      className="bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed px-3 py-2 rounded-lg font-semibold text-xs md:text-sm whitespace-nowrap"
                                     >
-                                      {isStagingInProgress ? '⏳ Staging...' : '✓ Stage'}
+                                      {isStagingInProgress ? '⏳ Staging...' : (isCompiled ? '✓ Stage All' : '✓ Stage')}
                                     </button>
                                   )}
                                   {laneLocations.length === 0 && (
-                                    <div className="bg-yellow-700 px-2 md:px-4 py-1.5 md:py-2 rounded-lg text-xs md:text-sm font-semibold whitespace-nowrap">
+                                    <div className="bg-yellow-700 px-3 py-2 rounded-lg text-xs md:text-sm font-semibold whitespace-nowrap">
                                       Assign first
                                     </div>
                                   )}
@@ -1391,6 +1703,7 @@ export default function ShipmentCard({
                               )}
                             </div>
                           </div>
+
                           {allowAdminStatusEdit && (
                             <div className="mt-3 pt-3 border-t border-indigo-700">
                               <div className="flex flex-col md:flex-row md:items-center gap-2 md:gap-3">
@@ -1398,11 +1711,11 @@ export default function ShipmentCard({
                                   Admin PT status
                                 </span>
                                 <select
-                                  value={adminPtStatusById[pt.id] ?? normalizeAdminPtStatus(pt.status)}
+                                  value={adminPtStatusById[primary.id] ?? normalizeAdminPtStatus(primary.status)}
                                   onChange={(event) => {
                                     const nextValue = event.target.value as PickticketStatusOption;
                                     if (!PICKTICKET_STATUS_OPTIONS.includes(nextValue)) return;
-                                    setAdminPtStatusById((prev) => ({ ...prev, [pt.id]: nextValue }));
+                                    setAdminPtStatusById((prev) => ({ ...prev, [primary.id]: nextValue }));
                                   }}
                                   className="flex-1 bg-gray-900 border border-indigo-600 text-white rounded px-3 py-2 text-sm md:text-base"
                                 >
@@ -1413,11 +1726,11 @@ export default function ShipmentCard({
                                   ))}
                                 </select>
                                 <button
-                                  onClick={() => handleAdminSavePtStatus(pt)}
-                                  disabled={adminSavingPtIds.includes(pt.id)}
+                                  onClick={() => handleAdminSavePtStatus(primary)}
+                                  disabled={adminSavingPtIds.includes(primary.id)}
                                   className="bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-600 px-3 md:px-4 py-2 rounded-lg font-semibold text-xs md:text-sm whitespace-nowrap"
                                 >
-                                  {adminSavingPtIds.includes(pt.id) ? 'Saving...' : 'Save PT Status'}
+                                  {adminSavingPtIds.includes(primary.id) ? 'Saving...' : 'Save PT Status'}
                                 </button>
                               </div>
                             </div>
@@ -1453,6 +1766,79 @@ export default function ShipmentCard({
         onConfirm={confirmModal.onConfirm}
         onCancel={() => setConfirmModal({ ...confirmModal, isOpen: false })}
       />
+
+      {manualCompiledStagePTs && (
+        <div className="fixed inset-0 bg-black/90 z-[105] flex items-center justify-center p-4">
+          <div className="w-full max-w-lg bg-gray-800 border border-orange-500 rounded-xl p-4 md:p-6">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-lg md:text-xl font-bold text-orange-300">Stage Compiled Pallet</h3>
+              <button
+                type="button"
+                onClick={() => {
+                  setManualCompiledStagePTs(null);
+                  setManualCompiledInput('');
+                  setManualCompiledError('');
+                }}
+                className="text-2xl leading-none hover:text-red-400"
+              >
+                &times;
+              </button>
+            </div>
+
+            <p className="text-sm text-gray-300 mb-3">
+              OCR is skipped for compiled pallets. Enter any PT or PO from this group to stage all PTs together.
+            </p>
+
+            <div className="mb-3 max-h-40 overflow-auto rounded border border-gray-700 bg-gray-900/70 p-2 space-y-1">
+              {manualCompiledStagePTs
+                .slice()
+                .sort((a, b) => compareTextNumeric(a.pt_number, b.pt_number))
+                .map((pt) => (
+                  <div key={pt.id} className="text-xs md:text-sm text-gray-200">
+                    PT #{pt.pt_number} | PO {pt.po_number}
+                  </div>
+                ))}
+            </div>
+
+            <input
+              type="text"
+              value={manualCompiledInput}
+              onChange={(event) => {
+                setManualCompiledInput(event.target.value);
+                setManualCompiledError('');
+              }}
+              placeholder="Enter any PT or PO from this group"
+              className="w-full bg-gray-900 border border-gray-600 rounded px-3 py-2 text-sm md:text-base"
+              autoFocus
+            />
+
+            {manualCompiledError && (
+              <div className="text-xs md:text-sm text-red-400 mt-2">{manualCompiledError}</div>
+            )}
+
+            <div className="mt-4 flex gap-2">
+              <button
+                type="button"
+                onClick={() => void confirmManualCompiledStage()}
+                className="flex-1 bg-green-600 hover:bg-green-700 px-3 py-2 rounded-lg font-semibold text-sm md:text-base"
+              >
+                Verify & Stage All
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setManualCompiledStagePTs(null);
+                  setManualCompiledInput('');
+                  setManualCompiledError('');
+                }}
+                className="flex-1 bg-gray-600 hover:bg-gray-700 px-3 py-2 rounded-lg font-semibold text-sm md:text-base"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* OCR Camera Modal */}
       {scanningPT && (
