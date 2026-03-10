@@ -17,15 +17,24 @@ interface PrintData {
   source_po_numbers?: string[];
 }
 
+type PalletLookupRow = {
+  pt_number: unknown;
+  po_number: unknown;
+  actual_pallet_count: unknown;
+};
+
 // CHANGE THIS PASSWORD TO WHATEVER YOU WANT
 const REPRINT_PASSWORD = '12345';
+const MAX_PALLET_COUNT = 50;
+const PALLET_LOOKUP_CHUNK_SIZE = 150;
+const PALLET_LOOKUP_PAGE_SIZE = 1000;
 
 export default function PrinterPage() {
   const [inputVal, setInputVal] = useState('');
   const [loading, setLoading] = useState(false);
   const [printData, setPrintData] = useState<PrintData | null>(null);
   const [multiPTMode, setMultiPTMode] = useState(false);
-  const [palletCount, setPalletCount] = useState<number>(1);
+  const [palletCountInput, setPalletCountInput] = useState('1');
   const [printing, setPrinting] = useState(false);
   const [statusMsg, setStatusMsg] = useState('');
   const [showPasswordPrompt, setShowPasswordPrompt] = useState(false);
@@ -35,6 +44,7 @@ export default function PrinterPage() {
   const [annieMessage, setAnnieMessage] = useState('');
   const [annieDragActive, setAnnieDragActive] = useState(false);
   const annieFileInputRef = useRef<HTMLInputElement | null>(null);
+  const palletCount = parsePalletCount(palletCountInput);
 
   function normalizeKey(value: unknown): string {
     if (value === null || value === undefined) return '';
@@ -98,6 +108,55 @@ export default function PrinterPage() {
     return `${sorted[0]} - ${sorted[sorted.length - 1]}`;
   }
 
+  function parsePalletCount(rawValue: string): number | null {
+    const trimmed = rawValue.trim();
+    if (!trimmed) return null;
+    if (!/^\d+$/.test(trimmed)) return null;
+    const parsed = Number.parseInt(trimmed, 10);
+    if (!Number.isFinite(parsed) || parsed < 1 || parsed > MAX_PALLET_COUNT) return null;
+    return parsed;
+  }
+
+  function getPalletCountOrShowError(): number | null {
+    const parsed = parsePalletCount(palletCountInput);
+    if (parsed === null) {
+      setStatusMsg(`❌ Please add pallet qty (1-${MAX_PALLET_COUNT}) before printing.`);
+      return null;
+    }
+    return parsed;
+  }
+
+  async function fetchPalletRowsByColumn(column: 'pt_number' | 'po_number', values: string[]): Promise<PalletLookupRow[]> {
+    const uniqueValues = Array.from(new Set(values.filter(Boolean)));
+    if (uniqueValues.length === 0) return [];
+
+    const rows: PalletLookupRow[] = [];
+
+    for (let i = 0; i < uniqueValues.length; i += PALLET_LOOKUP_CHUNK_SIZE) {
+      const chunk = uniqueValues.slice(i, i + PALLET_LOOKUP_CHUNK_SIZE);
+      let from = 0;
+
+      while (true) {
+        const to = from + PALLET_LOOKUP_PAGE_SIZE - 1;
+        const { data, error } = await supabase
+          .from('picktickets')
+          .select('pt_number, po_number, actual_pallet_count')
+          .not('actual_pallet_count', 'is', null)
+          .in(column, chunk)
+          .range(from, to);
+
+        if (error) throw error;
+
+        const batch = (data || []) as PalletLookupRow[];
+        rows.push(...batch);
+        if (batch.length < PALLET_LOOKUP_PAGE_SIZE) break;
+        from += PALLET_LOOKUP_PAGE_SIZE;
+      }
+    }
+
+    return rows;
+  }
+
   async function handleAnnieFile(file: File) {
     if (!file) return;
     const lowerName = file.name.toLowerCase();
@@ -121,29 +180,7 @@ export default function PrinterPage() {
         return;
       }
 
-      const { data: palletRows, error } = await supabase
-        .from('picktickets')
-        .select('pt_number, po_number, actual_pallet_count')
-        .not('actual_pallet_count', 'is', null);
-
-      if (error) {
-        setAnnieMessage('❌ Failed to load pallet data from Supabase.');
-        return;
-      }
-
-      const palletMap = new Map<string, number>();
-      (palletRows || []).forEach((row) => {
-        const pt = normalizeKey(row.pt_number);
-        const po = normalizeKey(row.po_number);
-        const pallets = typeof row.actual_pallet_count === 'number'
-          ? row.actual_pallet_count
-          : Number.parseInt(String(row.actual_pallet_count ?? ''), 10);
-
-        if (!pt || !po || Number.isNaN(pallets)) return;
-        palletMap.set(`${pt}::${po}`, pallets);
-      });
-
-      let filledCount = 0;
+      const rowsNeedingPallets: Array<{ rowNumber: number; pt: string; po: string }> = [];
       const lastRowNumber = sheet.rowCount;
 
       for (let rowNumber = 2; rowNumber <= lastRowNumber; rowNumber++) {
@@ -155,9 +192,51 @@ export default function PrinterPage() {
         const palletsCell = row.getCell(7);
         if (!isBlankValue(palletsCell.value)) continue;
 
-        const mapKey = `${ptValue}::${poValue}`;
+        rowsNeedingPallets.push({ rowNumber, pt: ptValue, po: poValue });
+      }
+
+      if (rowsNeedingPallets.length === 0) {
+        setAnnieMessage('⚠️ No empty pallet cells found in Column G.');
+        return;
+      }
+
+      setAnnieMessage('Matching PT/PO rows with Supabase pallet counts...');
+      const uniquePts = Array.from(new Set(rowsNeedingPallets.map((entry) => entry.pt)));
+      const uniquePos = Array.from(new Set(rowsNeedingPallets.map((entry) => entry.po)));
+
+      let palletRowsByPt: PalletLookupRow[] = [];
+      let palletRowsByPo: PalletLookupRow[] = [];
+      try {
+        [palletRowsByPt, palletRowsByPo] = await Promise.all([
+          fetchPalletRowsByColumn('pt_number', uniquePts),
+          fetchPalletRowsByColumn('po_number', uniquePos)
+        ]);
+      } catch (queryError) {
+        console.error('Annie UTD pallet lookup failed:', queryError);
+        const detail = queryError instanceof Error ? ` (${queryError.message})` : '';
+        setAnnieMessage(`❌ Failed to load pallet data from Supabase${detail}`);
+        return;
+      }
+
+      const palletMap = new Map<string, number>();
+      [...palletRowsByPt, ...palletRowsByPo].forEach((row) => {
+        const pt = normalizeKey(row.pt_number);
+        const po = normalizeKey(row.po_number);
+        const pallets = typeof row.actual_pallet_count === 'number'
+          ? row.actual_pallet_count
+          : Number.parseInt(String(row.actual_pallet_count ?? ''), 10);
+        if (!pt || !po || Number.isNaN(pallets)) return;
+        palletMap.set(`${pt}::${po}`, pallets);
+      });
+
+      let filledCount = 0;
+      rowsNeedingPallets.forEach(({ rowNumber, pt, po }) => {
+        const mapKey = `${pt}::${po}`;
         const pallets = palletMap.get(mapKey);
-        if (pallets === undefined) continue;
+        if (pallets === undefined) return;
+
+        const row = sheet.getRow(rowNumber);
+        const palletsCell = row.getCell(7);
 
         palletsCell.value = pallets;
         palletsCell.font = {
@@ -168,7 +247,7 @@ export default function PrinterPage() {
           color: { argb: 'FFFF0000' }
         };
         filledCount++;
-      }
+      });
 
       const updatedBuffer = await workbook.xlsx.writeBuffer();
       const blob = new Blob(
@@ -184,11 +263,16 @@ export default function PrinterPage() {
       anchor.remove();
       window.setTimeout(() => URL.revokeObjectURL(downloadUrl), 2000);
 
-      setAnnieMessage(`✅ Done. Filled ${filledCount} pallet cell${filledCount === 1 ? '' : 's'} and downloaded.`);
-      setShowAnnieModal(false);
+      if (filledCount === 0) {
+        setAnnieMessage('⚠️ Downloaded unchanged file. No PT/PO matches with stored pallet counts were found.');
+      } else {
+        setAnnieMessage(`✅ Done. Filled ${filledCount} pallet cell${filledCount === 1 ? '' : 's'} and downloaded.`);
+        setShowAnnieModal(false);
+      }
     } catch (processError) {
       console.error('Annie UTD processing failed:', processError);
-      setAnnieMessage('❌ Failed to process the file.');
+      const detail = processError instanceof Error ? ` (${processError.message})` : '';
+      setAnnieMessage(`❌ Failed to process the file${detail}`);
     } finally {
       setAnnieProcessing(false);
     }
@@ -285,7 +369,7 @@ export default function PrinterPage() {
           source_pt_numbers: ptNumbers,
           source_po_numbers: poNumbers
         });
-        setPalletCount(1);
+        setPalletCountInput('1');
         setStatusMsg('');
       } else {
         const { data, error } = await supabase
@@ -312,7 +396,7 @@ export default function PrinterPage() {
           ...data,
           has_been_printed: hasPrinted || false
         });
-        setPalletCount(1);
+        setPalletCountInput('1');
         setStatusMsg('');
       }
 
@@ -326,6 +410,8 @@ export default function PrinterPage() {
 
   async function handlePrintClick() {
     if (!printData) return;
+    const palletQty = getPalletCountOrShowError();
+    if (palletQty === null) return;
 
     // If already printed, show password prompt
     if (printData.has_been_printed) {
@@ -334,10 +420,13 @@ export default function PrinterPage() {
     }
 
     // First time print - send directly
-    await sendToPrintQueue();
+    await sendToPrintQueue(palletQty);
   }
 
   async function handleReprintWithPassword() {
+    const palletQty = getPalletCountOrShowError();
+    if (palletQty === null) return;
+
     if (passwordInput !== REPRINT_PASSWORD) {
       alert('❌ Incorrect password');
       setPasswordInput('');
@@ -346,10 +435,10 @@ export default function PrinterPage() {
 
     setShowPasswordPrompt(false);
     setPasswordInput('');
-    await sendToPrintQueue(true);
+    await sendToPrintQueue(palletQty, true);
   }
 
-  async function sendToPrintQueue(isReprint = false) {
+  async function sendToPrintQueue(palletQty: number, isReprint = false) {
     if (!printData) return;
     setPrinting(true);
     setStatusMsg('⏳ Sending to printer...');
@@ -364,7 +453,7 @@ export default function PrinterPage() {
           customer: printData.customer,
           store_dc: printData.store_dc,
           cancel_date: printData.cancel_date,
-          pallet_count: palletCount,
+          pallet_count: palletQty,
           status: 'pending',
           is_reprint: isReprint,
           ctn: printData.ctn || null
@@ -385,18 +474,18 @@ export default function PrinterPage() {
               pt_number: ptNumber,
               po_number: printData.po_number,
               customer: printData.customer,
-              pallet_count: palletCount
+              pallet_count: palletQty
             }))
           );
       }
 
-      setStatusMsg(`✅ Sent to printer! ${palletCount * 2} labels queued.`);
+      setStatusMsg(`✅ Sent to printer! ${palletQty * 2} labels queued.`);
 
       setTimeout(() => {
         setPrinting(false);
         setPrintData(null);
         setInputVal('');
-        setPalletCount(1);
+        setPalletCountInput('1');
         setStatusMsg('');
       }, 2000);
 
@@ -534,27 +623,34 @@ export default function PrinterPage() {
                 <input
                   type="number"
                   min="1"
-                  max="50"
-                  value={palletCount}
+                  max={MAX_PALLET_COUNT}
+                  value={palletCountInput}
                   onChange={(e) => {
-                    const val = e.target.value;
-                    if (val === '') {
-                      setPalletCount(0); // Allow empty temporarily
-                    } else {
-                      setPalletCount(parseInt(val) || 1);
+                    const nextValue = e.target.value.trim();
+                    if (nextValue === '') {
+                      setPalletCountInput('');
+                      return;
                     }
-                  }}
-                  onBlur={(e) => {
-                    // Set to 1 if empty when user leaves the field
-                    if (e.target.value === '' || palletCount === 0) {
-                      setPalletCount(1);
+
+                    if (!/^\d+$/.test(nextValue)) return;
+                    const parsed = Number.parseInt(nextValue, 10);
+
+                    if (!Number.isFinite(parsed) || parsed <= 0) {
+                      setPalletCountInput('');
+                      return;
+                    }
+
+                    const clamped = Math.min(parsed, MAX_PALLET_COUNT);
+                    setPalletCountInput(String(clamped));
+                    if (statusMsg.startsWith('❌ Please add pallet qty')) {
+                      setStatusMsg('');
                     }
                   }}
                   className="bg-gray-900 border border-gray-600 rounded-lg p-3 md:p-4 text-2xl md:text-3xl font-bold w-full sm:w-32 text-center"
                   disabled={showPasswordPrompt}
                 />
                 <div className="text-gray-400 text-xs md:text-sm">
-                  x 2 copies = <span className="text-white font-bold text-sm md:text-base">{palletCount * 2}</span> total labels
+                  x 2 copies = <span className="text-white font-bold text-sm md:text-base">{palletCount === null ? '--' : palletCount * 2}</span> total labels
                 </div>
               </div>
 

@@ -116,6 +116,12 @@ export default function Home() {
                 📦 Shipments
               </Link>
               <Link
+                href="/pu-watch"
+                className="flex-1 sm:flex-none bg-cyan-600 hover:bg-cyan-700 px-3 md:px-6 py-2 md:py-3 rounded-lg font-semibold text-center text-sm md:text-base"
+              >
+                🚚 PU Watch
+              </Link>
+              <Link
                 href="/samples"
                 className="flex-1 sm:flex-none bg-yellow-600 hover:bg-yellow-700 px-3 md:px-6 py-2 md:py-3 rounded-lg font-semibold text-center text-sm md:text-base"
               >

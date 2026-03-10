@@ -297,8 +297,23 @@ export function RealtimeProvider({ children }: { children: React.ReactNode }) {
       emitScopeEvent('lane-grid', {});
     };
 
-    const handlePickticketChange = () => {
-      emitScopeEvent('shipments', {});
+    const handlePickticketChange = (payload: RealtimeDbPayload) => {
+      const nextRow = payload.new || null;
+      const previousRow = payload.old || null;
+      const rawId = nextRow?.id ?? previousRow?.id;
+      const parsedId = Number(rawId);
+      const ptId = Number.isFinite(parsedId) ? parsedId : null;
+
+      emitScopeEvent('shipments', {
+        source: 'picktickets',
+        eventType: payload.eventType || '',
+        ptId,
+        status: asTrimmedText(nextRow?.status),
+        puDate: asTrimmedText(nextRow?.pu_date),
+        puNumber: asTrimmedText(nextRow?.pu_number),
+        containerNumber: asTrimmedText(nextRow?.container_number),
+        lastSyncedAt: asTrimmedText(nextRow?.last_synced_at)
+      });
       emitScopeEvent('lane-grid', {});
     };
 
