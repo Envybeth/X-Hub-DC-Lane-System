@@ -152,6 +152,43 @@ function sumUniquePallets(pts: ShipmentPT[], predicate: (pt: ShipmentPT) => bool
   return total;
 }
 
+function buildDetailsTicket(primary: ShipmentPT, members: ShipmentPT[]): ShipmentPT {
+  if (members.length <= 1) return primary;
+
+  const compiledWith = members
+    .filter((member) => member.id !== primary.id)
+    .map((member) => ({
+      ...member,
+      compiled_with: undefined
+    }));
+
+  return {
+    ...primary,
+    compiled_with: compiledWith
+  };
+}
+
+function getShipmentPtCardClass(options: {
+  isCompiled: boolean;
+  isShipped: boolean;
+  isCurrentlyStaged: boolean;
+  hasLaneLocation: boolean;
+}): string {
+  const base = 'p-3 md:p-4 rounded-lg border-2';
+
+  if (options.isCompiled) {
+    const stagedOverlay = options.isCurrentlyStaged && !options.isShipped
+      ? ' ring-1 ring-inset ring-green-500'
+      : '';
+    return `${base} bg-orange-950/35 border-orange-500${stagedOverlay}`;
+  }
+
+  if (options.isShipped) return `${base} bg-gray-800 border-gray-600 opacity-75`;
+  if (options.isCurrentlyStaged) return `${base} bg-green-900 border-green-600`;
+  if (!options.hasLaneLocation) return `${base} bg-gray-700 border-gray-600`;
+  return `${base} bg-gray-700 border-gray-600`;
+}
+
 export interface ShipmentCardProps {
   shipment: Shipment;
   onUpdate: () => void;
@@ -1768,19 +1805,18 @@ export default function ShipmentCard({
                       const groupPalletCount = Math.max(...members.map((member) => Number(member.actual_pallet_count || 0)));
                       const ptRangeLabel = getRangeLabel(members.map((member) => member.pt_number));
                       const poRangeLabel = getRangeLabel(members.map((member) => member.po_number));
+                      const detailsTicket = buildDetailsTicket(primary, members);
+                      const cardClassName = getShipmentPtCardClass({
+                        isCompiled,
+                        isShipped,
+                        isCurrentlyStaged,
+                        hasLaneLocation: laneLocations.length > 0
+                      });
 
                       return (
                         <div
                           key={group.key}
-                          className={`p-3 md:p-4 rounded-lg border-2 ${isCompiled ? 'bg-orange-950/35 border-orange-500' :
-                            isShipped
-                              ? 'bg-gray-800 border-gray-600 opacity-75'
-                              : isCurrentlyStaged
-                                ? 'bg-green-900 border-green-600'
-                                : laneLocations.length === 0
-                                  ? 'bg-gray-700 border-gray-600'
-                                  : 'bg-gray-700 border-gray-600'
-                            }`}
+                          className={cardClassName}
                         >
                           <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-3">
                             <div className="flex-1 min-w-0">
@@ -1847,7 +1883,7 @@ export default function ShipmentCard({
 
                             <div className="flex gap-2 justify-end lg:justify-start">
                               <button
-                                onClick={() => setSelectedPTDetails(primary)}
+                                onClick={() => setSelectedPTDetails(detailsTicket)}
                                 className="bg-blue-600 hover:bg-blue-700 px-3 py-2 rounded-lg font-semibold text-xs md:text-sm whitespace-nowrap"
                               >
                                 Details

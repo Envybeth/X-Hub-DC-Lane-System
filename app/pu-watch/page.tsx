@@ -59,6 +59,19 @@ interface ContainerSummary {
   nextDueLabel: string;
 }
 
+interface AgeBreakdownRow {
+  key: string;
+  label: string;
+  count: number;
+  badgeClass: string;
+  daysUntil: number | null;
+}
+
+interface ActiveContainerBreakdown {
+  containerNumber: string;
+  metric: 'pt' | 'pu';
+}
+
 type ContainerSortKey = 'ptNumber' | 'customer' | 'loadId' | 'puDate';
 type SortDirection = 'asc' | 'desc';
 
@@ -125,68 +138,41 @@ function getDaysUntil(puDate: string): number | null {
   return Math.floor((parsed.getTime() - today.getTime()) / DAY_MS);
 }
 
+function getUrgencyOrder(daysUntil: number | null): number {
+  if (daysUntil === null) return 6;
+  if (daysUntil < 0) return 0;
+  if (daysUntil === 0) return 1;
+  if (daysUntil === 1) return 2;
+  if (daysUntil <= 3) return 3;
+  if (daysUntil <= 7) return 4;
+  return 5;
+}
+
+function getUrgencyLabel(daysUntil: number | null): string {
+  if (daysUntil === null) return 'Unknown';
+  if (daysUntil < 0) return `Overdue ${Math.abs(daysUntil)}d`;
+  if (daysUntil === 0) return 'Due Today';
+  if (daysUntil === 1) return 'Due Tomorrow';
+  return `Due in ${daysUntil}d`;
+}
+
+function getUrgencyBadgeClass(daysUntil: number | null): string {
+  if (daysUntil === null) return 'bg-slate-800/80 text-slate-200 ring-1 ring-inset ring-slate-600/70';
+  if (daysUntil < 0) return 'bg-rose-950/40 text-rose-200 ring-1 ring-inset ring-rose-700/60';
+  if (daysUntil === 0) return 'bg-rose-900/35 text-rose-100 ring-1 ring-inset ring-rose-600/60';
+  if (daysUntil === 1) return 'bg-amber-950/40 text-amber-200 ring-1 ring-inset ring-amber-700/60';
+  if (daysUntil <= 3) return 'bg-amber-950/30 text-amber-300 ring-1 ring-inset ring-amber-700/50';
+  if (daysUntil <= 7) return 'bg-sky-800/55 text-sky-50 ring-1 ring-inset ring-sky-500/70';
+  return 'bg-slate-900/80 text-slate-200 ring-1 ring-inset ring-slate-600/70';
+}
+
 function getUrgencyInfo(puDate: string): UrgencyInfo {
   const daysUntil = getDaysUntil(puDate);
-
-  if (daysUntil === null) {
-    return {
-      order: 6,
-      label: 'Unknown',
-      badgeClass: 'bg-slate-800/80 text-slate-200 ring-1 ring-inset ring-slate-600/70',
-      daysUntil: null
-    };
-  }
-
-  if (daysUntil < 0) {
-    return {
-      order: 0,
-      label: `Overdue ${Math.abs(daysUntil)}d`,
-      badgeClass: 'bg-rose-950/40 text-rose-200 ring-1 ring-inset ring-rose-700/60',
-      daysUntil
-    };
-  }
-
-  if (daysUntil === 0) {
-    return {
-      order: 1,
-      label: 'Due Today',
-      badgeClass: 'bg-rose-900/35 text-rose-100 ring-1 ring-inset ring-rose-600/60',
-      daysUntil
-    };
-  }
-
-  if (daysUntil === 1) {
-    return {
-      order: 2,
-      label: 'Due Tomorrow',
-      badgeClass: 'bg-amber-950/40 text-amber-200 ring-1 ring-inset ring-amber-700/60',
-      daysUntil
-    };
-  }
-
-  if (daysUntil <= 3) {
-    return {
-      order: 3,
-      label: `Due in ${daysUntil}d`,
-      badgeClass: 'bg-amber-950/30 text-amber-300 ring-1 ring-inset ring-amber-700/50',
-      daysUntil
-    };
-  }
-
-  if (daysUntil <= 7) {
-    return {
-      order: 4,
-      label: `Due in ${daysUntil}d`,
-      badgeClass: 'bg-sky-800/55 text-sky-50 ring-1 ring-inset ring-sky-500/70',
-      daysUntil
-    };
-  }
-
   return {
-    order: 5,
-    label: `Due in ${daysUntil}d`,
-    badgeClass: 'bg-slate-900/80 text-slate-200 ring-1 ring-inset ring-slate-600/70',
-    daysUntil
+    order: getUrgencyOrder(daysUntil),
+    label: getUrgencyLabel(daysUntil),
+    badgeClass: getUrgencyBadgeClass(daysUntil),
+    daysUntil: daysUntil ?? null
   };
 }
 
@@ -217,6 +203,66 @@ function getContainerBorderClass(urgency: UrgencyInfo): string {
   if (urgency.order === 3) return 'border-amber-800/70';
   if (urgency.order === 4) return 'border-sky-500/75';
   return 'border-slate-700/80';
+}
+
+function buildAgeBreakdown(values: Array<number | null>): AgeBreakdownRow[] {
+  const byDaysKey = new Map<string, { daysUntil: number | null; count: number }>();
+
+  values.forEach((daysUntil) => {
+    const key = daysUntil === null ? 'unknown' : String(daysUntil);
+    const current = byDaysKey.get(key) || { daysUntil, count: 0 };
+    current.count += 1;
+    byDaysKey.set(key, current);
+  });
+
+  return Array.from(byDaysKey.entries())
+    .map(([key, value]) => ({
+      key,
+      daysUntil: value.daysUntil,
+      count: value.count,
+      label: getUrgencyLabel(value.daysUntil),
+      badgeClass: getUrgencyBadgeClass(value.daysUntil)
+    }))
+    .sort((a, b) => {
+      if (a.daysUntil === null && b.daysUntil === null) return 0;
+      if (a.daysUntil === null) return 1;
+      if (b.daysUntil === null) return -1;
+      return a.daysUntil - b.daysUntil;
+    });
+}
+
+function buildUniquePuAgeBreakdown(items: PuWatchItem[]): AgeBreakdownRow[] {
+  const byPuNumber = new Map<string, number | null>();
+
+  items.forEach((item) => {
+    const puNumber = asTrimmedText(item.puNumber);
+    if (!puNumber || puNumber === 'N/A') return;
+
+    const daysUntil = item.urgency.daysUntil;
+    if (!byPuNumber.has(puNumber)) {
+      byPuNumber.set(puNumber, daysUntil);
+      return;
+    }
+
+    const previousDaysUntil = byPuNumber.get(puNumber);
+    if (previousDaysUntil === undefined) {
+      byPuNumber.set(puNumber, daysUntil);
+      return;
+    }
+    if (previousDaysUntil === null) {
+      if (daysUntil !== null) {
+        byPuNumber.set(puNumber, daysUntil);
+      }
+      return;
+    }
+
+    if (daysUntil === null) return;
+    if (daysUntil < previousDaysUntil) {
+      byPuNumber.set(puNumber, daysUntil);
+    }
+  });
+
+  return buildAgeBreakdown(Array.from(byPuNumber.values()));
 }
 
 function compareByContainerSort(a: PuWatchItem, b: PuWatchItem, key: ContainerSortKey): number {
@@ -284,6 +330,8 @@ async function fetchRowsForSyncTimestamp(lastSyncedAt: string): Promise<PuWatchR
 export default function PuWatchPage() {
   const { health: realtimeHealth, subscribeScope } = useRealtimeCoordinator();
   const [items, setItems] = useState<PuWatchItem[]>([]);
+  const [activeSummaryBreakdown, setActiveSummaryBreakdown] = useState<'containers' | 'ptRows' | null>(null);
+  const [activeContainerBreakdown, setActiveContainerBreakdown] = useState<ActiveContainerBreakdown | null>(null);
   const [viewingPTDetails, setViewingPTDetails] = useState<Pickticket | null>(null);
   const [detailsLoadingId, setDetailsLoadingId] = useState<number | null>(null);
   const [lastSyncIso, setLastSyncIso] = useState<string | null>(null);
@@ -419,6 +467,37 @@ export default function PuWatchPage() {
     document.addEventListener('visibilitychange', handleVisibilityChange);
     return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
   }, []);
+
+  useEffect(() => {
+    if (!activeSummaryBreakdown && !activeContainerBreakdown) return;
+
+    const handlePointerDown = (event: MouseEvent | TouchEvent) => {
+      const targetNode = event.target as Node | null;
+      if (!targetNode) return;
+      const targetElement = targetNode instanceof Element ? targetNode : null;
+      if (targetElement?.closest('[data-summary-breakdown-root]')) return;
+      if (targetElement?.closest('[data-container-breakdown-root]')) return;
+      setActiveSummaryBreakdown(null);
+      setActiveContainerBreakdown(null);
+    };
+
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setActiveSummaryBreakdown(null);
+        setActiveContainerBreakdown(null);
+      }
+    };
+
+    document.addEventListener('mousedown', handlePointerDown);
+    document.addEventListener('touchstart', handlePointerDown);
+    document.addEventListener('keydown', handleEscape);
+
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDown);
+      document.removeEventListener('touchstart', handlePointerDown);
+      document.removeEventListener('keydown', handleEscape);
+    };
+  }, [activeSummaryBreakdown, activeContainerBreakdown]);
 
   useEffect(() => {
     const unsubscribeShipments = subscribeScope('shipments', (payload) => {
@@ -613,6 +692,14 @@ export default function PuWatchPage() {
     });
   }, [containerGroups]);
 
+  useEffect(() => {
+    if (!activeContainerBreakdown) return;
+    const exists = containerGroups.some((group) => group.containerNumber === activeContainerBreakdown.containerNumber);
+    if (!exists) {
+      setActiveContainerBreakdown(null);
+    }
+  }, [activeContainerBreakdown, containerGroups]);
+
   const allExpanded = containerGroups.length > 0 && containerGroups.every((group) => expandedContainers.has(group.containerNumber));
 
   function cycleContainerSort(containerNumber: string, key: ContainerSortKey) {
@@ -697,6 +784,69 @@ export default function PuWatchPage() {
     [items]
   );
 
+  const containerAgeBreakdown = useMemo(
+    () => buildAgeBreakdown(containerGroups.map((group) => group.topUrgency.daysUntil)),
+    [containerGroups]
+  );
+
+  const ptAgeBreakdown = useMemo(
+    () => buildAgeBreakdown(items.map((item) => item.urgency.daysUntil)),
+    [items]
+  );
+
+  const containerBreakdownById = useMemo(() => {
+    const byContainer = new Map<string, { ptRows: AgeBreakdownRow[]; puRows: AgeBreakdownRow[] }>();
+
+    containerGroups.forEach((group) => {
+      byContainer.set(group.containerNumber, {
+        ptRows: buildAgeBreakdown(group.items.map((item) => item.urgency.daysUntil)),
+        puRows: buildUniquePuAgeBreakdown(group.items)
+      });
+    });
+
+    return byContainer;
+  }, [containerGroups]);
+
+  function toggleSummaryBreakdown(target: 'containers' | 'ptRows') {
+    setActiveContainerBreakdown(null);
+    setActiveSummaryBreakdown((previous) => (previous === target ? null : target));
+  }
+
+  function toggleContainerBreakdown(containerNumber: string, metric: 'pt' | 'pu') {
+    setActiveSummaryBreakdown(null);
+    setActiveContainerBreakdown((previous) => {
+      if (previous?.containerNumber === containerNumber && previous.metric === metric) {
+        return null;
+      }
+      return { containerNumber, metric };
+    });
+  }
+
+  function renderAgeBreakdownPanel(rows: AgeBreakdownRow[], unitLabel: string) {
+    if (rows.length === 0) {
+      return (
+        <div className="text-xs text-slate-400">
+          No rows to break down yet.
+        </div>
+      );
+    }
+
+    return (
+      <div className="space-y-1 max-h-56 overflow-y-auto">
+        {rows.map((row) => (
+          <div key={row.key} className="flex items-center justify-between gap-2">
+            <span className={`px-2 py-1 rounded-md text-[11px] md:text-xs font-semibold ${row.badgeClass}`}>
+              {row.label}
+            </span>
+            <span className="text-xs md:text-sm font-semibold text-slate-200">
+              {row.count} {unitLabel}
+            </span>
+          </div>
+        ))}
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-gray-900 text-white p-4 md:p-8">
       <div className="max-w-7xl mx-auto">
@@ -748,14 +898,54 @@ export default function PuWatchPage() {
         </div>
 
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
-          <div className="bg-slate-900/80 border border-slate-700 rounded-lg p-3">
-            <div className="text-xs text-gray-400 uppercase">Containers</div>
-            <div className="text-xl md:text-2xl font-bold">{containerGroups.length}</div>
+          <div className="relative" data-summary-breakdown-root>
+            <button
+              type="button"
+              onClick={() => toggleSummaryBreakdown('containers')}
+              className="w-full text-left bg-slate-900/80 border border-slate-700 rounded-lg p-3 hover:bg-slate-800/70 transition-colors"
+              aria-expanded={activeSummaryBreakdown === 'containers'}
+              aria-label="Toggle containers age breakdown"
+            >
+              <div className="text-xs text-gray-400 uppercase">Containers</div>
+              <div className="text-xl md:text-2xl font-bold">{containerGroups.length}</div>
+              <div className="text-[10px] md:text-[11px] text-cyan-300 mt-1">
+                Click for day breakdown
+              </div>
+            </button>
+            {activeSummaryBreakdown === 'containers' && (
+              <div className="absolute left-0 top-full mt-2 z-30 w-64 max-w-[min(16rem,calc(100vw-2rem))] rounded-lg border border-slate-600 bg-slate-950/95 p-3 shadow-xl">
+                <div className="text-[11px] uppercase tracking-wide text-slate-400 mb-2">
+                  By most urgent PU day
+                </div>
+                {renderAgeBreakdownPanel(containerAgeBreakdown, 'containers')}
+              </div>
+            )}
           </div>
-          <div className="bg-slate-900/80 border border-slate-700 rounded-lg p-3">
-            <div className="text-xs text-gray-400 uppercase">PT Rows</div>
-            <div className="text-xl md:text-2xl font-bold">{items.length}</div>
+
+          <div className="relative" data-summary-breakdown-root>
+            <button
+              type="button"
+              onClick={() => toggleSummaryBreakdown('ptRows')}
+              className="w-full text-left bg-slate-900/80 border border-slate-700 rounded-lg p-3 hover:bg-slate-800/70 transition-colors"
+              aria-expanded={activeSummaryBreakdown === 'ptRows'}
+              aria-label="Toggle PT rows age breakdown"
+            >
+              <div className="text-xs text-gray-400 uppercase">PT Rows</div>
+              <div className="text-xl md:text-2xl font-bold">{items.length}</div>
+              <div className="text-[10px] md:text-[11px] text-cyan-300 mt-1">
+                Click for day breakdown
+              </div>
+            </button>
+            {activeSummaryBreakdown === 'ptRows' && (
+              <div className="absolute left-0 top-full mt-2 z-30 w-64 max-w-[min(16rem,calc(100vw-2rem))] rounded-lg border border-slate-600 bg-slate-950/95 p-3 shadow-xl">
+                <div className="text-[11px] uppercase tracking-wide text-slate-400 mb-2">
+                  By PT PU day
+                </div>
+                {renderAgeBreakdownPanel(ptAgeBreakdown, 'PT')}
+              </div>
+            )}
           </div>
+
           <div className="bg-slate-900/80 border border-slate-700 rounded-lg p-3">
             <div className="text-xs text-gray-400 uppercase">Overdue</div>
             <div className="text-xl md:text-2xl font-bold text-rose-300">{overdueCount}</div>
@@ -789,17 +979,38 @@ export default function PuWatchPage() {
               const isExpanded = expandedContainers.has(group.containerNumber);
               const sortState = containerSortById[group.containerNumber];
               const visibleItems = sortContainerItems(group.items, sortState);
+              const containerBreakdown = containerBreakdownById.get(group.containerNumber);
+              const isPtBreakdownOpen =
+                activeContainerBreakdown?.containerNumber === group.containerNumber &&
+                activeContainerBreakdown.metric === 'pt';
+              const isPuBreakdownOpen =
+                activeContainerBreakdown?.containerNumber === group.containerNumber &&
+                activeContainerBreakdown.metric === 'pu';
 
               return (
                 <div
                   key={group.containerNumber}
-                  className={`bg-slate-900/80 border-2 rounded-lg overflow-hidden ${getContainerBorderClass(group.topUrgency)}`}
+                  className={`bg-slate-900/80 border-2 rounded-lg overflow-visible ${getContainerBorderClass(group.topUrgency)}`}
                 >
-                  <button
-                    type="button"
-                    onClick={() => toggleContainer(group.containerNumber)}
-                    className="w-full px-4 py-3 text-left hover:bg-slate-800/40 transition-colors"
+                  <div
+                    data-container-breakdown-root
+                    role="button"
+                    tabIndex={0}
                     aria-expanded={isExpanded}
+                    onClick={() => {
+                      setActiveSummaryBreakdown(null);
+                      setActiveContainerBreakdown(null);
+                      toggleContainer(group.containerNumber);
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault();
+                        setActiveSummaryBreakdown(null);
+                        setActiveContainerBreakdown(null);
+                        toggleContainer(group.containerNumber);
+                      }
+                    }}
+                    className="w-full px-4 py-3 text-left hover:bg-slate-800/40 transition-colors"
                   >
                     <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
                       <div className="flex items-start gap-3 min-w-0">
@@ -815,12 +1026,58 @@ export default function PuWatchPage() {
                       </div>
 
                       <div className="flex flex-wrap items-center gap-2 lg:justify-end">
-                        <span className={NEUTRAL_CHIP_CLASS}>
-                          {group.summary.totalPts} PT
-                        </span>
-                        <span className={NEUTRAL_CHIP_CLASS}>
-                          {group.summary.uniquePuCount} PU
-                        </span>
+                        <div className="relative" data-container-breakdown-root>
+                          <button
+                            type="button"
+                            onClick={(event) => {
+                              event.preventDefault();
+                              event.stopPropagation();
+                              toggleContainerBreakdown(group.containerNumber, 'pt');
+                            }}
+                            className={`${NEUTRAL_CHIP_CLASS} hover:bg-slate-700`}
+                            aria-expanded={isPtBreakdownOpen}
+                            aria-label={`Toggle PT breakdown for container ${group.containerNumber}`}
+                          >
+                            {group.summary.totalPts} PT
+                          </button>
+                          {isPtBreakdownOpen && (
+                            <div
+                              onClick={(event) => event.stopPropagation()}
+                              className="absolute z-30 top-full mt-2 right-0 w-64 max-w-[min(16rem,calc(100vw-2rem))] rounded-lg border border-slate-600 bg-slate-950/95 p-3 shadow-xl"
+                            >
+                              <div className="text-[11px] uppercase tracking-wide text-slate-400 mb-2">
+                                PT day breakdown
+                              </div>
+                              {renderAgeBreakdownPanel(containerBreakdown?.ptRows || [], 'PT')}
+                            </div>
+                          )}
+                        </div>
+                        <div className="relative" data-container-breakdown-root>
+                          <button
+                            type="button"
+                            onClick={(event) => {
+                              event.preventDefault();
+                              event.stopPropagation();
+                              toggleContainerBreakdown(group.containerNumber, 'pu');
+                            }}
+                            className={`${NEUTRAL_CHIP_CLASS} hover:bg-slate-700`}
+                            aria-expanded={isPuBreakdownOpen}
+                            aria-label={`Toggle PU breakdown for container ${group.containerNumber}`}
+                          >
+                            {group.summary.uniquePuCount} PU
+                          </button>
+                          {isPuBreakdownOpen && (
+                            <div
+                              onClick={(event) => event.stopPropagation()}
+                              className="absolute z-30 top-full mt-2 right-0 w-64 max-w-[min(16rem,calc(100vw-2rem))] rounded-lg border border-slate-600 bg-slate-950/95 p-3 shadow-xl"
+                            >
+                              <div className="text-[11px] uppercase tracking-wide text-slate-400 mb-2">
+                                PU day breakdown
+                              </div>
+                              {renderAgeBreakdownPanel(containerBreakdown?.puRows || [], 'PU')}
+                            </div>
+                          )}
+                        </div>
                         {group.summary.overdueCount > 0 && (
                           <span className={OVERDUE_CHIP_CLASS}>
                             {group.summary.overdueCount} overdue
@@ -846,7 +1103,7 @@ export default function PuWatchPage() {
                         </span>
                       </div>
                     </div>
-                  </button>
+                  </div>
 
                   {isExpanded && (
                     <div className="p-3 md:p-4 space-y-3 border-t border-slate-700">
