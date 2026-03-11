@@ -103,22 +103,40 @@ begin
     1
   );
 
-  insert into public.shipment_pts (
-    shipment_id,
-    pt_id,
-    original_lane,
-    removed_from_staging
-  )
-  values (
-    v_shipment_id,
-    p_pt_id,
-    nullif(btrim(coalesce(p_original_lane, v_pickticket_assigned_lane)), ''),
-    false
-  )
-  on conflict (shipment_id, pt_id)
-  do update set
-    original_lane = excluded.original_lane,
-    removed_from_staging = false;
+  -- Avoid ambiguous variable/column resolution with RETURNS TABLE output names.
+  -- (e.g. output variable "shipment_id" vs table column "shipment_id")
+  update public.shipment_pts sp
+  set
+    original_lane = nullif(btrim(coalesce(p_original_lane, v_pickticket_assigned_lane)), ''),
+    removed_from_staging = false
+  where sp.shipment_id = v_shipment_id
+    and sp.pt_id = p_pt_id;
+
+  if not found then
+    begin
+      insert into public.shipment_pts (
+        shipment_id,
+        pt_id,
+        original_lane,
+        removed_from_staging
+      )
+      values (
+        v_shipment_id,
+        p_pt_id,
+        nullif(btrim(coalesce(p_original_lane, v_pickticket_assigned_lane)), ''),
+        false
+      );
+    exception
+      when unique_violation then
+        -- Concurrent stage call raced this insert; reconcile to desired state.
+        update public.shipment_pts sp
+        set
+          original_lane = nullif(btrim(coalesce(p_original_lane, v_pickticket_assigned_lane)), ''),
+          removed_from_staging = false
+        where sp.shipment_id = v_shipment_id
+          and sp.pt_id = p_pt_id;
+    end;
+  end if;
 
   v_pt_status := case
     when coalesce(v_shipment_status, '') = 'finalized' then 'ready_to_ship'
@@ -128,6 +146,7 @@ begin
   update public.picktickets
   set
     assigned_lane = v_staging_lane,
+    actual_pallet_count = v_insert_pallet_count,
     status = v_pt_status
   where id = p_pt_id;
 

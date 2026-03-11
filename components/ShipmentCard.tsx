@@ -64,6 +64,45 @@ function normalizeDigits(value?: string | null): string {
   return (value || '').replace(/\D/g, '');
 }
 
+function asTrimmedText(value: unknown): string {
+  return String(value ?? '').trim();
+}
+
+function normalizeDateToken(value?: string | null): string {
+  const trimmed = asTrimmedText(value);
+  if (!trimmed) return '';
+
+  const isoMatch = trimmed.match(/^(\d{4}-\d{2}-\d{2})/);
+  if (isoMatch) return isoMatch[1];
+
+  const parsed = new Date(trimmed);
+  if (!Number.isNaN(parsed.getTime())) {
+    return parsed.toISOString().slice(0, 10);
+  }
+
+  return trimmed;
+}
+
+function describeError(error: unknown): string {
+  if (!error) return 'Unknown error';
+  if (error instanceof Error && error.message) return error.message;
+
+  if (typeof error === 'object') {
+    const maybe = error as { code?: string; message?: string; details?: string; hint?: string };
+    const parts = [maybe.code, maybe.message, maybe.details, maybe.hint]
+      .map((part) => asTrimmedText(part))
+      .filter(Boolean);
+    if (parts.length > 0) return parts.join(' | ');
+  }
+
+  if (typeof error === 'string') {
+    const trimmed = error.trim();
+    if (trimmed) return trimmed;
+  }
+
+  return 'Unknown error';
+}
+
 function compareTextNumeric(a: string, b: string): number {
   const aDigits = normalizeDigits(a);
   const bDigits = normalizeDigits(b);
@@ -309,14 +348,14 @@ export default function ShipmentCard({
   //OCR move PT
   async function performMovePT(pt: ShipmentPT) {
     setStagingPTIds((prev) => (prev.includes(pt.id) ? prev : [...prev, pt.id]));
-    showToast(`Staging PT ${pt.pt_number}...`, 'success');
 
     try {
       if (!shipment.staging_lane) throw new Error('Staging lane not set');
+      const rpcContext = await resolveStageRpcContext();
 
       const { error: stageError } = await supabase.rpc('stage_pickticket_into_shipment_lane', {
-        p_pu_number: shipment.pu_number,
-        p_pu_date: shipment.pu_date,
+        p_pu_number: rpcContext.puNumber,
+        p_pu_date: rpcContext.puDate,
         p_pt_id: pt.id,
         p_original_lane: pt.assigned_lane
       });
@@ -326,7 +365,7 @@ export default function ShipmentCard({
       onUpdate();
     } catch (error) {
       console.error('Error moving PT:', error);
-      showToast('Failed to move PT', 'error');
+      showToast(`Failed to move PT: ${describeError(error)}`, 'error', 7000);
     } finally {
       setStagingPTIds((prev) => prev.filter((id) => id !== pt.id));
     }
@@ -411,6 +450,64 @@ export default function ShipmentCard({
 
   function showToast(message: string, type: 'success' | 'error', durationMs = 3000) {
     setToast({ message, type, durationMs });
+  }
+
+  async function resolveStageRpcContext() {
+    const fallbackPuNumber = asTrimmedText(shipment.pu_number);
+    const fallbackPuDate = asTrimmedText(shipment.pu_date);
+    const stagingLane = asTrimmedText(shipment.staging_lane);
+
+    if (!fallbackPuNumber) {
+      throw new Error('Missing PU number for staging.');
+    }
+    if (!stagingLane) {
+      throw new Error('Staging lane not set.');
+    }
+
+    const { data: rows, error } = await supabase
+      .from('shipments')
+      .select('id, pu_number, pu_date, staging_lane')
+      .eq('pu_number', fallbackPuNumber)
+      .eq('staging_lane', stagingLane)
+      .eq('archived', false)
+      .order('id', { ascending: false })
+      .limit(5);
+
+    if (error) {
+      throw new Error(`Failed resolving staging shipment context: ${describeError(error)}`);
+    }
+
+    const typedRows = (rows || []) as Array<{
+      pu_number: string | null;
+      pu_date: string | null;
+      staging_lane: string | null;
+    }>;
+
+    if (typedRows.length === 0) {
+      if (!fallbackPuDate) {
+        throw new Error('Missing PU date for staging.');
+      }
+      return {
+        puNumber: fallbackPuNumber,
+        puDate: fallbackPuDate
+      };
+    }
+
+    const fallbackDateToken = normalizeDateToken(fallbackPuDate);
+    const dateMatchedRow = typedRows.find((row) => normalizeDateToken(row.pu_date) === fallbackDateToken);
+    const selectedRow = dateMatchedRow || typedRows[0];
+
+    const resolvedPuNumber = asTrimmedText(selectedRow.pu_number) || fallbackPuNumber;
+    const resolvedPuDate = asTrimmedText(selectedRow.pu_date) || fallbackPuDate;
+
+    if (!resolvedPuDate) {
+      throw new Error('Resolved staging shipment has no PU date.');
+    }
+
+    return {
+      puNumber: resolvedPuNumber,
+      puDate: resolvedPuDate
+    };
   }
 
   async function getLaneOccupancy(laneNumber: number) {
@@ -1051,12 +1148,12 @@ export default function ShipmentCard({
     const representative = getRepresentativePTForCompiledGroup(uniquePts);
 
     setStagingPTIds((previous) => Array.from(new Set([...previous, ...ptIds])));
-    showToast(`Staging compiled pallet (${uniquePts.length} PTs)...`, 'success');
 
     try {
+      const rpcContext = await resolveStageRpcContext();
       const { data: stageRows, error: stageError } = await supabase.rpc('stage_pickticket_into_shipment_lane', {
-        p_pu_number: shipment.pu_number,
-        p_pu_date: shipment.pu_date,
+        p_pu_number: rpcContext.puNumber,
+        p_pu_date: rpcContext.puDate,
         p_pt_id: representative.id,
         p_original_lane: representative.assigned_lane
       });
@@ -1073,8 +1170,8 @@ export default function ShipmentCard({
         const { data: shipmentRow, error: shipmentLookupError } = await supabase
           .from('shipments')
           .select('id')
-          .eq('pu_number', shipment.pu_number)
-          .eq('pu_date', shipment.pu_date)
+          .eq('pu_number', rpcContext.puNumber)
+          .eq('pu_date', rpcContext.puDate)
           .order('id', { ascending: false })
           .limit(1)
           .maybeSingle();
@@ -1122,7 +1219,7 @@ export default function ShipmentCard({
       onUpdate();
     } catch (error) {
       console.error('Error staging compiled pallet:', error);
-      showToast('Failed to stage compiled pallet', 'error');
+      showToast(`Failed to stage compiled pallet: ${describeError(error)}`, 'error', 7000);
     } finally {
       setStagingPTIds((previous) => previous.filter((id) => !ptIds.includes(id)));
     }

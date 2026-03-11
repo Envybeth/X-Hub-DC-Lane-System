@@ -86,6 +86,7 @@ export default function LaneGrid({ readOnly = false }: LaneGridProps) {
   const laneFetchInFlightRef = useRef(false);
   const laneFetchQueuedRef = useRef(false);
   const pendingVisibleRefreshRef = useRef(false);
+  const autoOpenedSearchKeyRef = useRef<string | null>(null);
 
   const fetchLanes = useCallback(async () => {
     if (laneFetchInFlightRef.current) {
@@ -323,9 +324,18 @@ export default function LaneGrid({ readOnly = false }: LaneGridProps) {
   }, [fetchLanes]);
 
   useEffect(() => {
-    const laneQuery = searchParams.get('lane');
-    const ptQuery = searchParams.get('pt');
-    if (!laneQuery || lanes.length === 0 || showAssignModal) return;
+    const params = new URLSearchParams(searchParams.toString());
+    const laneQuery = params.get('lane');
+    const ptQuery = params.get('pt');
+
+    if (!laneQuery) {
+      autoOpenedSearchKeyRef.current = null;
+      return;
+    }
+
+    const searchKey = `${laneQuery}::${ptQuery || ''}`;
+    if (autoOpenedSearchKeyRef.current === searchKey) return;
+    if (lanes.length === 0 || showAssignModal) return;
 
     const targetLaneFromQuery = lanes.find((lane) => lane.lane_number === laneQuery);
     if (!targetLaneFromQuery) return;
@@ -360,6 +370,7 @@ export default function LaneGrid({ readOnly = false }: LaneGridProps) {
       if (cancelled) return;
 
       timer = window.setTimeout(() => {
+        autoOpenedSearchKeyRef.current = searchKey;
         if (targetLane.hasStorage && targetLane.storageAssignments && targetLane.storageAssignments.length > 0) {
           setStorageModalData({
             mode: 'lane',
