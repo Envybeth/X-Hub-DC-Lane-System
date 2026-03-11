@@ -48,6 +48,21 @@ interface PTLaneAssignmentRow {
   compiled_pallet_id?: number | null;
 }
 
+interface StagingShipmentContext {
+  id: number;
+  pu_number: string;
+  pu_date: string;
+  staging_lane: string;
+  status: string;
+}
+
+interface StagingCandidate {
+  pt: Pickticket;
+  laneLocations: string[];
+  primaryLane: string | null;
+  isUnassigned: boolean;
+}
+
 const ASSIGN_MODAL_PICKTICKET_SELECT_COLUMNS = `
   id,
   pt_number,
@@ -90,6 +105,21 @@ export default function AssignModal({
   const [draggedItem, setDraggedItem] = useState<number | null>(null);
   const [isStaging, setIsStaging] = useState(false);
   const [stagingPUs, setStagingPUs] = useState<string[]>([]);
+  const [stagingShipment, setStagingShipment] = useState<StagingShipmentContext | null>(null);
+  const [stagingCandidates, setStagingCandidates] = useState<StagingCandidate[]>([]);
+  const [stagingCandidatesLoading, setStagingCandidatesLoading] = useState(false);
+  const [stagingCandidatesError, setStagingCandidatesError] = useState('');
+  const [stagingActionPtIds, setStagingActionPtIds] = useState<number[]>([]);
+  const [stagingSearchQuery, setStagingSearchQuery] = useState('');
+  const [stagingPalletPrompt, setStagingPalletPrompt] = useState<{
+    ptId: number | null;
+    value: string;
+    error: string;
+  }>({
+    ptId: null,
+    value: '',
+    error: ''
+  });
   const [allUnassignedPTs, setAllUnassignedPTs] = useState<Pickticket[]>([]);
   const [isTouchDevice, setIsTouchDevice] = useState(false);
   const [mobileControlsIndex, setMobileControlsIndex] = useState<number | null>(null);
@@ -115,6 +145,7 @@ export default function AssignModal({
   const [mostRecentSync, setMostRecentSync] = useState<Date | null>(null);
   const mostRecentSyncLoadRef = useRef<Promise<Date | null> | null>(null);
   const laneDataRequestIdRef = useRef(0);
+  const stagingActionLockRef = useRef<Set<number>>(new Set());
 
   //compiling PTs
   const [compilingPTs, setCompilingPTs] = useState<Set<number>>(new Set());
@@ -161,6 +192,12 @@ export default function AssignModal({
     setCompilingPTs(new Set());
     setCompilingConfirm(null);
     setCompiledPalletCount('');
+    setStagingShipment(null);
+    setStagingCandidates([]);
+    setStagingCandidatesError('');
+    setStagingActionPtIds([]);
+    setStagingSearchQuery('');
+    setStagingPalletPrompt({ ptId: null, value: '', error: '' });
 
     const activeLaneNumber = String(lane.lane_number);
     void (async () => {
@@ -224,6 +261,17 @@ export default function AssignModal({
       setMobileControlsIndex(null);
     }
   }, [existingPTs, mobileControlsIndex]);
+
+  useEffect(() => {
+    if (!isStaging || !stagingShipment) {
+      setStagingCandidates([]);
+      setStagingCandidatesError('');
+      return;
+    }
+
+    void fetchStagingCandidates(stagingShipment);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isStaging, stagingShipment?.id, stagingShipment?.staging_lane, lane.lane_number]);
 
   async function handleCompile() {
     if (!compilingConfirm || compilingPTs.size === 0) return;
@@ -298,6 +346,21 @@ export default function AssignModal({
     return a.localeCompare(b);
   }
 
+  function comparePTLabels(a: string | null | undefined, b: string | null | undefined) {
+    return String(a || '').localeCompare(String(b || ''), undefined, {
+      sensitivity: 'base',
+      numeric: true
+    });
+  }
+
+  function parsePositiveIntegerInput(value: string): number | null {
+    const normalized = value.trim();
+    if (!/^\d+$/.test(normalized)) return null;
+    const parsed = Number.parseInt(normalized, 10);
+    if (!Number.isFinite(parsed) || parsed <= 0) return null;
+    return parsed;
+  }
+
   async function syncPickticketWithAssignments(
     ptId: number,
     options?: { setUnlabeledIfEmpty?: boolean }
@@ -363,7 +426,7 @@ export default function AssignModal({
   async function checkIfStagingLane(targetLaneNumber: string = String(lane.lane_number), requestId?: number) {
     const { data } = await supabase
       .from('shipments')
-      .select('id, pu_number, staging_lane, status')
+      .select('id, pu_number, pu_date, staging_lane, status')
       .eq('staging_lane', targetLaneNumber)
       .eq('archived', false)
       .maybeSingle();
@@ -373,7 +436,15 @@ export default function AssignModal({
     if (data) {
       setIsStaging(true);
       setStagingPUs([data.pu_number]);
+      setStagingShipment({
+        id: data.id,
+        pu_number: data.pu_number,
+        pu_date: data.pu_date,
+        staging_lane: String(data.staging_lane || targetLaneNumber),
+        status: String(data.status || 'in_process')
+      });
     } else {
+      setStagingShipment(null);
       // ALSO check if ANY PTs in this lane have staged/ready_to_ship status
       const { data: stagedPTs } = await supabase
         .from('picktickets')
@@ -574,6 +645,212 @@ export default function AssignModal({
     );
 
     setPicktickets(filtered);
+  }
+
+  async function fetchStagingCandidates(context?: StagingShipmentContext | null) {
+    const activeContext = context || stagingShipment;
+    if (!activeContext) {
+      setStagingCandidates([]);
+      setStagingCandidatesError('');
+      return;
+    }
+
+    setStagingCandidatesLoading(true);
+    setStagingCandidatesError('');
+
+    try {
+      const { data: ptRows, error: ptError } = await supabase
+        .from('picktickets')
+        .select(ASSIGN_MODAL_PICKTICKET_SELECT_COLUMNS)
+        .eq('pu_number', activeContext.pu_number)
+        .eq('pu_date', activeContext.pu_date)
+        .neq('status', 'shipped')
+        .neq('customer', 'PAPER')
+        .order('pt_number');
+      throwIfSupabaseError(ptError, 'Failed loading shipment PTs for staging lane');
+
+      const typedRows = (ptRows || []) as Pickticket[];
+      const ptIds = typedRows.map((pt) => pt.id);
+      const laneLocationsByPtId = new Map<number, string[]>();
+
+      if (ptIds.length > 0) {
+        const { data: laneRows, error: laneRowsError } = await supabase
+          .from('lane_assignments')
+          .select('pt_id, lane_number')
+          .in('pt_id', ptIds);
+        throwIfSupabaseError(laneRowsError, 'Failed loading lane assignments for shipment PTs');
+
+        (laneRows || []).forEach((row) => {
+          const ptId = Number((row as { pt_id: number }).pt_id);
+          const laneNumber = String((row as { lane_number: string | null }).lane_number || '').trim();
+          if (!Number.isFinite(ptId) || !laneNumber) return;
+
+          const current = laneLocationsByPtId.get(ptId) || [];
+          if (!current.includes(laneNumber)) {
+            current.push(laneNumber);
+            laneLocationsByPtId.set(ptId, current);
+          }
+        });
+      }
+
+      laneLocationsByPtId.forEach((locations, ptId) => {
+        laneLocationsByPtId.set(ptId, [...locations].sort(compareLaneNumbers));
+      });
+
+      const stagingLaneNumber = String(activeContext.staging_lane || lane.lane_number).trim();
+
+      const candidates: StagingCandidate[] = typedRows
+        .map((pt) => {
+          const explicitLaneLocations = laneLocationsByPtId.get(pt.id) || [];
+          const fallbackLocations = explicitLaneLocations.length === 0 && pt.assigned_lane
+            ? [String(pt.assigned_lane).trim()].filter(Boolean)
+            : [];
+          const laneLocations = (explicitLaneLocations.length > 0 ? explicitLaneLocations : fallbackLocations)
+            .filter(Boolean)
+            .sort(compareLaneNumbers);
+          const primaryLane = laneLocations[0] || null;
+
+          return {
+            pt,
+            laneLocations,
+            primaryLane,
+            isUnassigned: laneLocations.length === 0
+          } satisfies StagingCandidate;
+        })
+        .filter((candidate) => !candidate.laneLocations.includes(stagingLaneNumber))
+        .sort((a, b) => {
+          if (a.isUnassigned !== b.isUnassigned) {
+            return a.isUnassigned ? -1 : 1;
+          }
+
+          if (!a.isUnassigned && !b.isUnassigned) {
+            const laneComparison = compareLaneNumbers(a.primaryLane || '', b.primaryLane || '');
+            if (laneComparison !== 0) return laneComparison;
+          }
+
+          return comparePTLabels(a.pt.pt_number, b.pt.pt_number);
+        });
+
+      setStagingCandidates(candidates);
+    } catch (error) {
+      console.error('Failed loading staging candidates:', error);
+      setStagingCandidates([]);
+      setStagingCandidatesError(getErrorMessage(error));
+    } finally {
+      setStagingCandidatesLoading(false);
+    }
+  }
+
+  async function stageStagingCandidateNow(candidate: StagingCandidate, requestedPalletCount: number | null) {
+    if (!stagingShipment) {
+      showToast('No active shipment is linked to this staging lane.', 'error');
+      return false;
+    }
+
+    const ptId = candidate.pt.id;
+    const ptLabel = candidate.pt.pt_number || `PT-${ptId}`;
+    const actionInFlight = stagingActionLockRef.current.has(ptId) || stagingActionPtIds.includes(ptId);
+    if (actionInFlight) return false;
+
+    stagingActionLockRef.current.add(ptId);
+    setStagingActionPtIds((previous) => (previous.includes(ptId) ? previous : [...previous, ptId]));
+
+    try {
+      if (requestedPalletCount !== null) {
+        const previousPalletCount = candidate.pt.actual_pallet_count ?? null;
+        const { error: updatePalletError } = await supabase
+          .from('picktickets')
+          .update({ actual_pallet_count: requestedPalletCount })
+          .eq('id', ptId);
+        throwIfSupabaseError(updatePalletError, `Failed setting pallet count for PT ${ptLabel}`);
+
+        const { error: stageError } = await supabase.rpc('stage_pickticket_into_shipment_lane', {
+          p_pu_number: stagingShipment.pu_number,
+          p_pu_date: stagingShipment.pu_date,
+          p_pt_id: ptId,
+          p_original_lane: null
+        });
+
+        if (stageError) {
+          await supabase
+            .from('picktickets')
+            .update({ actual_pallet_count: previousPalletCount })
+            .eq('id', ptId);
+          throw stageError;
+        }
+      } else {
+        const { error: stageError } = await supabase.rpc('stage_pickticket_into_shipment_lane', {
+          p_pu_number: stagingShipment.pu_number,
+          p_pu_date: stagingShipment.pu_date,
+          p_pt_id: ptId,
+          p_original_lane: candidate.primaryLane
+        });
+        throwIfSupabaseError(stageError, `Failed staging PT ${ptLabel}`);
+      }
+
+      showToast(`✅ PT ${ptLabel} staged`, 'success');
+      await fetchExistingPTs();
+      await checkIfStagingLane();
+      await fetchStagingCandidates();
+      onUpdated?.();
+      return true;
+    } catch (error) {
+      console.error('Failed staging candidate PT:', error);
+      showToast(`Failed staging PT ${ptLabel}: ${getErrorMessage(error)}`, 'error');
+      return false;
+    } finally {
+      setStagingActionPtIds((previous) => previous.filter((id) => id !== ptId));
+      stagingActionLockRef.current.delete(ptId);
+    }
+  }
+
+  function openStagingPalletPrompt(candidate: StagingCandidate) {
+    const suggested = Math.max(1, Number(candidate.pt.actual_pallet_count || 0));
+    setStagingPalletPrompt({
+      ptId: candidate.pt.id,
+      value: String(suggested),
+      error: ''
+    });
+  }
+
+  function closeStagingPalletPrompt() {
+    setStagingPalletPrompt({ ptId: null, value: '', error: '' });
+  }
+
+  async function stageStagingCandidate(candidate: StagingCandidate) {
+    if (candidate.isUnassigned) {
+      openStagingPalletPrompt(candidate);
+      return;
+    }
+    await stageStagingCandidateNow(candidate, null);
+  }
+
+  async function confirmStageUnassignedCandidate() {
+    if (stagingPalletPrompt.ptId === null) return;
+
+    const candidate = stagingCandidates.find((item) => item.pt.id === stagingPalletPrompt.ptId);
+    if (!candidate) {
+      setStagingPalletPrompt((prev) => ({ ...prev, error: 'PT is no longer available. Refreshing list...' }));
+      await fetchStagingCandidates();
+      return;
+    }
+
+    const normalized = stagingPalletPrompt.value.trim();
+    if (!normalized) {
+      setStagingPalletPrompt((prev) => ({ ...prev, error: 'Enter pallet count.' }));
+      return;
+    }
+
+    const parsed = parsePositiveIntegerInput(normalized);
+    if (parsed === null) {
+      setStagingPalletPrompt((prev) => ({ ...prev, error: 'Pallet count must be a whole number greater than 0.' }));
+      return;
+    }
+
+    const succeeded = await stageStagingCandidateNow(candidate, parsed);
+    if (succeeded) {
+      closeStagingPalletPrompt();
+    }
   }
 
   function handlePTSelect(ptId: number) {
@@ -1116,6 +1393,28 @@ export default function AssignModal({
     })
     .filter(Boolean);
 
+  const stagingSearchNeedle = stagingSearchQuery.trim().toLowerCase();
+  const visibleStagingCandidates = stagingSearchNeedle
+    ? stagingCandidates.filter((candidate) => {
+      const laneText = candidate.isUnassigned ? 'unassigned' : candidate.laneLocations.join('/');
+      return [
+        candidate.pt.pt_number,
+        candidate.pt.po_number,
+        candidate.pt.customer,
+        candidate.pt.container_number,
+        laneText
+      ].some((value) => String(value || '').toLowerCase().includes(stagingSearchNeedle));
+    })
+    : stagingCandidates;
+
+  const stagingPalletPromptCandidate = stagingPalletPrompt.ptId === null
+    ? null
+    : stagingCandidates.find((candidate) => candidate.pt.id === stagingPalletPrompt.ptId) || null;
+  const stagingPalletPromptBusy = Boolean(
+    stagingPalletPromptCandidate && stagingActionPtIds.includes(stagingPalletPromptCandidate.pt.id)
+  );
+  const stagingPalletPromptHasValidValue = parsePositiveIntegerInput(stagingPalletPrompt.value) !== null;
+
   function toggleEditForAssignment(assignment: LaneAssignment) {
     if (editingPT && editingPT.id === assignment.id) {
       setEditingPT(null);
@@ -1204,7 +1503,7 @@ export default function AssignModal({
           )}
 
           {/* Tab switcher */}
-          {existingPTs.length > 0 && !isStaging && (
+          {(existingPTs.length > 0 || isStaging) && (
             <div className="grid grid-cols-2 gap-2 md:gap-4 mb-4 md:mb-6">
               <button
                 onClick={() => setView('existing')}
@@ -1222,13 +1521,13 @@ export default function AssignModal({
                   : 'bg-gray-700 hover:bg-gray-600'
                   }`}
               >
-                + Add New PT
+                {isStaging ? '+ Stage Shipment PTs' : '+ Add New PT'}
               </button>
             </div>
           )}
 
           {/* EXISTING PTs VIEW */}
-          {(view === 'existing' || isStaging) && (
+          {view === 'existing' && (
             <div>
               <div className="bg-gray-700 p-3 md:p-4 rounded-lg mb-3 md:mb-4">
                 <div className="text-sm md:text-lg">
@@ -1913,6 +2212,112 @@ export default function AssignModal({
             </div>
           )}
 
+          {/* STAGING ADD VIEW */}
+          {view === 'add' && isStaging && (
+            <div className="space-y-3 md:space-y-4">
+              <div className="bg-purple-950/45 border border-purple-700 rounded-lg p-3 md:p-4">
+                <div className="font-bold text-sm md:text-base text-purple-200">
+                  {stagingShipment
+                    ? `Stage remaining PTs for PU ${stagingShipment.pu_number} (${stagingShipment.pu_date})`
+                    : 'This lane is in staging mode'}
+                </div>
+                <div className="text-xs md:text-sm text-purple-100/90 mt-1">
+                  Order: Unassigned first, then assigned lanes from smallest to largest.
+                </div>
+              </div>
+
+              <div className="bg-gray-800 border border-gray-700 rounded-lg p-3">
+                <label className="block text-xs md:text-sm font-semibold text-gray-200 mb-2">
+                  Search Shipment PTs
+                </label>
+                <input
+                  type="text"
+                  value={stagingSearchQuery}
+                  onChange={(event) => setStagingSearchQuery(event.target.value)}
+                  placeholder="PT #, PO #, customer, container, lane..."
+                  className="w-full bg-gray-900 border border-gray-600 text-white p-2 rounded-lg text-sm md:text-base"
+                />
+              </div>
+
+              {stagingCandidatesError && (
+                <div className="bg-red-950/40 border border-red-700 text-red-100 rounded-lg p-3 text-xs md:text-sm">
+                  Failed loading staging candidates: {stagingCandidatesError}
+                </div>
+              )}
+
+              {!stagingShipment ? (
+                <div className="bg-gray-700 rounded-lg p-4 text-sm md:text-base text-gray-200">
+                  No active shipment record is currently linked to this staging lane.
+                </div>
+              ) : stagingCandidatesLoading ? (
+                <div className="bg-gray-700 rounded-lg p-4 text-sm md:text-base animate-pulse">
+                  Loading shipment PTs...
+                </div>
+              ) : stagingCandidates.length === 0 ? (
+                <div className="bg-gray-700 rounded-lg p-4 text-sm md:text-base text-gray-200">
+                  All PTs for this shipment are already staged in this lane.
+                </div>
+              ) : visibleStagingCandidates.length === 0 ? (
+                <div className="bg-gray-700 rounded-lg p-4 text-sm md:text-base text-gray-200">
+                  No shipment PTs match your search.
+                </div>
+              ) : (
+                <div className="space-y-2 md:space-y-3">
+                  {visibleStagingCandidates.map((candidate) => {
+                    const isArchived = isPTArchived(candidate.pt, mostRecentSync);
+                    const laneLabel = candidate.isUnassigned
+                      ? 'Unassigned'
+                      : `Lane ${candidate.laneLocations.join('/')}`;
+                    const isActing = stagingActionPtIds.includes(candidate.pt.id);
+
+                    return (
+                      <div key={candidate.pt.id} className="bg-gray-700 border border-gray-600 rounded-lg p-3 md:p-4">
+                        <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <div className="font-bold text-sm md:text-base break-all">PT #{candidate.pt.pt_number}</div>
+                              {isArchived && (
+                                <span className="bg-gray-800 px-1.5 py-0.5 rounded text-[9px] font-bold text-gray-200">
+                                  ARCHIVED
+                                </span>
+                              )}
+                              <span className={`px-2 py-0.5 rounded text-[10px] md:text-xs font-semibold ${
+                                candidate.isUnassigned ? 'bg-yellow-800 text-yellow-100' : 'bg-blue-800 text-blue-100'
+                              }`}>
+                                {laneLabel}
+                              </span>
+                            </div>
+                            <div className="text-xs md:text-sm text-gray-300 break-all mt-1">
+                              {candidate.pt.customer} | PO: {candidate.pt.po_number} | Container: {candidate.pt.container_number}
+                            </div>
+                          </div>
+
+                          <div className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => setViewingSearchPTDetails(candidate.pt)}
+                              className="bg-blue-700 hover:bg-blue-600 px-3 py-2 rounded-lg font-semibold text-xs md:text-sm whitespace-nowrap"
+                            >
+                              Details
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => void stageStagingCandidate(candidate)}
+                              disabled={isActing || loading}
+                              className="bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed px-3 py-2 rounded-lg font-semibold text-xs md:text-sm whitespace-nowrap"
+                            >
+                              {isActing ? 'Staging...' : (candidate.isUnassigned ? 'Add & Stage' : 'Stage')}
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
           {/* PT Details Modal */}
           {selectedPTDetails && (
             <PTDetails
@@ -1934,6 +2339,72 @@ export default function AssignModal({
         onConfirm={confirmModal.onConfirm}
         onCancel={() => setConfirmModal({ ...confirmModal, isOpen: false })}
       />
+
+      {stagingPalletPrompt.ptId !== null && (
+        <div className="fixed inset-0 bg-black/75 flex items-center justify-center z-[120] p-4">
+          <div className="bg-gray-800 border-2 border-gray-600 rounded-lg w-full max-w-md p-4 md:p-6">
+            <h3 className="text-lg md:text-xl font-bold mb-2">Add & Stage PT</h3>
+            <p className="text-xs md:text-sm text-gray-300 mb-4">
+              {stagingPalletPromptCandidate
+                ? `Enter pallet count for PT #${stagingPalletPromptCandidate.pt.pt_number}.`
+                : 'PT is no longer available.'}
+            </p>
+
+            <label className="block text-xs md:text-sm font-semibold text-gray-200 mb-2">Pallet Count</label>
+            <input
+              type="number"
+              min="1"
+              autoFocus
+              value={stagingPalletPrompt.value}
+              onChange={(event) => setStagingPalletPrompt((prev) => ({ ...prev, value: event.target.value, error: '' }))}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') {
+                  event.preventDefault();
+                  if (!stagingPalletPromptHasValidValue) {
+                    setStagingPalletPrompt((prev) => ({
+                      ...prev,
+                      error: prev.value.trim()
+                        ? 'Pallet count must be a whole number greater than 0.'
+                        : 'Enter pallet count.'
+                    }));
+                    return;
+                  }
+                  void confirmStageUnassignedCandidate();
+                }
+              }}
+              className={`w-full bg-gray-900 text-white p-2 md:p-3 rounded-lg text-sm md:text-base ${
+                stagingPalletPrompt.error ? 'border-2 border-red-500' : 'border border-gray-600'
+              }`}
+            />
+
+            {stagingPalletPrompt.error && (
+              <div className="mt-2 text-xs md:text-sm text-red-300">
+                {stagingPalletPrompt.error}
+              </div>
+            )}
+
+            <div className="flex gap-2 justify-end mt-4">
+              <button
+                type="button"
+                onClick={closeStagingPalletPrompt}
+                disabled={stagingPalletPromptBusy}
+                className="bg-gray-600 hover:bg-gray-700 disabled:bg-gray-700 px-4 py-2 rounded-lg font-semibold text-sm md:text-base"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => void confirmStageUnassignedCandidate()}
+                disabled={!stagingPalletPromptCandidate || stagingPalletPromptBusy || !stagingPalletPromptHasValidValue}
+                className="bg-green-600 hover:bg-green-700 disabled:bg-gray-600 px-4 py-2 rounded-lg font-semibold text-sm md:text-base"
+              >
+                {stagingPalletPromptBusy ? 'Staging...' : 'Add & Stage'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Search PT Details Modal */}
       {viewingSearchPTDetails && (
         <PTDetails

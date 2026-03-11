@@ -257,11 +257,18 @@ export default function ShipmentsPage() {
   }, [staleSnapshotStoreAvailable]);
 
   useEffect(() => {
-    const unsubscribe = subscribeScope('shipments', (payload) => {
+    const unsubscribeShipments = subscribeScope('shipments', (payload) => {
       scheduleShipmentRefresh(Boolean(payload.includeStale));
     });
 
-    return () => unsubscribe();
+    const unsubscribeLaneGrid = subscribeScope('lane-grid', () => {
+      scheduleShipmentRefresh(false);
+    });
+
+    return () => {
+      unsubscribeShipments();
+      unsubscribeLaneGrid();
+    };
   }, [scheduleShipmentRefresh, subscribeScope]);
 
   useEffect(() => {

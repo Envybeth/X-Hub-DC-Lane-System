@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { supabase } from '@/lib/supabase';
 import ConfirmModal from './ConfirmModal';
 import PTDetails from './PTDetails';
@@ -140,7 +140,9 @@ export default function ShipmentCard({
   const [selectedLaneInput, setSelectedLaneInput] = useState('');
   const [selectedPTDetails, setSelectedPTDetails] = useState<ShipmentPT | null>(null);
   const [ptDepthInfo, setPtDepthInfo] = useState<{ [key: number]: { palletsInFront: number; maxCapacity: number } }>({});
-  const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
+  const [toast, setToast] = useState<{ message: string; type: 'success' | 'error'; durationMs?: number } | null>(null);
+  const [stagingLaneBusy, setStagingLaneBusy] = useState(false);
+  const stagingLaneBusyRef = useRef(false);
   const [changingStagingLane, setChangingStagingLane] = useState(false);
   const [newStagingLane, setNewStagingLane] = useState('');
   const [stagingLaneError, setStagingLaneError] = useState('');
@@ -211,7 +213,7 @@ export default function ShipmentCard({
 
   useEffect(() => {
     if (toast) {
-      const timer = setTimeout(() => setToast(null), 3000);
+      const timer = setTimeout(() => setToast(null), toast.durationMs || 3000);
       return () => clearTimeout(timer);
     }
   }, [toast]);
@@ -221,23 +223,40 @@ export default function ShipmentCard({
     setAdminShipmentArchived(Boolean(shipment.archived));
   }, [shipment.status, shipment.archived, shipment.pu_number, shipment.pu_date]);
 
-  async function normalizeStagedPTLaneAssignments(ptId: number, targetLane: string, palletCount: number) {
-    const normalizedPalletCount = Number.isFinite(palletCount) ? Math.max(0, Math.trunc(palletCount)) : 0;
+  function buildRepresentativeRowsForPTIds(ptIds: number[]) {
+    const byRepresentative = new Map<number, number>();
 
-    const { data: existingPtAssignments, error: existingPtAssignmentsError } = await supabase
+    ptIds.forEach((ptId) => {
+      const representativeId = getCompiledRepresentativeId(ptId);
+      if (byRepresentative.has(representativeId)) return;
+
+      const representativePt = shipment.pts.find((pt) => pt.id === representativeId) || shipment.pts.find((pt) => pt.id === ptId);
+      const palletCount = Number(representativePt?.actual_pallet_count || 0);
+      byRepresentative.set(representativeId, Number.isFinite(palletCount) ? Math.max(0, Math.trunc(palletCount)) : 0);
+    });
+
+    return Array.from(byRepresentative.entries())
+      .map(([ptId, palletCount]) => ({ ptId, palletCount }))
+      .sort((a, b) => {
+        const aPt = shipment.pts.find((pt) => pt.id === a.ptId);
+        const bPt = shipment.pts.find((pt) => pt.id === b.ptId);
+        return compareTextNumeric(aPt?.pt_number || String(a.ptId), bPt?.pt_number || String(b.ptId));
+      });
+  }
+
+  async function normalizeStagedPTLaneAssignmentsBatch(
+    rows: Array<{ ptId: number; palletCount: number }>,
+    targetLane: string
+  ) {
+    if (rows.length === 0) return;
+
+    const representativeIds = rows.map((row) => row.ptId);
+
+    const { error: deleteAssignmentsError } = await supabase
       .from('lane_assignments')
-      .select('id')
-      .eq('pt_id', ptId);
-    if (existingPtAssignmentsError) throw existingPtAssignmentsError;
-
-    if (existingPtAssignments && existingPtAssignments.length > 0) {
-      const assignmentIds = existingPtAssignments.map((assignment) => assignment.id);
-      const { error: deleteAssignmentsError } = await supabase
-        .from('lane_assignments')
-        .delete()
-        .in('id', assignmentIds);
-      if (deleteAssignmentsError) throw deleteAssignmentsError;
-    }
+      .delete()
+      .in('pt_id', representativeIds);
+    if (deleteAssignmentsError) throw deleteAssignmentsError;
 
     const { data: existingLaneAssignments, error: existingLaneAssignmentsError } = await supabase
       .from('lane_assignments')
@@ -246,25 +265,30 @@ export default function ShipmentCard({
       .order('order_position', { ascending: true });
     if (existingLaneAssignmentsError) throw existingLaneAssignmentsError;
 
-    if (existingLaneAssignments) {
-      for (const assignment of existingLaneAssignments) {
-        const { error: shiftAssignmentError } = await supabase
-          .from('lane_assignments')
-          .update({ order_position: (assignment.order_position || 0) + 1 })
-          .eq('id', assignment.id);
-        if (shiftAssignmentError) throw shiftAssignmentError;
-      }
+    const shiftBy = rows.length;
+    if ((existingLaneAssignments || []).length > 0 && shiftBy > 0) {
+      await Promise.all(
+        (existingLaneAssignments || []).map(async (assignment) => {
+          const { error: shiftAssignmentError } = await supabase
+            .from('lane_assignments')
+            .update({ order_position: (assignment.order_position || 0) + shiftBy })
+            .eq('id', assignment.id);
+          if (shiftAssignmentError) throw shiftAssignmentError;
+        })
+      );
     }
 
-    const { error: insertAssignmentError } = await supabase
+    const { error: insertAssignmentsError } = await supabase
       .from('lane_assignments')
-      .insert({
-        lane_number: targetLane,
-        pt_id: ptId,
-        pallet_count: normalizedPalletCount,
-        order_position: 1
-      });
-    if (insertAssignmentError) throw insertAssignmentError;
+      .insert(
+        rows.map((row, index) => ({
+          lane_number: targetLane,
+          pt_id: row.ptId,
+          pallet_count: row.palletCount,
+          order_position: index + 1
+        }))
+      );
+    if (insertAssignmentsError) throw insertAssignmentsError;
   }
 
   // THE WATCHDOG: Automatically syncs PTs in the staging lane to staged/ready_to_ship based on shipment status.
@@ -385,8 +409,27 @@ export default function ShipmentCard({
     }
   }
 
-  function showToast(message: string, type: 'success' | 'error') {
-    setToast({ message, type });
+  function showToast(message: string, type: 'success' | 'error', durationMs = 3000) {
+    setToast({ message, type, durationMs });
+  }
+
+  async function getLaneOccupancy(laneNumber: number) {
+    const laneKey = String(laneNumber);
+    const { data: rows, error } = await supabase
+      .from('lane_assignments')
+      .select('pt_id')
+      .eq('lane_number', laneKey);
+    if (error) throw error;
+
+    const shipmentPtIdSet = new Set(shipment.pts.map((pt) => pt.id));
+    const uniquePtIds = Array.from(
+      new Set((rows || []).map((row) => Number((row as { pt_id: number }).pt_id)).filter((ptId) => Number.isFinite(ptId)))
+    );
+
+    const sameShipmentPtIds = uniquePtIds.filter((ptId) => shipmentPtIdSet.has(ptId));
+    const foreignPtIds = uniquePtIds.filter((ptId) => !shipmentPtIdSet.has(ptId));
+
+    return { sameShipmentPtIds, foreignPtIds };
   }
 
   function showConfirm(title: string, message: string, onConfirm: () => void) {
@@ -725,6 +768,8 @@ export default function ShipmentCard({
   }
 
   async function handleSetStagingLane() {
+    if (stagingLaneBusyRef.current || stagingLaneBusy) return;
+
     if (!selectedLaneInput.trim()) {
       showToast('Please enter a lane number', 'error');
       return;
@@ -736,28 +781,31 @@ export default function ShipmentCard({
       return;
     }
 
-    // Check if lane has existing PTs
-    const { data: existingPTs } = await supabase
-      .from('lane_assignments')
-      .select('id, pt_id')
-      .eq('lane_number', laneNumber);
+    stagingLaneBusyRef.current = true;
+    setStagingLaneBusy(true);
+    try {
+      const occupancy = await getLaneOccupancy(laneNumber);
+      if (occupancy.foreignPtIds.length > 0) {
+        window.alert(
+          `Lane ${laneNumber} cannot be selected for this shipment.\n\n` +
+          `It has ${occupancy.foreignPtIds.length} PT(s) from other shipment(s).`
+        );
+        return;
+      }
 
-    if (existingPTs && existingPTs.length > 0) {
-      showConfirm(
-        'Lane Has PTs',
-        `⚠️ Warning: Lane ${laneNumber} has ${existingPTs.length} PT(s) assigned.\n\nAre you sure you want to use this lane for staging?`,
-        async () => {
-          await performSetStagingLane(laneNumber, existingPTs.map(pt => pt.pt_id));
-          setConfirmModal({ ...confirmModal, isOpen: false });
-        }
-      );
-    } else {
-      await performSetStagingLane(laneNumber, []);
+      await performSetStagingLane(laneNumber, occupancy.sameShipmentPtIds);
+    } catch (error) {
+      console.error('Error validating staging lane occupancy:', error);
+      showToast('Failed to validate lane occupancy', 'error');
+    } finally {
+      setStagingLaneBusy(false);
+      stagingLaneBusyRef.current = false;
     }
   }
 
-  async function performSetStagingLane(laneNumber: number, existingPTIds: number[]) {
+  async function performSetStagingLane(laneNumber: number, existingShipmentPTIdsInLane: number[]) {
     try {
+      const targetLane = laneNumber.toString();
       // Create/update shipment
       const { data: shipmentData, error: shipmentError } = await supabase
         .from('shipments')
@@ -765,7 +813,7 @@ export default function ShipmentCard({
           pu_number: shipment.pu_number,
           pu_date: shipment.pu_date,
           carrier: shipment.carrier,
-          staging_lane: laneNumber.toString(),
+          staging_lane: targetLane,
           status: 'in_process',
           updated_at: new Date().toISOString()
         }, {
@@ -779,48 +827,62 @@ export default function ShipmentCard({
       // Automatically stage any PTs that belong to this shipment AND are already in the target lane
       const shipmentPTIds = shipment.pts.map(pt => pt.id);
       const ptsToMarkAsStaged = new Set<number>();
+      const alreadyInTargetLane = new Set<number>();
+      const assignedLaneByPtId = new Map<number, string | null>(
+        shipment.pts.map((pt) => [pt.id, pt.assigned_lane || null])
+      );
 
       shipment.pts.forEach(pt => {
-        if (pt.assigned_lane === laneNumber.toString()) {
+        if (pt.assigned_lane === targetLane) {
+          alreadyInTargetLane.add(pt.id);
           ptsToMarkAsStaged.add(pt.id);
         }
       });
-      existingPTIds.forEach(id => {
+      existingShipmentPTIdsInLane.forEach(id => {
         if (shipmentPTIds.includes(id)) {
+          alreadyInTargetLane.add(id);
           ptsToMarkAsStaged.add(id);
         }
       });
 
       const ptsArray = Array.from(ptsToMarkAsStaged);
-      const normalizedRepresentativeIds = new Set<number>();
+      const stageStatus = shipmentData.status === 'finalized' ? 'ready_to_ship' : 'staged';
 
-      for (const ptId of ptsArray) {
-        await supabase
+      if (ptsArray.length > 0) {
+        const { error: upsertShipmentPtsError } = await supabase
           .from('shipment_pts')
-          .upsert({
-            shipment_id: shipmentData.id,
-            pt_id: ptId,
-            original_lane: null,
-            removed_from_staging: false
-          }, {
-            onConflict: 'shipment_id,pt_id'
-          });
+          .upsert(
+            ptsArray.map((ptId) => ({
+              shipment_id: shipmentData.id,
+              pt_id: ptId,
+              original_lane: assignedLaneByPtId.get(ptId),
+              removed_from_staging: false
+            })),
+            { onConflict: 'shipment_id,pt_id' }
+          );
+        if (upsertShipmentPtsError) throw upsertShipmentPtsError;
 
-        await supabase
+        const { error: updatePickticketsError } = await supabase
           .from('picktickets')
-          .update({ status: 'ready_to_ship', assigned_lane: laneNumber.toString() })
-          .eq('id', ptId);
+          .update({ status: stageStatus, assigned_lane: targetLane })
+          .in('id', ptsArray);
+        if (updatePickticketsError) throw updatePickticketsError;
 
-        const representativeId = getCompiledRepresentativeId(ptId);
-        if (!normalizedRepresentativeIds.has(representativeId)) {
-          normalizedRepresentativeIds.add(representativeId);
-          const palletCount = shipment.pts.find((pt) => pt.id === representativeId)?.actual_pallet_count || 0;
-          await normalizeStagedPTLaneAssignments(representativeId, laneNumber.toString(), palletCount);
-        }
+        const representativeRows = buildRepresentativeRowsForPTIds(ptsArray);
+        await normalizeStagedPTLaneAssignmentsBatch(representativeRows, targetLane);
       }
 
       if (ptsArray.length > 0) {
-        showToast(`Staging lane ${laneNumber} set (${ptsArray.length} PTs swept into staging)`, 'success');
+        const alreadyCount = alreadyInTargetLane.size;
+        if (alreadyCount > 0) {
+          showToast(
+            `Staging lane ${laneNumber} set. ${alreadyCount} PT(s) already in this lane were auto-linked to this load.`,
+            'success',
+            6500
+          );
+        } else {
+          showToast(`Staging lane ${laneNumber} set (${ptsArray.length} PTs swept into staging)`, 'success');
+        }
       } else {
         showToast(`Staging lane ${laneNumber} set`, 'success');
       }
@@ -835,6 +897,7 @@ export default function ShipmentCard({
   }
 
   async function handleChangeStagingLane() {
+    if (stagingLaneBusyRef.current || stagingLaneBusy) return;
     if (!newStagingLane.trim() || !shipment.staging_lane) return;
 
     const targetLaneNumber = parseInt(newStagingLane.trim());
@@ -851,58 +914,53 @@ export default function ShipmentCard({
       return;
     }
 
-    const { data: existingPTs } = await supabase
-      .from('lane_assignments')
-      .select('id')
-      .eq('lane_number', targetLaneNumber);
+    stagingLaneBusyRef.current = true;
+    setStagingLaneBusy(true);
+    try {
+      const occupancy = await getLaneOccupancy(targetLaneNumber);
+      if (occupancy.foreignPtIds.length > 0) {
+        window.alert(
+          `Lane ${targetLaneNumber} cannot be selected for this shipment.\n\n` +
+          `It has ${occupancy.foreignPtIds.length} PT(s) from other shipment(s).`
+        );
+        return;
+      }
 
-    if (existingPTs && existingPTs.length > 0) {
-      showConfirm(
-        'Lane Has PTs',
-        `⚠️ Warning: Lane ${targetLaneNumber} has ${existingPTs.length} PT(s) assigned.\n\nMove staging lane anyway?`,
-        async () => {
-          await performChangeStagingLane(targetLaneNumber);
-          setConfirmModal({ ...confirmModal, isOpen: false });
-        }
-      );
-    } else {
-      showConfirm(
-        'Change Staging Lane',
-        `Move all PTs from Lane ${shipment.staging_lane} to Lane ${targetLaneNumber}?`,
-        async () => {
-          await performChangeStagingLane(targetLaneNumber);
-          setConfirmModal({ ...confirmModal, isOpen: false });
-        }
-      );
+      await performChangeStagingLane(targetLaneNumber);
+    } catch (error) {
+      console.error('Error validating lane while changing staging lane:', error);
+      setStagingLaneError('Failed to validate target lane');
+      setTimeout(() => setStagingLaneError(''), 3000);
+    } finally {
+      setStagingLaneBusy(false);
+      stagingLaneBusyRef.current = false;
     }
   }
 
   async function performChangeStagingLane(targetLaneNumber: number) {
     try {
+      const targetLane = targetLaneNumber.toString();
       const stagedPTs = shipment.pts.filter(pt => pt.moved_to_staging && !pt.removed_from_staging);
+      const stagedPtIds = stagedPTs.map((pt) => pt.id);
 
       await supabase
         .from('shipments')
         .update({
-          staging_lane: targetLaneNumber.toString(),
+          staging_lane: targetLane,
           updated_at: new Date().toISOString()
         })
         .eq('pu_number', shipment.pu_number)
         .eq('pu_date', shipment.pu_date);
 
-      const normalizedRepresentativeIds = new Set<number>();
-      for (const pt of stagedPTs) {
-        await supabase
+      if (stagedPtIds.length > 0) {
+        const { error: updatePickticketsError } = await supabase
           .from('picktickets')
-          .update({ assigned_lane: targetLaneNumber.toString() })
-          .eq('id', pt.id);
+          .update({ assigned_lane: targetLane })
+          .in('id', stagedPtIds);
+        if (updatePickticketsError) throw updatePickticketsError;
 
-        const representativeId = getCompiledRepresentativeId(pt.id);
-        if (!normalizedRepresentativeIds.has(representativeId)) {
-          normalizedRepresentativeIds.add(representativeId);
-          const palletCount = shipment.pts.find((candidate) => candidate.id === representativeId)?.actual_pallet_count || 0;
-          await normalizeStagedPTLaneAssignments(representativeId, targetLaneNumber.toString(), palletCount);
-        }
+        const representativeRows = buildRepresentativeRowsForPTIds(stagedPtIds);
+        await normalizeStagedPTLaneAssignmentsBatch(representativeRows, targetLane);
       }
 
       showToast(`Moved to Lane ${targetLaneNumber}`, 'success');
@@ -1288,7 +1346,8 @@ export default function ShipmentCard({
                 {shipment.staging_lane && !changingStagingLane && (
                   <button
                     onClick={() => setChangingStagingLane(true)}
-                    className="bg-purple-600 hover:bg-purple-700 px-3 md:px-6 py-2 md:py-3 rounded-lg font-bold text-sm md:text-base whitespace-nowrap border border-purple-700 mr-3"
+                    disabled={stagingLaneBusy}
+                    className="bg-purple-600 hover:bg-purple-700 disabled:bg-gray-600 px-3 md:px-6 py-2 md:py-3 rounded-lg font-bold text-sm md:text-base whitespace-nowrap border border-purple-700 mr-3"
                   >
                     Change Lane
                   </button>
@@ -1298,7 +1357,8 @@ export default function ShipmentCard({
                 {!deletingShipment ? (
                   <button
                     onClick={() => setDeletingShipment(true)}
-                    className="bg-red-600 hover:bg-red-700 px-3 md:px-6 py-2 md:py-3 rounded-lg font-bold text-sm md:text-base whitespace-nowrap border border-red-700"
+                    disabled={stagingLaneBusy}
+                    className="bg-red-600 hover:bg-red-700 disabled:bg-gray-600 px-3 md:px-6 py-2 md:py-3 rounded-lg font-bold text-sm md:text-base whitespace-nowrap border border-red-700"
                   >
                     Reset Shipment
                   </button>
@@ -1342,6 +1402,7 @@ export default function ShipmentCard({
                       <input
                         type="text"
                         value={newStagingLane}
+                        disabled={stagingLaneBusy}
                         onChange={(e) => {
                           setNewStagingLane(e.target.value);
                           setStagingLaneError('');
@@ -1352,9 +1413,10 @@ export default function ShipmentCard({
                       <div className="flex gap-2 w-full sm:w-auto">
                         <button
                           onClick={handleChangeStagingLane}
-                          className="flex-1 sm:flex-none bg-green-600 hover:bg-green-700 px-3 md:px-4 py-2 rounded font-semibold text-sm md:text-base"
+                          disabled={stagingLaneBusy}
+                          className="flex-1 sm:flex-none bg-green-600 hover:bg-green-700 disabled:bg-gray-600 px-3 md:px-4 py-2 rounded font-semibold text-sm md:text-base"
                         >
-                          Move
+                          {stagingLaneBusy ? 'Moving...' : 'Move'}
                         </button>
                         <button
                           onClick={() => {
@@ -1362,7 +1424,8 @@ export default function ShipmentCard({
                             setNewStagingLane('');
                             setStagingLaneError('');
                           }}
-                          className="flex-1 sm:flex-none bg-gray-600 hover:bg-gray-700 px-3 md:px-4 py-2 rounded font-semibold text-sm md:text-base"
+                          disabled={stagingLaneBusy}
+                          className="flex-1 sm:flex-none bg-gray-600 hover:bg-gray-700 disabled:bg-gray-700 px-3 md:px-4 py-2 rounded font-semibold text-sm md:text-base"
                         >
                           Cancel
                         </button>
@@ -1386,7 +1449,8 @@ export default function ShipmentCard({
                 {!selectingLane ? (
                   <button
                     onClick={() => setSelectingLane(true)}
-                    className="bg-blue-600 hover:bg-blue-700 px-4 md:px-6 py-2 md:py-3 rounded-lg font-bold text-sm md:text-base"
+                    disabled={stagingLaneBusy}
+                    className="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 px-4 md:px-6 py-2 md:py-3 rounded-lg font-bold text-sm md:text-base"
                   >
                     Select Lane
                   </button>
@@ -1395,6 +1459,7 @@ export default function ShipmentCard({
                     <input
                       type="text"
                       value={selectedLaneInput}
+                      disabled={stagingLaneBusy}
                       onChange={(e) => setSelectedLaneInput(e.target.value)}
                       placeholder="Enter lane number (e.g., 101)"
                       className="flex-1 bg-gray-900 text-white p-2 md:p-3 rounded-lg text-sm md:text-base"
@@ -1403,20 +1468,27 @@ export default function ShipmentCard({
                     <div className="flex gap-2">
                       <button
                         onClick={handleSetStagingLane}
-                        className="flex-1 sm:flex-none bg-green-600 hover:bg-green-700 px-4 md:px-6 py-2 rounded-lg font-bold text-sm md:text-base"
+                        disabled={stagingLaneBusy}
+                        className="flex-1 sm:flex-none bg-green-600 hover:bg-green-700 disabled:bg-gray-600 px-4 md:px-6 py-2 rounded-lg font-bold text-sm md:text-base"
                       >
-                        Confirm
+                        {stagingLaneBusy ? 'Setting...' : 'Confirm'}
                       </button>
                       <button
                         onClick={() => {
                           setSelectingLane(false);
                           setSelectedLaneInput('');
                         }}
-                        className="flex-1 sm:flex-none bg-gray-600 hover:bg-gray-700 px-4 md:px-6 py-2 rounded-lg text-sm md:text-base"
+                        disabled={stagingLaneBusy}
+                        className="flex-1 sm:flex-none bg-gray-600 hover:bg-gray-700 disabled:bg-gray-700 px-4 md:px-6 py-2 rounded-lg text-sm md:text-base"
                       >
                         Cancel
                       </button>
                     </div>
+                  </div>
+                )}
+                {stagingLaneBusy && (
+                  <div className="mt-3 text-xs md:text-sm text-yellow-200 animate-pulse">
+                    Applying staging lane updates...
                   </div>
                 )}
               </div>
