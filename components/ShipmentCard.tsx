@@ -224,7 +224,7 @@ export default function ShipmentCard({
   const [stagingLaneError, setStagingLaneError] = useState('');
   const [deletingShipment, setDeletingShipment] = useState(false);
   const [deleteConfirmText, setDeleteConfirmText] = useState('');
-  const [laneOrderByPtId, setLaneOrderByPtId] = useState<Record<number, number>>({});
+  const [laneOrderByLanePtKey, setLaneOrderByLanePtKey] = useState<Record<string, number>>({});
   const [laneLocationsByPtId, setLaneLocationsByPtId] = useState<Record<number, string[]>>({});
   const [stagingPTIds, setStagingPTIds] = useState<number[]>([]);
   const [adminShipmentStatus, setAdminShipmentStatus] = useState<Shipment['status']>(shipment.status);
@@ -683,14 +683,24 @@ export default function ShipmentCard({
     return acc;
   }, {} as Record<string, ShipmentPT[]>);
 
+  function getLaneOrderPosition(laneKey: string, ptId: number): number {
+    if (!Number.isFinite(ptId)) return Number.MAX_SAFE_INTEGER;
+    const normalizedLane = String(laneKey || '').startsWith('staging_')
+      ? String(laneKey).replace('staging_', '')
+      : String(laneKey || '');
+    const trimmedLane = normalizedLane.trim();
+    if (!trimmedLane || trimmedLane === 'unassigned') return Number.MAX_SAFE_INTEGER;
+    return laneOrderByLanePtKey[`${trimmedLane}:${ptId}`] ?? Number.MAX_SAFE_INTEGER;
+  }
+
   const sortedPtsByLane = Object.fromEntries(
     Object.entries(ptsByLane).map(([laneKey, pts]) => [
       laneKey,
       [...pts].sort((a, b) => {
-        const aOrder = laneOrderByPtId[a.id] ?? Number.MAX_SAFE_INTEGER;
-        const bOrder = laneOrderByPtId[b.id] ?? Number.MAX_SAFE_INTEGER;
+        const aOrder = getLaneOrderPosition(laneKey, a.id);
+        const bOrder = getLaneOrderPosition(laneKey, b.id);
         if (aOrder !== bOrder) return aOrder - bOrder;
-        return b.id - a.id;
+        return compareTextNumeric(a.pt_number, b.pt_number);
       })
     ])
   ) as Record<string, ShipmentPT[]>;
@@ -752,7 +762,7 @@ export default function ShipmentCard({
   async function fetchLaneOrderMap() {
     const ptIds = shipment.pts.map((pt) => pt.id);
     if (ptIds.length === 0) {
-      setLaneOrderByPtId({});
+      setLaneOrderByLanePtKey({});
       setLaneLocationsByPtId({});
       return;
     }
@@ -767,15 +777,17 @@ export default function ShipmentCard({
       return;
     }
 
-    const orderMap: Record<number, number> = {};
+    const orderMap: Record<string, number> = {};
     const laneMap: Record<number, string[]> = {};
     (assignments || []).forEach((assignment) => {
       const ptId = Number(assignment.pt_id);
-      const orderPosition = assignment.order_position || Number.MAX_SAFE_INTEGER;
-      orderMap[ptId] = Math.min(orderMap[ptId] ?? Number.MAX_SAFE_INTEGER, orderPosition);
-
       const laneNumber = String(assignment.lane_number || '').trim();
-      if (!laneNumber) return;
+      if (!Number.isFinite(ptId) || !laneNumber) return;
+
+      const orderPosition = assignment.order_position || Number.MAX_SAFE_INTEGER;
+      const orderKey = `${laneNumber}:${ptId}`;
+      orderMap[orderKey] = Math.min(orderMap[orderKey] ?? Number.MAX_SAFE_INTEGER, orderPosition);
+
       if (!laneMap[ptId]) laneMap[ptId] = [];
       if (!laneMap[ptId].includes(laneNumber)) {
         laneMap[ptId].push(laneNumber);
@@ -790,7 +802,7 @@ export default function ShipmentCard({
         return a.localeCompare(b);
       });
     });
-    setLaneOrderByPtId(orderMap);
+    setLaneOrderByLanePtKey(orderMap);
     setLaneLocationsByPtId(laneMap);
   }
 

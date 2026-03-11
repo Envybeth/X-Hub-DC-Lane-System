@@ -183,6 +183,7 @@ declare
   v_merged boolean := false;
   v_total_pallets integer := 0;
   v_primary_lane text;
+  v_target_staging_shipment_id bigint;
 begin
   if p_assignment_id is null then
     raise exception 'Assignment id is required';
@@ -212,6 +213,18 @@ begin
 
   if btrim(coalesce(v_source_lane, '')) = v_target_lane then
     raise exception 'Already in target lane';
+  end if;
+
+  select s.id
+  into v_target_staging_shipment_id
+  from public.shipments s
+  where btrim(coalesce(s.staging_lane::text, '')) = v_target_lane
+    and coalesce(s.archived, false) = false
+  order by s.updated_at desc nulls last, s.id desc
+  limit 1;
+
+  if v_target_staging_shipment_id is not null then
+    raise exception 'Target lane % is active staging lane; use shipment stage flow', v_target_lane;
   end if;
 
   perform 1
@@ -261,7 +274,12 @@ begin
 
   if v_compiled_pallet_id is not null then
     update public.picktickets
-    set assigned_lane = v_target_lane
+    set
+      assigned_lane = v_target_lane,
+      status = case
+        when coalesce(status, '') = 'shipped' then status
+        else 'labeled'
+      end
     where id in (
       select cpp.pt_id
       from public.compiled_pallet_pts cpp
@@ -291,13 +309,21 @@ begin
       update public.picktickets
       set
         assigned_lane = null,
-        actual_pallet_count = null
+        actual_pallet_count = null,
+        status = case
+          when coalesce(status, '') = 'shipped' then status
+          else 'unlabeled'
+        end
       where id = v_pt_id;
     else
       update public.picktickets
       set
         assigned_lane = v_primary_lane,
-        actual_pallet_count = v_total_pallets
+        actual_pallet_count = v_total_pallets,
+        status = case
+          when coalesce(status, '') = 'shipped' then status
+          else 'labeled'
+        end
       where id = v_pt_id;
     end if;
   end if;

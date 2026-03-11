@@ -1,6 +1,15 @@
 import { supabase } from './supabase';
 import { Pickticket } from '@/types/pickticket';
 
+function throwIfSupabaseError(
+    error: { message?: string; details?: string; hint?: string; code?: string } | null,
+    context: string
+) {
+    if (!error) return;
+    const detail = [error.message, error.details, error.hint, error.code].filter(Boolean).join(' | ');
+    throw new Error(detail ? `${context}: ${detail}` : context);
+}
+
 export async function createCompiledPallet(
     ptIds: number[],
     compiledPalletCount: number,
@@ -135,35 +144,48 @@ export async function fetchCompiledPTInfo(ptIds: number[]): Promise<{ [key: numb
 export async function deleteCompiledPallet(compiledId: number): Promise<boolean> {
     try {
         // Get all PT IDs in this group
-        const { data: links } = await supabase
+        const { data: links, error: linksError } = await supabase
             .from('compiled_pallet_pts')
             .select('pt_id')
             .eq('compiled_pallet_id', compiledId);
+        throwIfSupabaseError(linksError, `Failed loading compiled pallet links for ${compiledId}`);
 
-        const ptIds = links?.map(l => l.pt_id) || [];
+        const ptIds = Array.from(new Set((links || []).map((link) => link.pt_id)));
 
         // Delete lane assignments
-        await supabase
+        const { error: deleteAssignmentsError } = await supabase
             .from('lane_assignments')
             .delete()
             .eq('compiled_pallet_id', compiledId);
+        throwIfSupabaseError(deleteAssignmentsError, `Failed deleting lane assignments for compiled pallet ${compiledId}`);
 
         // Reset PTs
-        await supabase
-            .from('picktickets')
-            .update({
-                assigned_lane: null,
-                actual_pallet_count: null,
-                status: 'unlabeled',
-                compiled_pallet_id: null
-            })
-            .in('id', ptIds);
+        if (ptIds.length > 0) {
+            const { error: resetPtsError } = await supabase
+                .from('picktickets')
+                .update({
+                    assigned_lane: null,
+                    actual_pallet_count: null,
+                    status: 'unlabeled',
+                    compiled_pallet_id: null
+                })
+                .in('id', ptIds);
+            throwIfSupabaseError(resetPtsError, `Failed resetting PTs for compiled pallet ${compiledId}`);
+
+            // Remove stale staging links so shipment views do not keep these PTs as actively staged.
+            const { error: deleteShipmentLinksError } = await supabase
+                .from('shipment_pts')
+                .delete()
+                .in('pt_id', ptIds);
+            throwIfSupabaseError(deleteShipmentLinksError, `Failed removing staging links for compiled pallet ${compiledId}`);
+        }
 
         // Delete compiled pallet (cascades to links)
-        await supabase
+        const { error: deleteCompiledError } = await supabase
             .from('compiled_pallets')
             .delete()
             .eq('id', compiledId);
+        throwIfSupabaseError(deleteCompiledError, `Failed deleting compiled pallet ${compiledId}`);
 
         return true;
     } catch (error) {

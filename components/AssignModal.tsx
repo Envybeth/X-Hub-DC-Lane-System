@@ -232,7 +232,25 @@ export default function AssignModal({
   }, [selectedContainer, searchMode]);
 
   useEffect(() => {
-    setIsTouchDevice(typeof window !== 'undefined' && (navigator.maxTouchPoints > 0 || 'ontouchstart' in window));
+    if (typeof window === 'undefined') return;
+
+    const coarsePointerMedia = window.matchMedia('(any-pointer: coarse)');
+    const finePointerMedia = window.matchMedia('(any-pointer: fine)');
+
+    const updateTouchMode = () => {
+      // Treat as touch-only when coarse pointer exists without a fine pointer.
+      // Hybrid devices keep desktop drag behavior available.
+      setIsTouchDevice(coarsePointerMedia.matches && !finePointerMedia.matches);
+    };
+
+    updateTouchMode();
+    coarsePointerMedia.addEventListener('change', updateTouchMode);
+    finePointerMedia.addEventListener('change', updateTouchMode);
+
+    return () => {
+      coarsePointerMedia.removeEventListener('change', updateTouchMode);
+      finePointerMedia.removeEventListener('change', updateTouchMode);
+    };
   }, []);
 
   useEffect(() => {
@@ -417,6 +435,65 @@ export default function AssignModal({
       laneNumbers,
       primaryLane
     };
+  }
+
+  function getAssignmentMemberPtIds(assignment: LaneAssignment): number[] {
+    if (!assignment.compiled_pallet_id) {
+      return [assignment.pickticket.id];
+    }
+
+    return Array.from(
+      new Set([
+        assignment.pickticket.id,
+        ...(assignment.pickticket.compiled_with || []).map((pt) => pt.id)
+      ])
+    );
+  }
+
+  function isCurrentLaneStagingLane() {
+    if (!stagingShipment) return false;
+    return String(stagingShipment.staging_lane).trim() === String(lane.lane_number).trim();
+  }
+
+  async function markPTsRemovedFromCurrentStaging(ptIds: number[]) {
+    const uniquePtIds = Array.from(new Set(ptIds.filter((ptId) => Number.isFinite(ptId))));
+    if (uniquePtIds.length === 0) return;
+    const canMarkShipmentRows = Boolean(stagingShipment && isCurrentLaneStagingLane());
+
+    if (canMarkShipmentRows && stagingShipment) {
+      const rows = uniquePtIds.map((ptId) => ({
+        shipment_id: stagingShipment.id,
+        pt_id: ptId,
+        original_lane: String(lane.lane_number),
+        removed_from_staging: true
+      }));
+
+      const { error: stagingLinkError } = await supabase
+        .from('shipment_pts')
+        .upsert(rows, {
+          onConflict: 'shipment_id,pt_id'
+        });
+      throwIfSupabaseError(stagingLinkError, 'Failed to mark PT as removed from staging');
+    }
+
+    const { error: statusError } = await supabase
+      .from('picktickets')
+      .update({ status: 'labeled' })
+      .in('id', uniquePtIds)
+      .in('status', ['staged', 'ready_to_ship']);
+    throwIfSupabaseError(statusError, 'Failed to normalize PT status after staging removal');
+  }
+
+  async function markPTsLabeled(ptIds: number[]) {
+    const uniquePtIds = Array.from(new Set(ptIds.filter((ptId) => Number.isFinite(ptId))));
+    if (uniquePtIds.length === 0) return;
+
+    const { error: labelError } = await supabase
+      .from('picktickets')
+      .update({ status: 'labeled' })
+      .in('id', uniquePtIds)
+      .neq('status', 'shipped');
+    throwIfSupabaseError(labelError, 'Failed to set PT status to labeled after lane move');
   }
 
   function isLaneDataRequestStale(requestId?: number) {
@@ -1066,24 +1143,33 @@ export default function AssignModal({
     setLoading(false);
   }
 
-  async function handleRemovePT(assignmentId: number, ptId: number) {
+  async function handleRemovePT(assignment: LaneAssignment) {
     showConfirm(
       'Remove PT from Lane',
       'Are you sure you want to remove this PT from the lane?',
       async () => {
         try {
-          await supabase
+          const memberPtIds = getAssignmentMemberPtIds(assignment);
+
+          const { error: deleteAssignmentError } = await supabase
             .from('lane_assignments')
             .delete()
-            .eq('id', assignmentId);
+            .eq('id', assignment.id);
+          throwIfSupabaseError(deleteAssignmentError, 'Failed to remove lane assignment');
 
-          const assignmentSummary = await syncPickticketWithAssignments(ptId, { setUnlabeledIfEmpty: true });
+          const assignmentSummary = await syncPickticketWithAssignments(assignment.pickticket.id, { setUnlabeledIfEmpty: true });
 
           if (!assignmentSummary.hasAssignments) {
-            await supabase
+            const { error: removeShipmentLinksError } = await supabase
               .from('shipment_pts')
               .delete()
-              .eq('pt_id', ptId);
+              .eq('pt_id', assignment.pickticket.id);
+            throwIfSupabaseError(removeShipmentLinksError, 'Failed removing PT from shipment links');
+          } else if (
+            isStaging &&
+            !assignmentSummary.laneNumbers.includes(String(lane.lane_number))
+          ) {
+            await markPTsRemovedFromCurrentStaging(memberPtIds);
           }
 
           showToast('PT removed from lane', 'success');
@@ -1104,7 +1190,13 @@ export default function AssignModal({
   async function handleEditPalletCount() {
     if (!editingPT) return;
 
-    const count = parseInt(editingPT.count) || 1;
+    const parsedCount = parsePositiveIntegerInput(editingPT.count);
+    if (parsedCount === null) {
+      showToast('Enter a valid pallet count', 'error');
+      return;
+    }
+
+    const count = parsedCount;
     let ptIdsToUpdate: number[] = [editingPT.ptId];
     let updatedMainPalletCount = count;
 
@@ -1207,8 +1299,26 @@ export default function AssignModal({
     }
 
     try {
-      const ptToMove = existingPTs.find(pt => pt.id === movingPT.assignmentId);
-      if (!ptToMove) return;
+      const assignmentToMove = existingPTs.find((assignment) => assignment.id === movingPT.assignmentId);
+      if (!assignmentToMove) return;
+      const memberPtIds = getAssignmentMemberPtIds(assignmentToMove);
+      const targetLaneNumber = String(targetLane.lane_number).trim();
+
+      const { data: targetLaneShipmentRows, error: targetLaneShipmentError } = await supabase
+        .from('shipments')
+        .select('id')
+        .eq('staging_lane', targetLaneNumber)
+        .eq('archived', false)
+        .limit(1);
+      throwIfSupabaseError(targetLaneShipmentError, `Failed to validate target lane ${targetLaneNumber}`);
+
+      if ((targetLaneShipmentRows || []).length > 0) {
+        const errorText = 'Use Stage flow for staging lanes';
+        setMoveLaneError(errorText);
+        setTimeout(() => setMoveLaneError(''), 3000);
+        showToast('Cannot move PT directly into an active staging lane. Use stage actions.', 'error');
+        return;
+      }
 
       const { data: moveResult, error: moveError } = await supabase.rpc('move_lane_assignment_transactional', {
         p_assignment_id: movingPT.assignmentId,
@@ -1218,6 +1328,11 @@ export default function AssignModal({
 
       const resultRow = Array.isArray(moveResult) ? moveResult[0] : moveResult;
       const merged = Boolean(resultRow && typeof resultRow === 'object' && 'merged' in resultRow && resultRow.merged);
+
+      if (isStaging) {
+        await markPTsRemovedFromCurrentStaging(memberPtIds);
+      }
+      await markPTsLabeled(memberPtIds);
 
       if (merged) {
         showToast(`PT merged into Lane ${targetLane.lane_number}`, 'success');
@@ -1259,12 +1374,18 @@ export default function AssignModal({
   }
 
   async function persistPTOrder(updatedPTs: LaneAssignment[]) {
-    for (let i = 0; i < updatedPTs.length; i++) {
-      await supabase
-        .from('lane_assignments')
-        .update({ order_position: i + 1 })
-        .eq('id', updatedPTs[i].id);
-    }
+    const updateResults = await Promise.all(
+      updatedPTs.map((assignment, index) =>
+        supabase
+          .from('lane_assignments')
+          .update({ order_position: index + 1 })
+          .eq('id', assignment.id)
+      )
+    );
+
+    updateResults.forEach(({ error }, index) => {
+      throwIfSupabaseError(error, `Failed to persist lane order at row ${index + 1}`);
+    });
   }
 
   function reorderPTs(targetIndex: number) {
@@ -1597,9 +1718,8 @@ export default function AssignModal({
                                 type="text"
                                 value={editingPT.count}
                                 onChange={(e) => setEditingPT({ ...editingPT, count: e.target.value })}
-                                onBlur={(e) => {
-                                  if (!e.target.value) setEditingPT({ ...editingPT, count: '1' });
-                                }}
+                                inputMode="numeric"
+                                pattern="[0-9]*"
                                 className="bg-gray-900 text-white p-1 md:p-2 rounded w-16 md:w-20 text-center text-sm"
                               />
                               <button
@@ -1722,7 +1842,7 @@ export default function AssignModal({
                                 );
                               } else {
                                 // Regular PT
-                                handleRemovePT(assignment.id, assignment.pickticket.id);
+                                handleRemovePT(assignment);
                               }
                             }}
                             className="bg-red-600 hover:bg-red-700 px-2 md:px-4 py-1.5 md:py-2 rounded-lg font-semibold text-xs md:text-base whitespace-nowrap"
