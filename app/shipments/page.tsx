@@ -126,6 +126,27 @@ function plannerRowShipmentKey(row: PlannerQueueRow): string {
   return buildPuLoadKey(row.pu_number, row.pu_date) || `${row.pu_number}-${row.pu_date}`;
 }
 
+function plannerRowsMatchIdentity(a: PlannerQueueRow, b: PlannerQueueRow): boolean {
+  return (
+    toTrimmedText(a.pu_number) === toTrimmedText(b.pu_number)
+    && toTrimmedText(a.pu_date) === toTrimmedText(b.pu_date)
+    && toSafeNumber(a.representative_pt_id) === toSafeNumber(b.representative_pt_id)
+    && toTrimmedText(a.move_type) === toTrimmedText(b.move_type)
+  );
+}
+
+function looksTransientPlannerStageError(message: string): boolean {
+  const normalized = toTrimmedText(message).toLowerCase();
+  return (
+    normalized.includes('failed to fetch')
+    || normalized.includes('network')
+    || normalized.includes('timeout')
+    || normalized.includes('not found')
+    || normalized.includes('stale')
+    || normalized.includes('connection')
+  );
+}
+
 function normalizePlannerQueueRows(rows: PlannerQueueRow[]): PlannerQueueRow[] {
   return rows.map((row) => ({
     ...row,
@@ -196,6 +217,7 @@ export default function ShipmentsPage() {
   const includeHistoricalShipmentsRef = useRef(false);
   const staleRefreshRequestedRef = useRef(false);
   const pendingVisibleRefreshRef = useRef(false);
+  const pageHiddenAtRef = useRef<number | null>(null);
   const focusedShipmentKeyRef = useRef<string | null>(null);
   const plannerQueueContainerRef = useRef<HTMLDivElement | null>(null);
   const fetchShipmentsRef = useRef<() => Promise<void>>(async () => { });
@@ -228,12 +250,12 @@ export default function ShipmentsPage() {
   }, [plannerToast]);
 
   useEffect(() => {
-    if (!plannerModalOpen || isGuest) return;
+    if (!plannerModalOpen || isGuest || plannerLoading) return;
     if (plannerQueue.length === 0 || plannerQueueStale) {
       void buildPlannerQueue({ silent: true });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [plannerModalOpen, isGuest, plannerQueue.length, plannerQueueStale]);
+  }, [plannerModalOpen, isGuest, plannerLoading, plannerQueue.length, plannerQueueStale]);
 
   useEffect(() => {
     if (plannerModalOpen) return;
@@ -243,14 +265,14 @@ export default function ShipmentsPage() {
   const refreshShipmentView = useCallback((shipmentKeyToFocus: string, includeStale = false) => {
     focusedShipmentKeyRef.current = shipmentKeyToFocus;
     setExpandedShipmentKey(shipmentKeyToFocus);
-    if (plannerQueue.length > 0) {
+    if (plannerModalOpen || plannerQueue.length > 0) {
       setPlannerQueueStale(true);
     }
     void fetchShipmentsRef.current();
     if (includeStale) {
       void fetchStaleSnapshotsRef.current();
     }
-  }, [plannerQueue.length]);
+  }, [plannerModalOpen, plannerQueue.length]);
 
   const ensureHistoricalShipmentsLoaded = useCallback(async () => {
     if (includeHistoricalShipmentsRef.current || historicalShipmentsLoading) return;
@@ -329,7 +351,7 @@ export default function ShipmentsPage() {
   }
 
   async function buildPlannerQueue(options?: { silent?: boolean }) {
-    if (plannerLoading) return;
+    if (plannerLoading) return null;
 
     setPlannerLoading(true);
     try {
@@ -349,7 +371,7 @@ export default function ShipmentsPage() {
             message: 'Planner function missing. Run sql/transactional_stage_move_functions.sql in Supabase first.',
             type: 'error'
           });
-          return;
+          return null;
         }
         throw error;
       }
@@ -365,9 +387,11 @@ export default function ShipmentsPage() {
           setPlannerToast({ message: `Planner queue built (${typedRows.length} step${typedRows.length === 1 ? '' : 's'})`, type: 'success' });
         }
       }
+      return typedRows;
     } catch (error) {
       console.error('Failed to build planner queue:', error);
       setPlannerToast({ message: 'Failed to build planner queue', type: 'error' });
+      return null;
     } finally {
       setPlannerLoading(false);
     }
@@ -476,14 +500,48 @@ export default function ShipmentsPage() {
 
     setPlannerExecutingAssignmentId(row.assignment_id);
     let stageSucceeded = false;
+    let stageRow = row;
     try {
-      await executePlannerStageViaShipmentCardFlow(row);
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          await executePlannerStageViaShipmentCardFlow(stageRow);
+          stageSucceeded = true;
+          break;
+        } catch (stageError) {
+          const stageErrorText = describeUnknownStageError(stageError);
+          const isRetryable = attempt === 0 && looksTransientPlannerStageError(stageErrorText);
+          if (!isRetryable) {
+            throw stageError;
+          }
+
+          setPlannerToast({
+            message: 'Connection/queue looked stale. Refreshing and retrying once...',
+            type: 'info'
+          });
+          await fetchShipmentsRef.current();
+          const rebuiltRows = await buildPlannerQueue({ silent: true });
+          const candidateRows = rebuiltRows || plannerQueue;
+          const byAssignment = candidateRows.find((candidate) => candidate.assignment_id === stageRow.assignment_id);
+          const byIdentity = candidateRows.find((candidate) => plannerRowsMatchIdentity(candidate, stageRow));
+          const refreshedRow = byAssignment || byIdentity || null;
+
+          if (!refreshedRow) {
+            throw new Error(
+              `Queue changed while reconnecting. ${stageErrorText}. Rebuild queue and stage again.`
+            );
+          }
+          stageRow = refreshedRow;
+        }
+      }
+
+      if (!stageSucceeded) {
+        throw new Error('Stage did not complete.');
+      }
 
       setPlannerToast({
-        message: `Staged step ${row.step_no}: PU ${row.pu_number} PT ${row.representative_pt_number || row.representative_pt_id}`,
+        message: `Staged step ${stageRow.step_no}: PU ${stageRow.pu_number} PT ${stageRow.representative_pt_number || stageRow.representative_pt_id}`,
         type: 'success'
       });
-      stageSucceeded = true;
     } catch (error) {
       console.error('Failed to stage planner row:', error);
       setPlannerToast({
@@ -592,7 +650,7 @@ export default function ShipmentsPage() {
     if (includeStale) {
       staleRefreshRequestedRef.current = true;
     }
-    if (plannerQueue.length > 0) {
+    if (plannerModalOpen || plannerQueue.length > 0) {
       setPlannerQueueStale(true);
     }
     if (document.hidden) {
@@ -610,23 +668,37 @@ export default function ShipmentsPage() {
       }
       shipmentRefreshTimerRef.current = null;
     }, 450);
-  }, [plannerQueue.length, staleSnapshotStoreAvailable]);
+  }, [plannerModalOpen, plannerQueue.length, staleSnapshotStoreAvailable]);
 
   useEffect(() => {
     const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        pageHiddenAtRef.current = Date.now();
+        return;
+      }
       if (document.visibilityState !== 'visible') return;
-      if (!pendingVisibleRefreshRef.current) return;
+
+      const hiddenForMs = pageHiddenAtRef.current ? Date.now() - pageHiddenAtRef.current : 0;
+      pageHiddenAtRef.current = null;
+      const longBackgroundGap = hiddenForMs >= 15000;
+      const shouldRefreshOnReturn = pendingVisibleRefreshRef.current || longBackgroundGap || realtimeHealth !== 'live' || plannerModalOpen;
+      if (!shouldRefreshOnReturn) return;
+
       pendingVisibleRefreshRef.current = false;
       void fetchShipmentsRef.current();
       if (staleSnapshotStoreAvailable && staleRefreshRequestedRef.current) {
         staleRefreshRequestedRef.current = false;
         void fetchStaleSnapshotsRef.current();
       }
+      if (plannerModalOpen) {
+        void buildPlannerQueue({ silent: true });
+      }
     };
 
     document.addEventListener('visibilitychange', handleVisibilityChange);
     return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
-  }, [staleSnapshotStoreAvailable]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [staleSnapshotStoreAvailable, realtimeHealth, plannerModalOpen]);
 
   useEffect(() => {
     const unsubscribeShipments = subscribeScope('shipments', (payload) => {
@@ -1554,6 +1626,15 @@ export default function ShipmentsPage() {
                   Clear
                 </button>
               </div>
+
+              {realtimeHealth !== 'live' && (
+                <div className={`border px-3 py-2 rounded text-sm ${realtimeHealth === 'disconnected'
+                  ? 'bg-red-900/60 border-red-500 text-red-200'
+                  : 'bg-amber-900/60 border-amber-500 text-amber-200'
+                  }`}>
+                  Realtime status is {realtimeHealth}. Queue may be stale. The optimizer will auto-refresh when you return to this tab, and retries once on transient stage errors.
+                </div>
+              )}
 
               {plannerQueueStale && plannerQueue.length > 0 && (
                 <div className="bg-yellow-900/60 border border-yellow-600 text-yellow-200 px-3 py-2 rounded text-sm">
