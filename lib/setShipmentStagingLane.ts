@@ -1,5 +1,9 @@
 import { supabase } from '@/lib/supabase';
 import { normalizePuDate, normalizePuNumber } from '@/lib/shipmentIdentity';
+import {
+  buildStagedLaneAssignmentUnits,
+  normalizeStagedLaneAssignmentsBatch
+} from '@/lib/stagedLaneAssignments';
 
 type PickticketLaneContextRow = {
   id: number;
@@ -18,11 +22,6 @@ type LaneAssignmentPtRow = {
 type ShipmentUpsertRow = {
   id: number;
   status: string | null;
-};
-
-type RepresentativeRow = {
-  ptId: number;
-  palletCount: number;
 };
 
 export type SetShipmentStagingLaneErrorCode =
@@ -67,121 +66,6 @@ function toTrimmedText(value: unknown): string {
   if (typeof value === 'string') return value.trim();
   if (value === null || value === undefined) return '';
   return String(value).trim();
-}
-
-function compareTextNumeric(a: string, b: string): number {
-  const aDigits = a.replace(/\D/g, '');
-  const bDigits = b.replace(/\D/g, '');
-  if (aDigits && bDigits) {
-    const aNum = Number(aDigits);
-    const bNum = Number(bDigits);
-    if (Number.isFinite(aNum) && Number.isFinite(bNum) && aNum !== bNum) {
-      return aNum - bNum;
-    }
-  }
-  return a.localeCompare(b, undefined, { sensitivity: 'base', numeric: true });
-}
-
-function buildRepresentativeRowsForPTIds(
-  ptIds: number[],
-  shipmentPtRows: PickticketLaneContextRow[]
-): RepresentativeRow[] {
-  const rowsById = new Map<number, PickticketLaneContextRow>();
-  const compiledMembersById = new Map<number, PickticketLaneContextRow[]>();
-
-  shipmentPtRows.forEach((row) => {
-    if (!Number.isFinite(row.id)) return;
-    rowsById.set(row.id, row);
-    if (row.compiled_pallet_id === null || row.compiled_pallet_id === undefined) return;
-    const current = compiledMembersById.get(row.compiled_pallet_id) || [];
-    current.push(row);
-    compiledMembersById.set(row.compiled_pallet_id, current);
-  });
-
-  const byRepresentative = new Map<number, number>();
-
-  ptIds.forEach((ptId) => {
-    const row = rowsById.get(ptId);
-    let representativeId = ptId;
-
-    if (row?.compiled_pallet_id !== null && row?.compiled_pallet_id !== undefined) {
-      const members = [...(compiledMembersById.get(row.compiled_pallet_id) || [])].sort((a, b) => {
-        const byPtNumber = compareTextNumeric(toTrimmedText(a.pt_number), toTrimmedText(b.pt_number));
-        if (byPtNumber !== 0) return byPtNumber;
-        return a.id - b.id;
-      });
-      if (members.length > 0) {
-        representativeId = members[0].id;
-      }
-    }
-
-    if (byRepresentative.has(representativeId)) return;
-
-    const representativeRow = rowsById.get(representativeId) || row;
-    const palletCount = Number(representativeRow?.actual_pallet_count || 0);
-    byRepresentative.set(
-      representativeId,
-      Number.isFinite(palletCount) ? Math.max(0, Math.trunc(palletCount)) : 0
-    );
-  });
-
-  return Array.from(byRepresentative.entries())
-    .map(([id, palletCount]) => ({ ptId: id, palletCount }))
-    .sort((a, b) => {
-      const aRow = rowsById.get(a.ptId);
-      const bRow = rowsById.get(b.ptId);
-      return compareTextNumeric(
-        toTrimmedText(aRow?.pt_number) || String(a.ptId),
-        toTrimmedText(bRow?.pt_number) || String(b.ptId)
-      );
-    });
-}
-
-async function normalizeStagedPTLaneAssignmentsBatch(
-  rows: RepresentativeRow[],
-  targetLane: string
-) {
-  if (rows.length === 0) return;
-
-  const representativeIds = rows.map((row) => row.ptId);
-
-  const { error: deleteAssignmentsError } = await supabase
-    .from('lane_assignments')
-    .delete()
-    .in('pt_id', representativeIds);
-  if (deleteAssignmentsError) throw deleteAssignmentsError;
-
-  const { data: existingLaneAssignments, error: existingLaneAssignmentsError } = await supabase
-    .from('lane_assignments')
-    .select('id, order_position')
-    .eq('lane_number', targetLane)
-    .order('order_position', { ascending: true });
-  if (existingLaneAssignmentsError) throw existingLaneAssignmentsError;
-
-  const shiftBy = rows.length;
-  if ((existingLaneAssignments || []).length > 0 && shiftBy > 0) {
-    await Promise.all(
-      (existingLaneAssignments || []).map(async (assignment) => {
-        const { error: shiftAssignmentError } = await supabase
-          .from('lane_assignments')
-          .update({ order_position: (assignment.order_position || 0) + shiftBy })
-          .eq('id', assignment.id);
-        if (shiftAssignmentError) throw shiftAssignmentError;
-      })
-    );
-  }
-
-  const { error: insertAssignmentsError } = await supabase
-    .from('lane_assignments')
-    .insert(
-      rows.map((row, index) => ({
-        lane_number: targetLane,
-        pt_id: row.ptId,
-        pallet_count: row.palletCount,
-        order_position: index + 1
-      }))
-    );
-  if (insertAssignmentsError) throw insertAssignmentsError;
 }
 
 export async function setShipmentStagingLaneWithAutoLink(
@@ -332,8 +216,8 @@ export async function setShipmentStagingLaneWithAutoLink(
       .in('id', stagedPtIds);
     if (updatePickticketsError) throw updatePickticketsError;
 
-    const representativeRows = buildRepresentativeRowsForPTIds(stagedPtIds, typedPickticketRows);
-    await normalizeStagedPTLaneAssignmentsBatch(representativeRows, targetLane);
+    const stagedUnits = buildStagedLaneAssignmentUnits(stagedPtIds, typedPickticketRows);
+    await normalizeStagedLaneAssignmentsBatch(stagedUnits, targetLane);
   }
 
   return {

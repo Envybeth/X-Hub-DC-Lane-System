@@ -9,10 +9,15 @@ import { isPTArchived } from '@/lib/utils';
 import { exportShipmentSummaryPdf, ShipmentPdfLoad } from '@/lib/shipmentPdf';
 import { setShipmentStagingLaneWithAutoLink } from '@/lib/setShipmentStagingLane';
 import {
+  buildStagedLaneAssignmentUnits,
+  normalizeStagedLaneAssignmentsBatch
+} from '@/lib/stagedLaneAssignments';
+import {
   buildSetShipmentStagingLaneErrorMessage,
   buildSetShipmentStagingLaneSuccessMessage,
   getSetShipmentStagingLaneSuccessToastDurationMs
 } from '@/lib/setShipmentStagingLaneFeedback';
+import { stageLaneAssignmentIntoShipment } from '@/lib/stageShipmentExecution';
 
 import OCRCamera from './OCRCamera';
 
@@ -305,74 +310,6 @@ export default function ShipmentCard({
     setAdminShipmentArchived(Boolean(shipment.archived));
   }, [shipment.status, shipment.archived, shipment.pu_number, shipment.pu_date]);
 
-  function buildRepresentativeRowsForPTIds(ptIds: number[]) {
-    const byRepresentative = new Map<number, number>();
-
-    ptIds.forEach((ptId) => {
-      const representativeId = getCompiledRepresentativeId(ptId);
-      if (byRepresentative.has(representativeId)) return;
-
-      const representativePt = shipment.pts.find((pt) => pt.id === representativeId) || shipment.pts.find((pt) => pt.id === ptId);
-      const palletCount = Number(representativePt?.actual_pallet_count || 0);
-      byRepresentative.set(representativeId, Number.isFinite(palletCount) ? Math.max(0, Math.trunc(palletCount)) : 0);
-    });
-
-    return Array.from(byRepresentative.entries())
-      .map(([ptId, palletCount]) => ({ ptId, palletCount }))
-      .sort((a, b) => {
-        const aPt = shipment.pts.find((pt) => pt.id === a.ptId);
-        const bPt = shipment.pts.find((pt) => pt.id === b.ptId);
-        return compareTextNumeric(aPt?.pt_number || String(a.ptId), bPt?.pt_number || String(b.ptId));
-      });
-  }
-
-  async function normalizeStagedPTLaneAssignmentsBatch(
-    rows: Array<{ ptId: number; palletCount: number }>,
-    targetLane: string
-  ) {
-    if (rows.length === 0) return;
-
-    const representativeIds = rows.map((row) => row.ptId);
-
-    const { error: deleteAssignmentsError } = await supabase
-      .from('lane_assignments')
-      .delete()
-      .in('pt_id', representativeIds);
-    if (deleteAssignmentsError) throw deleteAssignmentsError;
-
-    const { data: existingLaneAssignments, error: existingLaneAssignmentsError } = await supabase
-      .from('lane_assignments')
-      .select('id, order_position')
-      .eq('lane_number', targetLane)
-      .order('order_position', { ascending: true });
-    if (existingLaneAssignmentsError) throw existingLaneAssignmentsError;
-
-    const shiftBy = rows.length;
-    if ((existingLaneAssignments || []).length > 0 && shiftBy > 0) {
-      await Promise.all(
-        (existingLaneAssignments || []).map(async (assignment) => {
-          const { error: shiftAssignmentError } = await supabase
-            .from('lane_assignments')
-            .update({ order_position: (assignment.order_position || 0) + shiftBy })
-            .eq('id', assignment.id);
-          if (shiftAssignmentError) throw shiftAssignmentError;
-        })
-      );
-    }
-
-    const { error: insertAssignmentsError } = await supabase
-      .from('lane_assignments')
-      .insert(
-        rows.map((row, index) => ({
-          lane_number: targetLane,
-          pt_id: row.ptId,
-          pallet_count: row.palletCount,
-          order_position: index + 1
-        }))
-      );
-    if (insertAssignmentsError) throw insertAssignmentsError;
-  }
-
   // THE WATCHDOG: Automatically syncs PTs in the staging lane to staged/ready_to_ship based on shipment status.
   useEffect(() => {
     if (readOnly) return;
@@ -390,28 +327,7 @@ export default function ShipmentCard({
 
   //OCR move PT
   async function performMovePT(pt: ShipmentPT) {
-    setStagingPTIds((prev) => (prev.includes(pt.id) ? prev : [...prev, pt.id]));
-
-    try {
-      if (!shipment.staging_lane) throw new Error('Staging lane not set');
-      const rpcContext = await resolveStageRpcContext();
-
-      const { error: stageError } = await supabase.rpc('stage_pickticket_into_shipment_lane', {
-        p_pu_number: rpcContext.puNumber,
-        p_pu_date: rpcContext.puDate,
-        p_pt_id: pt.id,
-        p_original_lane: pt.assigned_lane
-      });
-      if (stageError) throw stageError;
-
-      showToast(`✅ PT ${pt.pt_number} staged`, 'success');
-      onUpdate();
-    } catch (error) {
-      console.error('Error moving PT:', error);
-      showToast(`Failed to move PT: ${describeError(error)}`, 'error', 7000);
-    } finally {
-      setStagingPTIds((prev) => prev.filter((id) => id !== pt.id));
-    }
+    await stageShipmentUnit([pt]);
   }
 
   async function autoSyncPTs(ptsToSync: ShipmentPT[]) {
@@ -450,6 +366,106 @@ export default function ShipmentCard({
       }
     } catch (error) {
       console.error('Auto-sync failed:', error);
+    }
+  }
+
+  async function resolveStageAssignmentIdForUnit(pts: ShipmentPT[]): Promise<number | null> {
+    const uniquePtIds = Array.from(
+      new Set(
+        pts
+          .map((candidate) => Number(candidate.id))
+          .filter((ptId) => Number.isFinite(ptId) && ptId > 0)
+      )
+    );
+    if (uniquePtIds.length === 0) return null;
+
+    const compiledIds = Array.from(
+      new Set(
+        pts
+          .map((candidate) => Number(candidate.compiled_pallet_id))
+          .filter((compiledId) => Number.isFinite(compiledId) && compiledId > 0)
+      )
+    );
+
+    const { data: assignmentRows, error: assignmentRowsError } = await supabase
+      .from('lane_assignments')
+      .select('id, pt_id, compiled_pallet_id, order_position')
+      .in('pt_id', uniquePtIds)
+      .order('order_position', { ascending: true })
+      .order('id', { ascending: true });
+    if (assignmentRowsError) throw assignmentRowsError;
+
+    type StageAssignmentLookupRow = {
+      id: number;
+      pt_id: number;
+      compiled_pallet_id: number | null;
+      order_position: number | null;
+    };
+
+    const typedRows = (assignmentRows || []) as StageAssignmentLookupRow[];
+    if (typedRows.length === 0) return null;
+
+    const preferredRow = compiledIds.length > 0
+      ? typedRows.find((row) => compiledIds.includes(Number(row.compiled_pallet_id)))
+      : typedRows[0];
+
+    return Number(preferredRow?.id || typedRows[0]?.id || 0) || null;
+  }
+
+  async function stageShipmentUnit(pts: ShipmentPT[]) {
+    const uniquePts = Array.from(new Map(pts.map((pt) => [pt.id, pt])).values());
+    const ptIds = uniquePts.map((pt) => pt.id);
+    const isCompiledUnit = uniquePts.length > 1;
+    const primaryPt = uniquePts[0];
+
+    setStagingPTIds((previous) => Array.from(new Set([...previous, ...ptIds])));
+
+    try {
+      if (!shipment.staging_lane) throw new Error('Staging lane not set');
+      const rpcContext = await resolveStageRpcContext();
+      const assignmentId = await resolveStageAssignmentIdForUnit(uniquePts);
+
+      if (assignmentId) {
+        const stageResult = await stageLaneAssignmentIntoShipment({
+          assignmentId,
+          puNumber: rpcContext.puNumber,
+          puDate: rpcContext.puDate
+        });
+
+        if (isCompiledUnit) {
+          showToast(`✅ Compiled pallet staged (${stageResult.stagedMemberCount} PTs)`, 'success');
+        } else {
+          showToast(`✅ PT ${primaryPt?.pt_number || primaryPt?.id} staged`, 'success');
+        }
+        onUpdate();
+        return;
+      }
+
+      if (isCompiledUnit) {
+        throw new Error('Compiled pallet is missing its source lane assignment row.');
+      }
+
+      const { error: stageError } = await supabase.rpc('stage_pickticket_into_shipment_lane', {
+        p_pu_number: rpcContext.puNumber,
+        p_pu_date: rpcContext.puDate,
+        p_pt_id: primaryPt.id,
+        p_original_lane: primaryPt.assigned_lane
+      });
+      if (stageError) throw stageError;
+
+      showToast(`✅ PT ${primaryPt.pt_number} staged`, 'success');
+      onUpdate();
+    } catch (error) {
+      console.error('Error moving PT:', error);
+      showToast(
+        isCompiledUnit
+          ? `Failed to stage compiled pallet: ${describeError(error)}`
+          : `Failed to move PT: ${describeError(error)}`,
+        'error',
+        7000
+      );
+    } finally {
+      setStagingPTIds((previous) => previous.filter((id) => !ptIds.includes(id)));
     }
   }
 
@@ -660,20 +676,6 @@ export default function ShipmentCard({
     const compiledId = pt.compiled_pallet_id;
     if (compiledId === null || compiledId === undefined) return [pt];
     return compiledMembersById.get(compiledId) || [pt];
-  }
-
-  function getCompiledRepresentativeId(ptId: number): number {
-    const target = shipment.pts.find((pt) => pt.id === ptId);
-    if (!target) return ptId;
-    const compiledId = target.compiled_pallet_id;
-    if (compiledId === null || compiledId === undefined) return ptId;
-
-    const members = compiledMembersById.get(compiledId);
-    if (!members || members.length === 0) return ptId;
-
-    return [...members]
-      .sort((a, b) => compareTextNumeric(a.pt_number, b.pt_number))[0]
-      .id;
   }
 
   const ptsByLane = shipment.pts.reduce((acc, pt) => {
@@ -1033,8 +1035,8 @@ export default function ShipmentCard({
           .in('id', stagedPtIds);
         if (updatePickticketsError) throw updatePickticketsError;
 
-        const representativeRows = buildRepresentativeRowsForPTIds(stagedPtIds);
-        await normalizeStagedPTLaneAssignmentsBatch(representativeRows, targetLane);
+        const stagedUnits = buildStagedLaneAssignmentUnits(stagedPtIds, shipment.pts);
+        await normalizeStagedLaneAssignmentsBatch(stagedUnits, targetLane);
       }
 
       showToast(`Moved to Lane ${targetLaneNumber}`, 'success');
@@ -1107,99 +1109,8 @@ export default function ShipmentCard({
     }
   }
 
-  function getRepresentativePTForCompiledGroup(pts: ShipmentPT[]): ShipmentPT {
-    return [...pts].sort((a, b) => {
-      const aLaneCount = laneLocationsByPtId[a.id]?.length || 0;
-      const bLaneCount = laneLocationsByPtId[b.id]?.length || 0;
-      if (aLaneCount !== bLaneCount) return bLaneCount - aLaneCount;
-      return compareTextNumeric(a.pt_number, b.pt_number);
-    })[0] || pts[0];
-  }
-
   async function performMoveCompiledGroup(pts: ShipmentPT[]) {
-    if (!shipment.staging_lane) throw new Error('Staging lane not set');
-    if (pts.length === 0) return;
-
-    const uniquePts = Array.from(new Map(pts.map((pt) => [pt.id, pt])).values());
-    const ptIds = uniquePts.map((pt) => pt.id);
-    const representative = getRepresentativePTForCompiledGroup(uniquePts);
-
-    setStagingPTIds((previous) => Array.from(new Set([...previous, ...ptIds])));
-
-    try {
-      const rpcContext = await resolveStageRpcContext();
-      const { data: stageRows, error: stageError } = await supabase.rpc('stage_pickticket_into_shipment_lane', {
-        p_pu_number: rpcContext.puNumber,
-        p_pu_date: rpcContext.puDate,
-        p_pt_id: representative.id,
-        p_original_lane: representative.assigned_lane
-      });
-      if (stageError) throw stageError;
-
-      const stageRow = Array.isArray(stageRows) ? stageRows[0] : stageRows;
-      let shipmentId = stageRow?.shipment_id ? Number(stageRow.shipment_id) : null;
-      const stagedLane = stageRow?.staging_lane
-        ? String(stageRow.staging_lane)
-        : (shipment.staging_lane ? String(shipment.staging_lane) : null);
-      const stagedStatus = String(stageRow?.pt_status || (shipment.status === 'finalized' ? 'ready_to_ship' : 'staged'));
-
-      if (!shipmentId) {
-        const { data: shipmentRow, error: shipmentLookupError } = await supabase
-          .from('shipments')
-          .select('id')
-          .eq('pu_number', rpcContext.puNumber)
-          .eq('pu_date', rpcContext.puDate)
-          .order('id', { ascending: false })
-          .limit(1)
-          .maybeSingle();
-        if (shipmentLookupError) throw shipmentLookupError;
-        shipmentId = shipmentRow?.id || null;
-      }
-
-      const nonRepresentativePtIds = uniquePts
-        .filter((pt) => pt.id !== representative.id)
-        .map((pt) => pt.id);
-
-      if (nonRepresentativePtIds.length > 0) {
-        const { error: cleanupAssignmentsError } = await supabase
-          .from('lane_assignments')
-          .delete()
-          .in('pt_id', nonRepresentativePtIds);
-        if (cleanupAssignmentsError) throw cleanupAssignmentsError;
-      }
-
-      if (shipmentId) {
-        const upsertRows = uniquePts.map((pt) => ({
-          shipment_id: shipmentId as number,
-          pt_id: pt.id,
-          original_lane: pt.assigned_lane,
-          removed_from_staging: false
-        }));
-        const { error: upsertShipmentPtsError } = await supabase
-          .from('shipment_pts')
-          .upsert(upsertRows, {
-            onConflict: 'shipment_id,pt_id'
-          });
-        if (upsertShipmentPtsError) throw upsertShipmentPtsError;
-      }
-
-      const { error: updateGroupPtError } = await supabase
-        .from('picktickets')
-        .update({
-          assigned_lane: stagedLane,
-          status: stagedStatus
-        })
-        .in('id', ptIds);
-      if (updateGroupPtError) throw updateGroupPtError;
-
-      showToast(`✅ Compiled pallet staged (${uniquePts.length} PTs)`, 'success');
-      onUpdate();
-    } catch (error) {
-      console.error('Error staging compiled pallet:', error);
-      showToast(`Failed to stage compiled pallet: ${describeError(error)}`, 'error', 7000);
-    } finally {
-      setStagingPTIds((previous) => previous.filter((id) => !ptIds.includes(id)));
-    }
+    await stageShipmentUnit(pts);
   }
 
   async function handleMovePT(pt: ShipmentPT) {

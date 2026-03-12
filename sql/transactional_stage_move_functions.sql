@@ -707,6 +707,11 @@ begin
   end if;
 
   if v_compiled_pallet_id is not null then
+    update public.lane_assignments la
+    set compiled_pallet_id = v_compiled_pallet_id
+    where la.pt_id = v_representative_pt_id
+      and btrim(coalesce(la.lane_number::text, '')) = btrim(coalesce(v_stage_row.staging_lane::text, ''));
+
     for v_member in
       select
         p.id as pt_id,

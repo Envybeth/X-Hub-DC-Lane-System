@@ -9,6 +9,7 @@ import { Pickticket } from '@/types/pickticket';
 
 import { createCompiledPallet } from '@/lib/compiledPallets';
 import { fetchCompiledPTInfo } from '@/lib/compiledPallets';
+import { stageLaneAssignmentIntoShipment } from '@/lib/stageShipmentExecution';
 
 import { isPTArchived, isPTArchivedOver60Days } from '@/lib/utils';
 
@@ -57,10 +58,15 @@ interface StagingShipmentContext {
 }
 
 interface StagingCandidate {
+  key: string;
   pt: Pickticket;
+  memberPTs: Pickticket[];
+  memberPtIds: number[];
   laneLocations: string[];
   primaryLane: string | null;
   isUnassigned: boolean;
+  assignmentId: number | null;
+  compiledPalletId: number | null;
 }
 
 const ASSIGN_MODAL_PICKTICKET_SELECT_COLUMNS = `
@@ -369,6 +375,13 @@ export default function AssignModal({
       sensitivity: 'base',
       numeric: true
     });
+  }
+
+  function buildStagingCandidateLabel(candidate: StagingCandidate) {
+    if (candidate.memberPtIds.length > 1) {
+      return `Compiled pallet (${candidate.memberPtIds.length} PTs)`;
+    }
+    return `PT ${candidate.pt.pt_number || candidate.pt.id}`;
   }
 
   function parsePositiveIntegerInput(value: string): number | null {
@@ -748,53 +761,109 @@ export default function AssignModal({
 
       const typedRows = (ptRows || []) as Pickticket[];
       const ptIds = typedRows.map((pt) => pt.id);
-      const laneLocationsByPtId = new Map<number, string[]>();
+      const stagingLaneNumber = String(activeContext.staging_lane || lane.lane_number).trim();
+      const laneAssignmentRowsByPtId = new Map<number, PTLaneAssignmentRow[]>();
 
       if (ptIds.length > 0) {
         const { data: laneRows, error: laneRowsError } = await supabase
           .from('lane_assignments')
-          .select('pt_id, lane_number')
+          .select('id, lane_number, pallet_count, order_position, pt_id, compiled_pallet_id')
           .in('pt_id', ptIds);
         throwIfSupabaseError(laneRowsError, 'Failed loading lane assignments for shipment PTs');
 
-        (laneRows || []).forEach((row) => {
-          const ptId = Number((row as { pt_id: number }).pt_id);
-          const laneNumber = String((row as { lane_number: string | null }).lane_number || '').trim();
-          if (!Number.isFinite(ptId) || !laneNumber) return;
-
-          const current = laneLocationsByPtId.get(ptId) || [];
-          if (!current.includes(laneNumber)) {
-            current.push(laneNumber);
-            laneLocationsByPtId.set(ptId, current);
-          }
+        ((laneRows || []) as PTLaneAssignmentRow[]).forEach((row) => {
+          const ptId = Number(row.pt_id);
+          if (!Number.isFinite(ptId)) return;
+          const current = laneAssignmentRowsByPtId.get(ptId) || [];
+          current.push(row);
+          laneAssignmentRowsByPtId.set(ptId, current);
         });
       }
 
-      laneLocationsByPtId.forEach((locations, ptId) => {
-        laneLocationsByPtId.set(ptId, [...locations].sort(compareLaneNumbers));
+      laneAssignmentRowsByPtId.forEach((rows, ptId) => {
+        laneAssignmentRowsByPtId.set(
+          ptId,
+          [...rows].sort((left, right) => {
+            const leftOrder = left.order_position ?? Number.MAX_SAFE_INTEGER;
+            const rightOrder = right.order_position ?? Number.MAX_SAFE_INTEGER;
+            if (leftOrder !== rightOrder) return leftOrder - rightOrder;
+            return left.id - right.id;
+          })
+        );
       });
 
-      const stagingLaneNumber = String(activeContext.staging_lane || lane.lane_number).trim();
+      const compiledMembersById = new Map<number, Pickticket[]>();
 
-      const candidates: StagingCandidate[] = typedRows
-        .map((pt) => {
-          const explicitLaneLocations = laneLocationsByPtId.get(pt.id) || [];
-          const fallbackLocations = explicitLaneLocations.length === 0 && pt.assigned_lane
-            ? [String(pt.assigned_lane).trim()].filter(Boolean)
-            : [];
-          const laneLocations = (explicitLaneLocations.length > 0 ? explicitLaneLocations : fallbackLocations)
-            .filter(Boolean)
+      typedRows.forEach((pt) => {
+        const compiledId = Number(pt.compiled_pallet_id);
+        if (!Number.isFinite(compiledId) || compiledId <= 0) return;
+        const members = compiledMembersById.get(compiledId) || [];
+        members.push(pt);
+        compiledMembersById.set(compiledId, members);
+      });
+
+      compiledMembersById.forEach((members, compiledId) => {
+        compiledMembersById.set(
+          compiledId,
+          [...members].sort((left, right) => {
+            const byPt = comparePTLabels(left.pt_number, right.pt_number);
+            if (byPt !== 0) return byPt;
+            return left.id - right.id;
+          })
+        );
+      });
+
+      const seenCandidateKeys = new Set<string>();
+      const candidates = typedRows
+        .reduce<StagingCandidate[]>((accumulator, pt) => {
+          const compiledId = Number(pt.compiled_pallet_id);
+          const isCompiled = Number.isFinite(compiledId) && compiledId > 0;
+          const memberPTs = isCompiled
+            ? (compiledMembersById.get(compiledId) || [pt])
+            : [pt];
+          const memberPtIds = memberPTs
+            .map((member) => Number(member.id))
+            .filter((ptId) => Number.isFinite(ptId) && ptId > 0);
+          const candidateKey = isCompiled ? `cp:${compiledId}` : `pt:${pt.id}`;
+          if (seenCandidateKeys.has(candidateKey)) return accumulator;
+          seenCandidateKeys.add(candidateKey);
+
+          const memberAssignmentRows = memberPtIds
+            .flatMap((memberPtId) => laneAssignmentRowsByPtId.get(memberPtId) || []);
+
+          const assignmentId = memberAssignmentRows[0]?.id ?? null;
+          const assignmentLanes = memberAssignmentRows
+            .map((row) => String(row.lane_number || '').trim())
+            .filter(Boolean);
+          const fallbackLanes = memberPTs
+            .map((member) => String(member.assigned_lane || '').trim())
+            .filter(Boolean);
+          const laneLocations = Array.from(new Set([...assignmentLanes, ...fallbackLanes]))
             .sort(compareLaneNumbers);
-          const primaryLane = laneLocations[0] || null;
+          const nonStagingLanes = laneLocations.filter((laneNumber) => laneNumber !== stagingLaneNumber);
+          const primaryLane = nonStagingLanes[0] || laneLocations[0] || null;
+          const isUnassigned = laneLocations.length === 0;
 
-          return {
-            pt,
+          const allMembersAlreadyStaged = memberPTs.every((member) => {
+            const assignedLane = String(member.assigned_lane || '').trim();
+            const normalizedStatus = String(member.status || '').trim().toLowerCase();
+            return assignedLane === stagingLaneNumber && (normalizedStatus === 'staged' || normalizedStatus === 'ready_to_ship');
+          });
+          if (allMembersAlreadyStaged) return accumulator;
+
+          accumulator.push({
+            key: candidateKey,
+            pt: memberPTs[0] || pt,
+            memberPTs,
+            memberPtIds,
             laneLocations,
             primaryLane,
-            isUnassigned: laneLocations.length === 0
-          } satisfies StagingCandidate;
-        })
-        .filter((candidate) => !candidate.laneLocations.includes(stagingLaneNumber))
+            isUnassigned,
+            assignmentId,
+            compiledPalletId: isCompiled ? compiledId : null
+          });
+          return accumulator;
+        }, [])
         .sort((a, b) => {
           if (a.isUnassigned !== b.isUnassigned) {
             return a.isUnassigned ? -1 : 1;
@@ -833,6 +902,25 @@ export default function AssignModal({
     setStagingActionPtIds((previous) => (previous.includes(ptId) ? previous : [...previous, ptId]));
 
     try {
+      if (candidate.assignmentId !== null) {
+        await stageLaneAssignmentIntoShipment({
+          assignmentId: candidate.assignmentId,
+          puNumber: stagingShipment.pu_number,
+          puDate: stagingShipment.pu_date
+        });
+
+        showToast(`✅ ${buildStagingCandidateLabel(candidate)} staged`, 'success');
+        await fetchExistingPTs();
+        await checkIfStagingLane();
+        await fetchStagingCandidates();
+        onUpdated?.();
+        return true;
+      }
+
+      if (candidate.memberPtIds.length > 1) {
+        throw new Error('Compiled pallet is missing its source lane assignment row.');
+      }
+
       if (requestedPalletCount !== null) {
         const previousPalletCount = candidate.pt.actual_pallet_count ?? null;
         const { error: updatePalletError } = await supabase
@@ -865,7 +953,7 @@ export default function AssignModal({
         throwIfSupabaseError(stageError, `Failed staging PT ${ptLabel}`);
       }
 
-      showToast(`✅ PT ${ptLabel} staged`, 'success');
+      showToast(`✅ ${buildStagingCandidateLabel(candidate)} staged`, 'success');
       await fetchExistingPTs();
       await checkIfStagingLane();
       await fetchStagingCandidates();
@@ -1518,12 +1606,17 @@ export default function AssignModal({
   const visibleStagingCandidates = stagingSearchNeedle
     ? stagingCandidates.filter((candidate) => {
       const laneText = candidate.isUnassigned ? 'unassigned' : candidate.laneLocations.join('/');
+      const memberPtText = candidate.memberPTs.map((member) => member.pt_number || '').join(' ');
+      const memberPoText = candidate.memberPTs.map((member) => member.po_number || '').join(' ');
       return [
         candidate.pt.pt_number,
         candidate.pt.po_number,
         candidate.pt.customer,
         candidate.pt.container_number,
-        laneText
+        laneText,
+        memberPtText,
+        memberPoText,
+        candidate.memberPtIds.length > 1 ? 'compiled merged pallet' : ''
       ].some((value) => String(value || '').toLowerCase().includes(stagingSearchNeedle));
     })
     : stagingCandidates;
@@ -2391,11 +2484,15 @@ export default function AssignModal({
                     const isActing = stagingActionPtIds.includes(candidate.pt.id);
 
                     return (
-                      <div key={candidate.pt.id} className="bg-gray-700 border border-gray-600 rounded-lg p-3 md:p-4">
+                      <div key={candidate.key} className="bg-gray-700 border border-gray-600 rounded-lg p-3 md:p-4">
                         <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
                           <div className="min-w-0">
                             <div className="flex items-center gap-2 flex-wrap">
-                              <div className="font-bold text-sm md:text-base break-all">PT #{candidate.pt.pt_number}</div>
+                              <div className="font-bold text-sm md:text-base break-all">
+                                {candidate.memberPtIds.length > 1
+                                  ? `Compiled pallet • ${candidate.memberPtIds.length} PTs`
+                                  : `PT #${candidate.pt.pt_number}`}
+                              </div>
                               {isArchived && (
                                 <span className="bg-gray-800 px-1.5 py-0.5 rounded text-[9px] font-bold text-gray-200">
                                   ARCHIVED
@@ -2408,7 +2505,9 @@ export default function AssignModal({
                               </span>
                             </div>
                             <div className="text-xs md:text-sm text-gray-300 break-all mt-1">
-                              {candidate.pt.customer} | PO: {candidate.pt.po_number} | Container: {candidate.pt.container_number}
+                              {candidate.memberPtIds.length > 1
+                                ? `${candidate.memberPTs.map((member) => member.pt_number).filter(Boolean).join(', ')} | ${candidate.pt.customer} | Container: ${candidate.pt.container_number}`
+                                : `${candidate.pt.customer} | PO: ${candidate.pt.po_number} | Container: ${candidate.pt.container_number}`}
                             </div>
                           </div>
 

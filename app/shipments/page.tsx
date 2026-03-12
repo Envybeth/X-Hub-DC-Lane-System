@@ -13,7 +13,7 @@ import ActionToast from '@/components/ActionToast';
 import { buildPuLoadKey, normalizePuDate, normalizePuNumber } from '@/lib/shipmentIdentity';
 import { setShipmentStagingLaneWithAutoLink } from '@/lib/setShipmentStagingLane';
 import { buildSetShipmentStagingLaneErrorMessage, buildSetShipmentStagingLaneSuccessMessage } from '@/lib/setShipmentStagingLaneFeedback';
-import { describeUnknownStageError } from '@/lib/stageShipmentExecution';
+import { describeUnknownStageError, stageLaneAssignmentIntoShipment } from '@/lib/stageShipmentExecution';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const SHIPPED_TO_ARCHIVED_DAYS = 7;
@@ -424,6 +424,7 @@ export default function ShipmentsPage() {
   const [plannerLanePreviewLoading, setPlannerLanePreviewLoading] = useState(false);
   const [plannerLanePreviewError, setPlannerLanePreviewError] = useState<string | null>(null);
   const [mobileMoreOptionsOpen, setMobileMoreOptionsOpen] = useState(false);
+  const plannerSyncActive = plannerModalOpen || plannerQueueRaw.length > 0;
   const shipmentRefreshTimerRef = useRef<number | null>(null);
   const shipmentFetchInFlightRef = useRef(false);
   const shipmentFetchQueuedRef = useRef(false);
@@ -435,6 +436,11 @@ export default function ShipmentsPage() {
   const plannerDateFilterInitializedRef = useRef(false);
   const focusedShipmentKeyRef = useRef<string | null>(null);
   const plannerQueueContainerRef = useRef<HTMLDivElement | null>(null);
+  const plannerSyncActiveRef = useRef(false);
+  const plannerRefreshRequestedRef = useRef(0);
+  const plannerRefreshCompletedRef = useRef(0);
+  const plannerBuildInFlightRef = useRef(false);
+  const latestFetchedShipmentsRef = useRef<Shipment[]>([]);
   const fetchShipmentsRef = useRef<() => Promise<void>>(async () => { });
   const fetchStaleSnapshotsRef = useRef<() => Promise<void>>(async () => { });
 
@@ -470,12 +476,27 @@ export default function ShipmentsPage() {
   }, [plannerToast]);
 
   useEffect(() => {
-    if (!plannerModalOpen || isGuest || plannerLoading) return;
-    if (!plannerDateFilterInitializedRef.current || plannerQueueStale) {
-      void buildPlannerQueue({ silent: true });
+    plannerSyncActiveRef.current = plannerSyncActive;
+  }, [plannerSyncActive]);
+
+  const requestPlannerQueueRefresh = useCallback(() => {
+    if (!plannerSyncActiveRef.current) return;
+    plannerRefreshRequestedRef.current += 1;
+    setPlannerQueueStale(true);
+  }, []);
+
+  useEffect(() => {
+    if (!plannerModalOpen || isGuest || plannerLoading || plannerDateFilterInitializedRef.current) return;
+    if (shipmentFetchInFlightRef.current && latestFetchedShipmentsRef.current.length === 0) {
+      requestPlannerQueueRefresh();
+      return;
     }
+    void buildPlannerQueue({
+      silent: true,
+      shipmentsOverride: latestFetchedShipmentsRef.current
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [plannerModalOpen, isGuest, plannerLoading, plannerQueueStale]);
+  }, [plannerModalOpen, isGuest, plannerLoading, requestPlannerQueueRefresh]);
 
   useEffect(() => {
     if (plannerModalOpen) return;
@@ -489,14 +510,12 @@ export default function ShipmentsPage() {
   const refreshShipmentView = useCallback((shipmentKeyToFocus: string, includeStale = false) => {
     focusedShipmentKeyRef.current = shipmentKeyToFocus;
     setExpandedShipmentKey(shipmentKeyToFocus);
-    if (plannerModalOpen || plannerQueueRaw.length > 0) {
-      setPlannerQueueStale(true);
-    }
+    requestPlannerQueueRefresh();
     void fetchShipmentsRef.current();
     if (includeStale) {
       void fetchStaleSnapshotsRef.current();
     }
-  }, [plannerModalOpen, plannerQueueRaw.length]);
+  }, [requestPlannerQueueRefresh]);
 
   const ensureHistoricalShipmentsLoaded = useCallback(async () => {
     if (includeHistoricalShipmentsRef.current || historicalShipmentsLoading) return;
@@ -574,9 +593,11 @@ export default function ShipmentsPage() {
     }
   }
 
-  async function buildPlannerQueue(options?: { silent?: boolean }) {
-    if (plannerLoading) return null;
+  async function buildPlannerQueue(options?: { silent?: boolean; shipmentsOverride?: Shipment[] }) {
+    if (plannerBuildInFlightRef.current) return null;
 
+    plannerBuildInFlightRef.current = true;
+    const buildRequestVersion = plannerRefreshRequestedRef.current;
     setPlannerLoading(true);
     try {
       const boundedMaxSteps = Math.max(1, Math.min(200, Math.trunc(plannerMaxSteps) || 40));
@@ -601,8 +622,10 @@ export default function ShipmentsPage() {
         throw error;
       }
 
+      const shipmentSource = options?.shipmentsOverride
+        ?? (latestFetchedShipmentsRef.current.length > 0 ? latestFetchedShipmentsRef.current : shipments);
       const shipmentStatusByKey = new Map(
-        shipments
+        shipmentSource
           .map((shipment) => [buildPuLoadKey(shipment.pu_number, shipment.pu_date), shipment.status] as const)
           .filter(([key]) => Boolean(key))
       );
@@ -633,7 +656,10 @@ export default function ShipmentsPage() {
       setPlannerSelectedPuDates(nextSelectedDates);
       setPlannerFilteredRowCount(filteredRows.length);
       setPlannerQueue(visibleRows);
-      setPlannerQueueStale(false);
+      plannerRefreshCompletedRef.current = Math.max(plannerRefreshCompletedRef.current, buildRequestVersion);
+      if (plannerRefreshCompletedRef.current >= plannerRefreshRequestedRef.current) {
+        setPlannerQueueStale(false);
+      }
 
       if (!options?.silent) {
         if (visibleRows.length === 0) {
@@ -651,7 +677,17 @@ export default function ShipmentsPage() {
       setPlannerToast({ message: 'Failed to build planner queue', type: 'error' });
       return null;
     } finally {
+      const newerRefreshRequested = plannerRefreshRequestedRef.current > buildRequestVersion;
+      const nextShipmentSnapshot = latestFetchedShipmentsRef.current;
+      const shouldReplayRefresh = newerRefreshRequested && plannerSyncActiveRef.current && !document.hidden;
+      plannerBuildInFlightRef.current = false;
       setPlannerLoading(false);
+      if (shouldReplayRefresh) {
+        void buildPlannerQueue({
+          silent: true,
+          shipmentsOverride: nextShipmentSnapshot
+        });
+      }
     }
   }
 
@@ -829,33 +865,15 @@ export default function ShipmentsPage() {
   }
 
   async function executePlannerStageViaAssignmentFlow(row: PlannerQueueRow) {
-    const { data: stageRows, error: stageError } = await supabase.rpc('stage_assignment_into_shipment_transactional', {
-      p_assignment_id: row.assignment_id,
-      p_pu_number: row.pu_number,
-      p_pu_date: row.pu_date
+    const stageResult = await stageLaneAssignmentIntoShipment({
+      assignmentId: row.assignment_id,
+      puNumber: row.pu_number,
+      puDate: row.pu_date
     });
 
-    if (stageError) {
-      if (isMissingRpcFunction(stageError, 'stage_assignment_into_shipment_transactional')) {
-        throw new Error('Transactional stage function missing. Run sql/transactional_stage_move_functions.sql in Supabase first.');
-      }
-      throw stageError;
-    }
-
-    const stageRow = (Array.isArray(stageRows) ? stageRows[0] : stageRows) as {
-      shipment_id?: number | null;
-      staged_member_count?: number | null;
-    } | null;
-
-    const shipmentId = Number(stageRow?.shipment_id || 0);
-    if (!Number.isFinite(shipmentId) || shipmentId <= 0) {
-      throw new Error('Transactional stage returned no shipment result.');
-    }
-
-    const stagedMemberCount = Number(stageRow?.staged_member_count || 0);
     return {
-      shipmentId,
-      stagedMemberCount: Number.isFinite(stagedMemberCount) && stagedMemberCount > 0 ? Math.trunc(stagedMemberCount) : 1
+      shipmentId: stageResult.shipmentId,
+      stagedMemberCount: stageResult.stagedMemberCount
     };
   }
 
@@ -1022,9 +1040,7 @@ export default function ShipmentsPage() {
     if (includeStale) {
       staleRefreshRequestedRef.current = true;
     }
-    if (plannerModalOpen || plannerQueueRaw.length > 0) {
-      setPlannerQueueStale(true);
-    }
+    requestPlannerQueueRefresh();
     if (document.hidden) {
       pendingVisibleRefreshRef.current = true;
       return;
@@ -1040,7 +1056,7 @@ export default function ShipmentsPage() {
       }
       shipmentRefreshTimerRef.current = null;
     }, 450);
-  }, [plannerModalOpen, plannerQueueRaw.length, staleSnapshotStoreAvailable]);
+  }, [requestPlannerQueueRefresh, staleSnapshotStoreAvailable]);
 
   useEffect(() => {
     const handleVisibilityChange = () => {
@@ -1053,24 +1069,21 @@ export default function ShipmentsPage() {
       const hiddenForMs = pageHiddenAtRef.current ? Date.now() - pageHiddenAtRef.current : 0;
       pageHiddenAtRef.current = null;
       const longBackgroundGap = hiddenForMs >= 15000;
-      const shouldRefreshOnReturn = pendingVisibleRefreshRef.current || longBackgroundGap || realtimeHealth !== 'live' || plannerModalOpen;
+      const shouldRefreshOnReturn = pendingVisibleRefreshRef.current || longBackgroundGap || realtimeHealth !== 'live' || plannerSyncActiveRef.current;
       if (!shouldRefreshOnReturn) return;
 
       pendingVisibleRefreshRef.current = false;
+      requestPlannerQueueRefresh();
       void fetchShipmentsRef.current();
       if (staleSnapshotStoreAvailable && staleRefreshRequestedRef.current) {
         staleRefreshRequestedRef.current = false;
         void fetchStaleSnapshotsRef.current();
       }
-      if (plannerModalOpen) {
-        void buildPlannerQueue({ silent: true });
-      }
     };
 
     document.addEventListener('visibilitychange', handleVisibilityChange);
     return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [staleSnapshotStoreAvailable, realtimeHealth, plannerModalOpen]);
+  }, [staleSnapshotStoreAvailable, realtimeHealth, plannerModalOpen, requestPlannerQueueRefresh]);
 
   useEffect(() => {
     const unsubscribeShipments = subscribeScope('shipments', (payload) => {
@@ -1090,11 +1103,12 @@ export default function ShipmentsPage() {
   useEffect(() => {
     if (realtimeHealth === 'live') return;
     if (document.hidden) return;
+    requestPlannerQueueRefresh();
     void fetchShipmentsRef.current();
     if (staleSnapshotStoreAvailable) {
       void fetchStaleSnapshotsRef.current();
     }
-  }, [realtimeHealth, staleSnapshotStoreAvailable]);
+  }, [realtimeHealth, requestPlannerQueueRefresh, staleSnapshotStoreAvailable]);
 
   useEffect(() => {
     const intervalMs = realtimeHealth === 'live'
@@ -1102,17 +1116,17 @@ export default function ShipmentsPage() {
       : SHIPMENTS_FALLBACK_DEGRADED_SYNC_MS;
     const timer = window.setInterval(() => {
       if (document.hidden) return;
+      if (realtimeHealth !== 'live') {
+        requestPlannerQueueRefresh();
+      }
       void fetchShipmentsRef.current();
       if (staleSnapshotStoreAvailable) {
         void fetchStaleSnapshotsRef.current();
       }
-      if (realtimeHealth !== 'live' && (plannerModalOpen || plannerQueueRaw.length > 0)) {
-        setPlannerQueueStale(true);
-      }
     }, intervalMs);
 
     return () => window.clearInterval(timer);
-  }, [plannerModalOpen, plannerQueueRaw.length, realtimeHealth, staleSnapshotStoreAvailable]);
+  }, [realtimeHealth, requestPlannerQueueRefresh, staleSnapshotStoreAvailable]);
 
   async function fetchStaleSnapshotsFromSupabase() {
     const { data, error } = await supabase
@@ -1369,7 +1383,22 @@ export default function ShipmentsPage() {
         return dateB.getTime() - dateA.getTime();
       });
 
+      latestFetchedShipmentsRef.current = sortedShipments;
       setShipments(sortedShipments);
+
+      const shouldRefreshPlannerQueue = (
+        !isGuest
+        && plannerSyncActiveRef.current
+        && plannerRefreshRequestedRef.current > plannerRefreshCompletedRef.current
+        && !document.hidden
+        && !plannerBuildInFlightRef.current
+      );
+      if (shouldRefreshPlannerQueue) {
+        await buildPlannerQueue({
+          silent: true,
+          shipmentsOverride: sortedShipments
+        });
+      }
 
     } catch (error) {
       console.error('Error fetching shipments:', error);
