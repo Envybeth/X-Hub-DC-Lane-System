@@ -13,6 +13,7 @@ import ActionToast from '@/components/ActionToast';
 import { buildPuLoadKey, normalizePuDate, normalizePuNumber } from '@/lib/shipmentIdentity';
 import { setShipmentStagingLaneWithAutoLink } from '@/lib/setShipmentStagingLane';
 import { buildSetShipmentStagingLaneErrorMessage, buildSetShipmentStagingLaneSuccessMessage } from '@/lib/setShipmentStagingLaneFeedback';
+import { describeUnknownStageError } from '@/lib/stageShipmentExecution';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const SHIPPED_TO_ARCHIVED_DAYS = 7;
@@ -377,6 +378,92 @@ export default function ShipmentsPage() {
     plannerQueueContainerRef.current.scrollTo({ top: 0, behavior });
   }
 
+  async function executePlannerStageViaShipmentCardFlow(row: PlannerQueueRow) {
+    const { data: stageRows, error: stageError } = await supabase.rpc('stage_pickticket_into_shipment_lane', {
+      p_pu_number: row.pu_number,
+      p_pu_date: row.pu_date,
+      p_pt_id: row.representative_pt_id,
+      p_original_lane: toTrimmedText(row.source_lane) || null
+    });
+
+    if (stageError) {
+      if (isMissingRpcFunction(stageError, 'stage_pickticket_into_shipment_lane')) {
+        throw new Error('Staging function missing. Run sql/transactional_stage_move_functions.sql in Supabase first.');
+      }
+      throw stageError;
+    }
+
+    if (row.move_type !== 'compiled_group') {
+      return;
+    }
+
+    const stageRow = (Array.isArray(stageRows) ? stageRows[0] : stageRows) as {
+      shipment_id?: number | null;
+      staging_lane?: string | null;
+      pt_status?: string | null;
+      pallet_count?: number | null;
+    } | null;
+
+    const shipmentId = Number(stageRow?.shipment_id || 0);
+    if (!Number.isFinite(shipmentId) || shipmentId <= 0) return;
+
+    const memberIds = (row.pending_member_pt_ids || [])
+      .map((value) => Number(value))
+      .filter((value) => Number.isFinite(value) && value > 0 && value !== row.representative_pt_id);
+
+    if (memberIds.length === 0) return;
+
+    const { data: memberRows, error: memberRowsError } = await supabase
+      .from('picktickets')
+      .select('id, assigned_lane, status')
+      .in('id', memberIds)
+      .neq('status', 'shipped');
+    if (memberRowsError) throw memberRowsError;
+
+    const activeMembers = ((memberRows || []) as Array<{ id: number; assigned_lane: string | null; status: string | null }>)
+      .filter((member) => Number.isFinite(Number(member.id)));
+    if (activeMembers.length === 0) return;
+
+    const { error: upsertShipmentPtsError } = await supabase
+      .from('shipment_pts')
+      .upsert(
+        activeMembers.map((member) => ({
+          shipment_id: shipmentId,
+          pt_id: member.id,
+          original_lane: toTrimmedText(member.assigned_lane) || toTrimmedText(row.source_lane) || null,
+          removed_from_staging: false
+        })),
+        { onConflict: 'shipment_id,pt_id' }
+      );
+    if (upsertShipmentPtsError) throw upsertShipmentPtsError;
+
+    const activeMemberIds = activeMembers.map((member) => member.id);
+
+    const { error: cleanupAssignmentsError } = await supabase
+      .from('lane_assignments')
+      .delete()
+      .in('pt_id', activeMemberIds);
+    if (cleanupAssignmentsError) throw cleanupAssignmentsError;
+
+    const stageLane = toTrimmedText(stageRow?.staging_lane) || null;
+    const stageStatus = toTrimmedText(stageRow?.pt_status) || 'staged';
+    const stagePalletCount = Number(stageRow?.pallet_count);
+    const updatePayload: { assigned_lane?: string | null; status: string; actual_pallet_count?: number } = {
+      status: stageStatus
+    };
+    if (stageLane !== null) updatePayload.assigned_lane = stageLane;
+    if (Number.isFinite(stagePalletCount)) {
+      updatePayload.actual_pallet_count = Math.max(0, Math.trunc(stagePalletCount));
+    }
+
+    const { error: updateMembersError } = await supabase
+      .from('picktickets')
+      .update(updatePayload)
+      .in('id', activeMemberIds)
+      .neq('status', 'shipped');
+    if (updateMembersError) throw updateMembersError;
+  }
+
   async function executePlannerStage(row: PlannerQueueRow) {
     if (isGuest || plannerExecutingAssignmentId !== null || plannerAssigningShipmentKey !== null) return;
     if (!plannerRowHasStagingLane(row)) {
@@ -388,39 +475,40 @@ export default function ShipmentsPage() {
     }
 
     setPlannerExecutingAssignmentId(row.assignment_id);
+    let stageSucceeded = false;
     try {
-      const { error } = await supabase.rpc('stage_assignment_into_shipment_transactional', {
-        p_assignment_id: row.assignment_id,
-        p_pu_number: row.pu_number,
-        p_pu_date: row.pu_date
-      });
-
-      if (error) {
-        if (isMissingRpcFunction(error, 'stage_assignment_into_shipment_transactional')) {
-          setPlannerToast({
-            message: 'Executor function missing. Run sql/transactional_stage_move_functions.sql in Supabase first.',
-            type: 'error'
-          });
-          return;
-        }
-        throw error;
-      }
+      await executePlannerStageViaShipmentCardFlow(row);
 
       setPlannerToast({
         message: `Staged step ${row.step_no}: PU ${row.pu_number} PT ${row.representative_pt_number || row.representative_pt_id}`,
         type: 'success'
       });
+      stageSucceeded = true;
+    } catch (error) {
+      console.error('Failed to stage planner row:', error);
+      setPlannerToast({
+        message: `Failed to execute planned step: ${describeUnknownStageError(error)}`,
+        type: 'error'
+      });
+      return;
+    } finally {
+      setPlannerExecutingAssignmentId(null);
+    }
 
+    if (!stageSucceeded) return;
+
+    try {
       await fetchShipmentsRef.current();
       await buildPlannerQueue({ silent: true });
       window.requestAnimationFrame(() => {
         scrollPlannerQueueToTop('smooth');
       });
-    } catch (error) {
-      console.error('Failed to stage planner row:', error);
-      setPlannerToast({ message: 'Failed to execute planned step', type: 'error' });
-    } finally {
-      setPlannerExecutingAssignmentId(null);
+    } catch (refreshError) {
+      console.error('Staged planner row but refresh failed:', refreshError);
+      setPlannerToast({
+        message: `Step staged, but refresh failed: ${describeUnknownStageError(refreshError)}`,
+        type: 'info'
+      });
     }
   }
 
