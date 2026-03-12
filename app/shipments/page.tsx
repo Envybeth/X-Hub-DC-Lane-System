@@ -402,90 +402,35 @@ export default function ShipmentsPage() {
     plannerQueueContainerRef.current.scrollTo({ top: 0, behavior });
   }
 
-  async function executePlannerStageViaShipmentCardFlow(row: PlannerQueueRow) {
-    const { data: stageRows, error: stageError } = await supabase.rpc('stage_pickticket_into_shipment_lane', {
+  async function executePlannerStageViaAssignmentFlow(row: PlannerQueueRow) {
+    const { data: stageRows, error: stageError } = await supabase.rpc('stage_assignment_into_shipment_transactional', {
+      p_assignment_id: row.assignment_id,
       p_pu_number: row.pu_number,
-      p_pu_date: row.pu_date,
-      p_pt_id: row.representative_pt_id,
-      p_original_lane: toTrimmedText(row.source_lane) || null
+      p_pu_date: row.pu_date
     });
 
     if (stageError) {
-      if (isMissingRpcFunction(stageError, 'stage_pickticket_into_shipment_lane')) {
-        throw new Error('Staging function missing. Run sql/transactional_stage_move_functions.sql in Supabase first.');
+      if (isMissingRpcFunction(stageError, 'stage_assignment_into_shipment_transactional')) {
+        throw new Error('Transactional stage function missing. Run sql/transactional_stage_move_functions.sql in Supabase first.');
       }
       throw stageError;
     }
 
-    if (row.move_type !== 'compiled_group') {
-      return;
-    }
-
     const stageRow = (Array.isArray(stageRows) ? stageRows[0] : stageRows) as {
       shipment_id?: number | null;
-      staging_lane?: string | null;
-      pt_status?: string | null;
-      pallet_count?: number | null;
+      staged_member_count?: number | null;
     } | null;
 
     const shipmentId = Number(stageRow?.shipment_id || 0);
-    if (!Number.isFinite(shipmentId) || shipmentId <= 0) return;
-
-    const memberIds = (row.pending_member_pt_ids || [])
-      .map((value) => Number(value))
-      .filter((value) => Number.isFinite(value) && value > 0 && value !== row.representative_pt_id);
-
-    if (memberIds.length === 0) return;
-
-    const { data: memberRows, error: memberRowsError } = await supabase
-      .from('picktickets')
-      .select('id, assigned_lane, status')
-      .in('id', memberIds)
-      .neq('status', 'shipped');
-    if (memberRowsError) throw memberRowsError;
-
-    const activeMembers = ((memberRows || []) as Array<{ id: number; assigned_lane: string | null; status: string | null }>)
-      .filter((member) => Number.isFinite(Number(member.id)));
-    if (activeMembers.length === 0) return;
-
-    const { error: upsertShipmentPtsError } = await supabase
-      .from('shipment_pts')
-      .upsert(
-        activeMembers.map((member) => ({
-          shipment_id: shipmentId,
-          pt_id: member.id,
-          original_lane: toTrimmedText(member.assigned_lane) || toTrimmedText(row.source_lane) || null,
-          removed_from_staging: false
-        })),
-        { onConflict: 'shipment_id,pt_id' }
-      );
-    if (upsertShipmentPtsError) throw upsertShipmentPtsError;
-
-    const activeMemberIds = activeMembers.map((member) => member.id);
-
-    const { error: cleanupAssignmentsError } = await supabase
-      .from('lane_assignments')
-      .delete()
-      .in('pt_id', activeMemberIds);
-    if (cleanupAssignmentsError) throw cleanupAssignmentsError;
-
-    const stageLane = toTrimmedText(stageRow?.staging_lane) || null;
-    const stageStatus = toTrimmedText(stageRow?.pt_status) || 'staged';
-    const stagePalletCount = Number(stageRow?.pallet_count);
-    const updatePayload: { assigned_lane?: string | null; status: string; actual_pallet_count?: number } = {
-      status: stageStatus
-    };
-    if (stageLane !== null) updatePayload.assigned_lane = stageLane;
-    if (Number.isFinite(stagePalletCount)) {
-      updatePayload.actual_pallet_count = Math.max(0, Math.trunc(stagePalletCount));
+    if (!Number.isFinite(shipmentId) || shipmentId <= 0) {
+      throw new Error('Transactional stage returned no shipment result.');
     }
 
-    const { error: updateMembersError } = await supabase
-      .from('picktickets')
-      .update(updatePayload)
-      .in('id', activeMemberIds)
-      .neq('status', 'shipped');
-    if (updateMembersError) throw updateMembersError;
+    const stagedMemberCount = Number(stageRow?.staged_member_count || 0);
+    return {
+      shipmentId,
+      stagedMemberCount: Number.isFinite(stagedMemberCount) && stagedMemberCount > 0 ? Math.trunc(stagedMemberCount) : 1
+    };
   }
 
   async function executePlannerStage(row: PlannerQueueRow) {
@@ -504,8 +449,12 @@ export default function ShipmentsPage() {
     try {
       for (let attempt = 0; attempt < 2; attempt += 1) {
         try {
-          await executePlannerStageViaShipmentCardFlow(stageRow);
+          const stageResult = await executePlannerStageViaAssignmentFlow(stageRow);
           stageSucceeded = true;
+          setPlannerToast({
+            message: `Staged step ${stageRow.step_no}: PU ${stageRow.pu_number}${stageResult.stagedMemberCount > 1 ? ` (${stageResult.stagedMemberCount} PTs)` : ''}`,
+            type: 'success'
+          });
           break;
         } catch (stageError) {
           const stageErrorText = describeUnknownStageError(stageError);
@@ -538,10 +487,6 @@ export default function ShipmentsPage() {
         throw new Error('Stage did not complete.');
       }
 
-      setPlannerToast({
-        message: `Staged step ${stageRow.step_no}: PU ${stageRow.pu_number} PT ${stageRow.representative_pt_number || stageRow.representative_pt_id}`,
-        type: 'success'
-      });
     } catch (error) {
       console.error('Failed to stage planner row:', error);
       setPlannerToast({
@@ -609,6 +554,10 @@ export default function ShipmentsPage() {
         targetLane: laneNumber
       });
 
+      await fetchShipmentsRef.current();
+      const rebuiltRows = await buildPlannerQueue({ silent: true });
+      if (rebuiltRows === null) return;
+
       setPlannerToast({
         message: buildSetShipmentStagingLaneSuccessMessage({
           result,
@@ -617,9 +566,6 @@ export default function ShipmentsPage() {
         }),
         type: 'success'
       });
-
-      await fetchShipmentsRef.current();
-      await buildPlannerQueue({ silent: true });
     } catch (error) {
       console.error('Failed to set staging lane from planner:', error);
       setPlannerToast({

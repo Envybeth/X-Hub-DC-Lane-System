@@ -94,7 +94,48 @@ function safeIsoTimestamp(value: unknown): string {
   return new Date().toISOString();
 }
 
-function RealtimeStatusDot({ health, online }: { health: RealtimeHealth; online: boolean }) {
+function RealtimeStatusDot({
+  health,
+  online,
+  isLeader
+}: {
+  health: RealtimeHealth;
+  online: boolean;
+  isLeader: boolean;
+}) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const [isPopoverOpen, setIsPopoverOpen] = useState(false);
+  const [supportsHover, setSupportsHover] = useState(false);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
+    const mediaQuery = window.matchMedia('(hover: hover) and (pointer: fine)');
+    const updateSupportsHover = () => setSupportsHover(mediaQuery.matches);
+    updateSupportsHover();
+    mediaQuery.addEventListener('change', updateSupportsHover);
+    return () => mediaQuery.removeEventListener('change', updateSupportsHover);
+  }, []);
+
+  useEffect(() => {
+    if (!isPopoverOpen) return;
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target as Node | null;
+      if (target && containerRef.current?.contains(target)) return;
+      setIsPopoverOpen(false);
+    };
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setIsPopoverOpen(false);
+      }
+    };
+    document.addEventListener('pointerdown', handlePointerDown, true);
+    document.addEventListener('keydown', handleEscape, true);
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown, true);
+      document.removeEventListener('keydown', handleEscape, true);
+    };
+  }, [isPopoverOpen]);
+
   const dotClasses = health === 'live'
     ? 'bg-green-400 shadow-[0_0_14px_rgba(74,222,128,0.95)]'
     : health === 'reconnecting'
@@ -107,11 +148,53 @@ function RealtimeStatusDot({ health, online }: { health: RealtimeHealth; online:
       ? 'Realtime: reconnecting'
       : 'Realtime: disconnected';
   const networkLabel = online ? 'Network: online' : 'Network: offline';
-  const label = `${realtimeLabel} • ${networkLabel}`;
+  const modeLabel = isLeader ? 'Mode: leader tab' : 'Mode: follower tab';
+  const progressionLabel = health === 'live'
+    ? 'Events are flowing now.'
+    : health === 'reconnecting'
+      ? 'Trying to recover channel.'
+      : 'No active realtime signal.';
 
   return (
-    <div className="fixed top-4 left-4 z-[140] pointer-events-none" title={label}>
-      <div className={`h-3.5 w-3.5 rounded-full border border-black/40 ${dotClasses}`} />
+    <div ref={containerRef} className="fixed top-4 left-4 z-[140]">
+      <button
+        type="button"
+        aria-label="Realtime connection status"
+        onClick={() => {
+          if (supportsHover) return;
+          setIsPopoverOpen((previous) => !previous);
+        }}
+        onMouseEnter={() => {
+          if (!supportsHover) return;
+          setIsPopoverOpen(true);
+        }}
+        onMouseLeave={() => {
+          if (!supportsHover) return;
+          setIsPopoverOpen(false);
+        }}
+        className={`h-3.5 w-3.5 rounded-full border border-black/40 ${dotClasses}`}
+      />
+
+      {isPopoverOpen && (
+        <div
+          className="absolute top-5 left-0 w-56 rounded-md border border-slate-600 bg-slate-950/96 px-3 py-2 text-xs text-slate-100 shadow-lg"
+          onMouseEnter={() => {
+            if (!supportsHover) return;
+            setIsPopoverOpen(true);
+          }}
+          onMouseLeave={() => {
+            if (!supportsHover) return;
+            setIsPopoverOpen(false);
+          }}
+        >
+          <div className="font-semibold text-cyan-200">Connection</div>
+          <div className="mt-1 text-slate-200">{realtimeLabel}</div>
+          <div className="text-slate-200">{networkLabel}</div>
+          <div className="text-slate-200">{modeLabel}</div>
+          <div className="mt-1 text-[11px] text-slate-400">Flow: disconnected - reconnecting - live</div>
+          <div className="text-[11px] text-slate-400">{progressionLabel}</div>
+        </div>
+      )}
     </div>
   );
 }
@@ -486,7 +569,7 @@ export function RealtimeProvider({ children }: { children: React.ReactNode }) {
   return (
     <RealtimeContext.Provider value={value}>
       {children}
-      <RealtimeStatusDot health={health} online={isOnline} />
+      <RealtimeStatusDot health={health} online={isOnline} isLeader={isLeader} />
     </RealtimeContext.Provider>
   );
 }
