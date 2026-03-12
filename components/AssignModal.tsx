@@ -10,6 +10,7 @@ import { Pickticket } from '@/types/pickticket';
 import { createCompiledPallet } from '@/lib/compiledPallets';
 import { fetchCompiledPTInfo } from '@/lib/compiledPallets';
 import { stageLaneAssignmentIntoShipment } from '@/lib/stageShipmentExecution';
+import { touchShipmentUpdatedAtById, touchShipmentUpdatedAtByLoad } from '@/lib/touchShipmentUpdatedAt';
 
 import { isPTArchived, isPTArchivedOver60Days } from '@/lib/utils';
 
@@ -487,6 +488,7 @@ export default function AssignModal({
           onConflict: 'shipment_id,pt_id'
         });
       throwIfSupabaseError(stagingLinkError, 'Failed to mark PT as removed from staging');
+      await touchShipmentUpdatedAtById(stagingShipment.id);
     }
 
     const { error: statusError } = await supabase
@@ -953,6 +955,8 @@ export default function AssignModal({
         throwIfSupabaseError(stageError, `Failed staging PT ${ptLabel}`);
       }
 
+      await touchShipmentUpdatedAtByLoad(stagingShipment.pu_number, stagingShipment.pu_date);
+
       showToast(`✅ ${buildStagingCandidateLabel(candidate)} staged`, 'success');
       await fetchExistingPTs();
       await checkIfStagingLane();
@@ -1207,6 +1211,10 @@ export default function AssignModal({
 
       }
 
+      if (isTargetLaneStaging && shipmentData?.id && totalNewAssignments > 0) {
+        await touchShipmentUpdatedAtById(shipmentData.id);
+      }
+
       const totalAssigned = previewCompiledGroups.length + individualSelectionOrder.length;
       showToast(`✅ Assigned ${totalAssigned} PT group(s)`, 'success');
 
@@ -1253,6 +1261,9 @@ export default function AssignModal({
               .delete()
               .eq('pt_id', assignment.pickticket.id);
             throwIfSupabaseError(removeShipmentLinksError, 'Failed removing PT from shipment links');
+            if (stagingShipment && isCurrentLaneStagingLane()) {
+              await touchShipmentUpdatedAtById(stagingShipment.id);
+            }
           } else if (
             isStaging &&
             !assignmentSummary.laneNumbers.includes(String(lane.lane_number))

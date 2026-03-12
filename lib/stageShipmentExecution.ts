@@ -1,4 +1,5 @@
 import { supabase } from './supabase';
+import { touchShipmentUpdatedAtById } from './touchShipmentUpdatedAt';
 
 function toTrimmedText(value: unknown): string {
   if (typeof value === 'string') return value.trim();
@@ -81,6 +82,8 @@ export async function stageLaneAssignmentIntoShipment(
   const palletCount = Number(row?.pallet_count || 0);
   const representativePtId = Number(row?.representative_pt_id || 0);
   const compiledPalletId = Number(row?.compiled_pallet_id || 0);
+
+  await touchShipmentUpdatedAtById(shipmentId);
 
   return {
     shipmentId,

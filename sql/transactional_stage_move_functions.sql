@@ -150,6 +150,10 @@ begin
     status = v_pt_status
   where id = p_pt_id;
 
+  update public.shipments
+  set updated_at = now()
+  where id = v_shipment_id;
+
   return query
   select
     v_shipment_id,
@@ -758,6 +762,10 @@ begin
         and coalesce(status, '') <> 'shipped';
     end if;
   end if;
+
+  update public.shipments
+  set updated_at = now()
+  where id = v_stage_row.shipment_id;
 
   return query
   select

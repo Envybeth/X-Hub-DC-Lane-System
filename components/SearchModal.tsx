@@ -6,6 +6,7 @@ import PTDetails from './PTDetails';
 import { Pickticket } from '@/types/pickticket';
 import { isPTArchived } from '@/lib/utils';
 import { fetchCompiledPTInfo } from '@/lib/compiledPallets';
+import { touchShipmentUpdatedAtByLoad } from '@/lib/touchShipmentUpdatedAt';
 import { useRouter } from 'next/navigation';
 
 interface SearchModalProps {
@@ -482,6 +483,8 @@ export default function SearchModal({ onClose, mostRecentSync }: SearchModalProp
           setQuickAssignError(`Failed staging PT into shipment lane: ${stageError.message}`);
           return;
         }
+
+        await touchShipmentUpdatedAtByLoad(puNumber, puDate);
 
         const stageRow = (Array.isArray(stageRows) ? stageRows[0] : null) as
           | { staging_lane?: string | null; pt_status?: string | null; pallet_count?: number | null }

@@ -18,6 +18,7 @@ import {
   getSetShipmentStagingLaneSuccessToastDurationMs
 } from '@/lib/setShipmentStagingLaneFeedback';
 import { stageLaneAssignmentIntoShipment } from '@/lib/stageShipmentExecution';
+import { touchShipmentUpdatedAtByLoad } from '@/lib/touchShipmentUpdatedAt';
 
 import OCRCamera from './OCRCamera';
 
@@ -452,6 +453,8 @@ export default function ShipmentCard({
         p_original_lane: primaryPt.assigned_lane
       });
       if (stageError) throw stageError;
+
+      await touchShipmentUpdatedAtByLoad(rpcContext.puNumber, rpcContext.puDate);
 
       showToast(`✅ PT ${primaryPt.pt_number} staged`, 'success');
       onUpdate();
