@@ -7,6 +7,12 @@ import PTDetails from './PTDetails';
 import ActionToast from './ActionToast';
 import { isPTArchived } from '@/lib/utils';
 import { exportShipmentSummaryPdf, ShipmentPdfLoad } from '@/lib/shipmentPdf';
+import { setShipmentStagingLaneWithAutoLink } from '@/lib/setShipmentStagingLane';
+import {
+  buildSetShipmentStagingLaneErrorMessage,
+  buildSetShipmentStagingLaneSuccessMessage,
+  getSetShipmentStagingLaneSuccessToastDurationMs
+} from '@/lib/setShipmentStagingLaneFeedback';
 
 import OCRCamera from './OCRCamera';
 
@@ -930,115 +936,37 @@ export default function ShipmentCard({
     stagingLaneBusyRef.current = true;
     setStagingLaneBusy(true);
     try {
-      const occupancy = await getLaneOccupancy(laneNumber);
-      if (occupancy.foreignPtIds.length > 0) {
-        window.alert(
-          `Lane ${laneNumber} cannot be selected for this shipment.\n\n` +
-          `It has ${occupancy.foreignPtIds.length} PT(s) from other shipment(s).`
-        );
-        return;
-      }
-
-      await performSetStagingLane(laneNumber, occupancy.sameShipmentPtIds);
+      await performSetStagingLane(laneNumber);
     } catch (error) {
-      console.error('Error validating staging lane occupancy:', error);
-      showToast('Failed to validate lane occupancy', 'error');
+      console.error('Error setting staging lane:', error);
+      showToast(buildSetShipmentStagingLaneErrorMessage(error, laneNumber), 'error');
     } finally {
       setStagingLaneBusy(false);
       stagingLaneBusyRef.current = false;
     }
   }
 
-  async function performSetStagingLane(laneNumber: number, existingShipmentPTIdsInLane: number[]) {
+  async function performSetStagingLane(laneNumber: number) {
     try {
-      const targetLane = laneNumber.toString();
-      // Create/update shipment
-      const { data: shipmentData, error: shipmentError } = await supabase
-        .from('shipments')
-        .upsert({
-          pu_number: shipment.pu_number,
-          pu_date: shipment.pu_date,
-          carrier: shipment.carrier,
-          staging_lane: targetLane,
-          status: 'in_process',
-          updated_at: new Date().toISOString()
-        }, {
-          onConflict: 'pu_number,pu_date'
-        })
-        .select()
-        .single();
+      const result = await setShipmentStagingLaneWithAutoLink({
+        puNumber: shipment.pu_number,
+        puDate: shipment.pu_date,
+        targetLane: laneNumber,
+        carrier: shipment.carrier
+      });
 
-      if (shipmentError) throw shipmentError;
-
-      // Automatically stage any PTs that belong to this shipment AND are already in the target lane
-      const shipmentPTIds = shipment.pts.map(pt => pt.id);
-      const ptsToMarkAsStaged = new Set<number>();
-      const alreadyInTargetLane = new Set<number>();
-      const assignedLaneByPtId = new Map<number, string | null>(
-        shipment.pts.map((pt) => [pt.id, pt.assigned_lane || null])
+      showToast(
+        buildSetShipmentStagingLaneSuccessMessage({ result, puNumber: shipment.pu_number }),
+        'success',
+        getSetShipmentStagingLaneSuccessToastDurationMs(result)
       );
-
-      shipment.pts.forEach(pt => {
-        if (pt.assigned_lane === targetLane) {
-          alreadyInTargetLane.add(pt.id);
-          ptsToMarkAsStaged.add(pt.id);
-        }
-      });
-      existingShipmentPTIdsInLane.forEach(id => {
-        if (shipmentPTIds.includes(id)) {
-          alreadyInTargetLane.add(id);
-          ptsToMarkAsStaged.add(id);
-        }
-      });
-
-      const ptsArray = Array.from(ptsToMarkAsStaged);
-      const stageStatus = shipmentData.status === 'finalized' ? 'ready_to_ship' : 'staged';
-
-      if (ptsArray.length > 0) {
-        const { error: upsertShipmentPtsError } = await supabase
-          .from('shipment_pts')
-          .upsert(
-            ptsArray.map((ptId) => ({
-              shipment_id: shipmentData.id,
-              pt_id: ptId,
-              original_lane: assignedLaneByPtId.get(ptId),
-              removed_from_staging: false
-            })),
-            { onConflict: 'shipment_id,pt_id' }
-          );
-        if (upsertShipmentPtsError) throw upsertShipmentPtsError;
-
-        const { error: updatePickticketsError } = await supabase
-          .from('picktickets')
-          .update({ status: stageStatus, assigned_lane: targetLane })
-          .in('id', ptsArray);
-        if (updatePickticketsError) throw updatePickticketsError;
-
-        const representativeRows = buildRepresentativeRowsForPTIds(ptsArray);
-        await normalizeStagedPTLaneAssignmentsBatch(representativeRows, targetLane);
-      }
-
-      if (ptsArray.length > 0) {
-        const alreadyCount = alreadyInTargetLane.size;
-        if (alreadyCount > 0) {
-          showToast(
-            `Staging lane ${laneNumber} set. ${alreadyCount} PT(s) already in this lane were auto-linked to this load.`,
-            'success',
-            6500
-          );
-        } else {
-          showToast(`Staging lane ${laneNumber} set (${ptsArray.length} PTs swept into staging)`, 'success');
-        }
-      } else {
-        showToast(`Staging lane ${laneNumber} set`, 'success');
-      }
 
       setSelectingLane(false);
       setSelectedLaneInput('');
       onUpdate();
     } catch (error) {
       console.error('Error setting staging lane:', error);
-      showToast('Failed to set staging lane', 'error');
+      showToast(buildSetShipmentStagingLaneErrorMessage(error, laneNumber), 'error');
     }
   }
 

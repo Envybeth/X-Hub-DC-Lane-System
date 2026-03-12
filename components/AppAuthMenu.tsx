@@ -25,6 +25,7 @@ export default function AppAuthMenu() {
   const [notificationOpen, setNotificationOpen] = useState(false);
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [seenById, setSeenById] = useState<Record<string, true>>({});
+  const [modalOverlayActive, setModalOverlayActive] = useState(false);
   const mobileMenuRef = useRef<HTMLDivElement | null>(null);
   const notificationMenuRef = useRef<HTMLDivElement | null>(null);
   const notificationButtonRef = useRef<HTMLButtonElement | null>(null);
@@ -34,6 +35,58 @@ export default function AppAuthMenu() {
   useEffect(() => {
     notificationOpenRef.current = notificationOpen;
   }, [notificationOpen]);
+
+  useEffect(() => {
+    function detectModalOverlay() {
+      const overlays = Array.from(document.querySelectorAll<HTMLDivElement>('div.fixed.inset-0'));
+      const hasBlockingOverlay = overlays.some((element) => {
+        if (element.hasAttribute('data-auth-menu-ignore')) return false;
+        const className = element.className;
+        if (typeof className !== 'string') return false;
+        if (!className.includes('bg-black')) return false;
+        return (
+          className.includes('justify-center')
+          || className.includes('items-center')
+          || className.includes('items-start')
+          || className.includes('overflow-y-auto')
+        );
+      });
+      setModalOverlayActive(hasBlockingOverlay);
+    }
+
+    let rafId: number | null = null;
+    function scheduleDetect() {
+      if (rafId !== null) {
+        window.cancelAnimationFrame(rafId);
+      }
+      rafId = window.requestAnimationFrame(() => {
+        detectModalOverlay();
+        rafId = null;
+      });
+    }
+
+    detectModalOverlay();
+
+    const observer = new MutationObserver(() => {
+      scheduleDetect();
+    });
+    observer.observe(document.body, {
+      subtree: true,
+      childList: true,
+      attributes: true,
+      attributeFilter: ['class', 'style', 'open', 'aria-hidden']
+    });
+
+    window.addEventListener('resize', scheduleDetect);
+
+    return () => {
+      observer.disconnect();
+      window.removeEventListener('resize', scheduleDetect);
+      if (rafId !== null) {
+        window.cancelAnimationFrame(rafId);
+      }
+    };
+  }, [pathname]);
 
   useEffect(() => {
     if (!mobileMenuOpen && !notificationOpen) return;
@@ -123,7 +176,7 @@ export default function AppAuthMenu() {
     return () => unsubscribe();
   }, [isCreatorAdmin, subscribeScope]);
 
-  if (loading || !isAuthenticated || pathname === '/login') {
+  if (loading || !isAuthenticated || pathname === '/login' || modalOverlayActive) {
     return null;
   }
 
