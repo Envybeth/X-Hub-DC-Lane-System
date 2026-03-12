@@ -24,6 +24,8 @@ const SHIPMENTS_FALLBACK_DEGRADED_SYNC_MS = 12000;
 const PLANNER_SOURCE_LANE_SWITCH_PENALTY = 6.0;
 const PLANNER_STAGING_LANE_SWITCH_PENALTY = 3.0;
 const PLANNER_SOURCE_LANE_DISTANCE_WEIGHT = 0.15;
+const PLANNER_FETCH_MAX_STEPS = 2000;
+const PLANNER_FETCH_MAX_CANDIDATES = 4000;
 
 type ShipmentSnapshotMap = Record<string, Shipment>;
 type StaleSnapshotRow = {
@@ -157,6 +159,14 @@ function toTrimmedText(value: unknown): string {
   if (typeof value === 'string') return value.trim();
   if (value === null || value === undefined) return '';
   return String(value).trim();
+}
+
+function areStringArraysEqual(left: string[], right: string[]): boolean {
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) return false;
+  }
+  return true;
 }
 
 function sumUniqueCompiledPallets(pts: ShipmentPT[]): number {
@@ -360,6 +370,14 @@ function buildFilteredOptimizedPlannerQueue(rows: PlannerQueueRow[], selectedPuD
   return recomputePlannerQueueOrdering(filteredRows);
 }
 
+function limitPlannerQueueRows(rows: PlannerQueueRow[], maxSteps: number): PlannerQueueRow[] {
+  const boundedMaxSteps = Math.max(1, Math.min(200, Math.trunc(maxSteps) || 40));
+  return rows.slice(0, boundedMaxSteps).map((row, index) => ({
+    ...row,
+    step_no: index + 1
+  }));
+}
+
 function getDaysSince(timestamp?: string | null, fallbackDate?: string): number | null {
   const primaryDate = timestamp ? new Date(timestamp) : null;
   if (primaryDate && !Number.isNaN(primaryDate.getTime())) {
@@ -391,6 +409,7 @@ export default function ShipmentsPage() {
   const [plannerQueueRaw, setPlannerQueueRaw] = useState<PlannerQueueRow[]>([]);
   const [plannerQueue, setPlannerQueue] = useState<PlannerQueueRow[]>([]);
   const [plannerSelectedPuDates, setPlannerSelectedPuDates] = useState<string[]>([]);
+  const [plannerFilteredRowCount, setPlannerFilteredRowCount] = useState(0);
   const [plannerDateFilterOpen, setPlannerDateFilterOpen] = useState(false);
   const [plannerLoading, setPlannerLoading] = useState(false);
   const [plannerExecutingAssignmentId, setPlannerExecutingAssignmentId] = useState<number | null>(null);
@@ -566,8 +585,9 @@ export default function ShipmentsPage() {
       }
 
       const { data, error } = await supabase.rpc('plan_shipment_staging_sequence', {
-        p_max_steps: boundedMaxSteps,
-        p_include_finalized: plannerIncludeFinalized
+        p_max_steps: PLANNER_FETCH_MAX_STEPS,
+        p_include_finalized: plannerIncludeFinalized,
+        p_max_candidates: PLANNER_FETCH_MAX_CANDIDATES
       });
 
       if (error) {
@@ -581,7 +601,21 @@ export default function ShipmentsPage() {
         throw error;
       }
 
-      const typedRows = normalizePlannerQueueRows((data || []) as PlannerQueueRow[]);
+      const shipmentStatusByKey = new Map(
+        shipments
+          .map((shipment) => [buildPuLoadKey(shipment.pu_number, shipment.pu_date), shipment.status] as const)
+          .filter(([key]) => Boolean(key))
+      );
+
+      const typedRows = normalizePlannerQueueRows((data || []) as PlannerQueueRow[])
+        .filter((row) => {
+          if (row.pending_member_count <= 0) return false;
+          if (!plannerIncludeFinalized) {
+            const localStatus = shipmentStatusByKey.get(plannerRowShipmentKey(row));
+            if (localStatus === 'finalized') return false;
+          }
+          return true;
+        });
       const nextDateOptions = buildPlannerPuDateFilterOptions(typedRows);
       const allDateSelections = nextDateOptions.map((option) => option.puDate);
       const currentSelectedSet = new Set(plannerSelectedPuDates.map((value) => toTrimmedText(value)));
@@ -590,17 +624,25 @@ export default function ShipmentsPage() {
         : allDateSelections;
       plannerDateFilterInitializedRef.current = true;
       const filteredRows = buildFilteredOptimizedPlannerQueue(typedRows, nextSelectedDates);
+      const showingAllSelectedDates = nextSelectedDates.length < nextDateOptions.length;
+      const visibleRows = showingAllSelectedDates
+        ? limitPlannerQueueRows(filteredRows, PLANNER_FETCH_MAX_STEPS)
+        : limitPlannerQueueRows(filteredRows, boundedMaxSteps);
 
       setPlannerQueueRaw(typedRows);
       setPlannerSelectedPuDates(nextSelectedDates);
-      setPlannerQueue(filteredRows);
+      setPlannerFilteredRowCount(filteredRows.length);
+      setPlannerQueue(visibleRows);
       setPlannerQueueStale(false);
 
       if (!options?.silent) {
-        if (filteredRows.length === 0) {
+        if (visibleRows.length === 0) {
           setPlannerToast({ message: 'No stage candidates found right now.', type: 'info' });
         } else {
-          setPlannerToast({ message: `Planner queue built (${filteredRows.length} step${filteredRows.length === 1 ? '' : 's'})`, type: 'success' });
+          const filteredCountSuffix = filteredRows.length > visibleRows.length
+            ? ` (showing ${visibleRows.length} of ${filteredRows.length})`
+            : '';
+          setPlannerToast({ message: `Planner queue built (${visibleRows.length} step${visibleRows.length === 1 ? '' : 's'})${filteredCountSuffix}`, type: 'success' });
         }
       }
       return filteredRows;
@@ -634,9 +676,20 @@ export default function ShipmentsPage() {
         if (orderedDates.indexOf(puDate) !== index) return false;
         return selectedSet.has(puDate);
       });
-    setPlannerSelectedPuDates(orderedUniqueSelected);
-    setPlannerQueue(buildFilteredOptimizedPlannerQueue(sourceRows, orderedUniqueSelected));
-  }, [plannerQueueRaw]);
+    const boundedMaxSteps = Math.max(1, Math.min(200, Math.trunc(plannerMaxSteps) || 40));
+    const filteredRows = buildFilteredOptimizedPlannerQueue(sourceRows, orderedUniqueSelected);
+    const showingAllSelectedDates = orderedUniqueSelected.length < options.length;
+    const visibleRows = showingAllSelectedDates
+      ? limitPlannerQueueRows(filteredRows, PLANNER_FETCH_MAX_STEPS)
+      : limitPlannerQueueRows(filteredRows, boundedMaxSteps);
+    setPlannerSelectedPuDates((previous) => (
+      areStringArraysEqual(previous, orderedUniqueSelected)
+        ? previous
+        : orderedUniqueSelected
+    ));
+    setPlannerFilteredRowCount(filteredRows.length);
+    setPlannerQueue(visibleRows);
+  }, [plannerMaxSteps, plannerQueueRaw]);
 
   const togglePlannerPuDateFilter = useCallback((puDate: string) => {
     const normalizedDate = plannerPuDateFilterKey(puDate);
@@ -661,6 +714,11 @@ export default function ShipmentsPage() {
     }
     applyPlannerPuDateFilterSelection(plannerPuDateFilterOptions.map((option) => option.puDate));
   }, [applyPlannerPuDateFilterSelection, plannerAllDatesSelected, plannerPuDateFilterOptions]);
+
+  useEffect(() => {
+    if (!plannerDateFilterInitializedRef.current) return;
+    applyPlannerPuDateFilterSelection(plannerSelectedPuDates);
+  }, [applyPlannerPuDateFilterSelection, plannerMaxSteps, plannerSelectedPuDates]);
 
   async function openPlannerLanePreview(row: PlannerQueueRow) {
     const lane = toTrimmedText(row.staging_lane);
@@ -1941,6 +1999,7 @@ export default function ShipmentsPage() {
                     setPlannerQueueRaw([]);
                     setPlannerQueue([]);
                     setPlannerSelectedPuDates([]);
+                    setPlannerFilteredRowCount(0);
                     setPlannerQueueStale(false);
                   }}
                   disabled={plannerLoading || plannerExecutingAssignmentId !== null || plannerAssigningShipmentKey !== null || plannerScanningRow !== null || (plannerQueue.length === 0 && plannerQueueRaw.length === 0)}
@@ -2013,6 +2072,15 @@ export default function ShipmentsPage() {
               {plannerQueueStale && plannerQueue.length > 0 && (
                 <div className="bg-yellow-900/60 border border-yellow-600 text-yellow-200 px-3 py-2 rounded text-sm">
                   Queue may be stale after recent changes. Rebuild queue for best recommendations.
+                </div>
+              )}
+
+              {plannerFilteredRowCount > plannerQueue.length && (
+                <div className="bg-slate-900/70 border border-slate-600 text-slate-200 px-3 py-2 rounded text-xs">
+                  Showing {plannerQueue.length} of {plannerFilteredRowCount} pending rows.
+                  {plannerSelectedPuDates.length === plannerPuDateFilterOptions.length
+                    ? ' Increase Max Steps to see more.'
+                    : ' Date filtering is active; showing all matches for selected dates.'}
                 </div>
               )}
 
