@@ -8,7 +8,8 @@ const REALTIME_BROADCAST_NAME = 'site-realtime-sync-v1';
 const REALTIME_HEARTBEAT_MS = 2500;
 const REALTIME_LEADER_STALE_MS = 7500;
 const REALTIME_SIGNAL_STALE_MS = 12000;
-const REALTIME_SIGNAL_DISCONNECTED_MS = 30000;
+const REALTIME_SIGNAL_DISCONNECTED_MS = 90000;
+const REALTIME_LEADER_RECOVERY_RETRY_MS = 6000;
 
 type RealtimeScope = 'shipments' | 'lane-grid' | 'notifications';
 type RealtimeHealth = 'live' | 'reconnecting' | 'disconnected';
@@ -18,6 +19,7 @@ type RealtimeMessage =
     type: 'realtime_heartbeat';
     leaderTabId: string;
     leaderHealth: RealtimeHealth;
+    leaderStateSince: number;
     timestamp: number;
   }
   | {
@@ -45,11 +47,14 @@ function normalizeMessage(data: unknown): RealtimeMessage | null {
     const leaderHealth = candidate.leaderHealth === 'live' || candidate.leaderHealth === 'reconnecting' || candidate.leaderHealth === 'disconnected'
       ? candidate.leaderHealth
       : 'reconnecting';
+    const timestamp = typeof candidate.timestamp === 'number' ? candidate.timestamp : Date.now();
+    const leaderStateSince = typeof candidate.leaderStateSince === 'number' ? candidate.leaderStateSince : timestamp;
     return {
       type: 'realtime_heartbeat',
       leaderTabId: candidate.leaderTabId,
       leaderHealth,
-      timestamp: typeof candidate.timestamp === 'number' ? candidate.timestamp : Date.now()
+      leaderStateSince,
+      timestamp
     };
   }
   if (
@@ -207,12 +212,16 @@ export function RealtimeProvider({ children }: { children: React.ReactNode }) {
   const [channelRetryEpoch, setChannelRetryEpoch] = useState(0);
   const tabIdRef = useRef('');
   const leaderRef = useRef(false);
+  const healthRef = useRef<RealtimeHealth>(initialOnline ? 'reconnecting' : 'disconnected');
   const signalAtRef = useRef(0);
   const onlineRef = useRef(initialOnline);
   const leaderChannelHealthRef = useRef<RealtimeHealth>('reconnecting');
+  const leaderHealthSinceRef = useRef<number>(0);
   const observedLeaderHealthRef = useRef<RealtimeHealth>('reconnecting');
+  const observedLeaderHealthSinceRef = useRef<number>(0);
   const observedLeaderHeartbeatAtRef = useRef(0);
   const reconnectTimerRef = useRef<number | null>(null);
+  const lastLeaderRecoveryRetryAtRef = useRef(0);
   const broadcastRef = useRef<BroadcastChannel | null>(null);
   const listenersRef = useRef<Record<RealtimeScope, Set<ScopeListener>>>({
     shipments: new Set<ScopeListener>(),
@@ -224,7 +233,17 @@ export function RealtimeProvider({ children }: { children: React.ReactNode }) {
     signalAtRef.current = Date.now();
   }, []);
 
+  const setLeaderChannelHealth = useCallback((nextHealth: RealtimeHealth) => {
+    if (leaderHealthSinceRef.current <= 0) {
+      leaderHealthSinceRef.current = Date.now();
+    }
+    if (leaderChannelHealthRef.current === nextHealth) return;
+    leaderChannelHealthRef.current = nextHealth;
+    leaderHealthSinceRef.current = Date.now();
+  }, []);
+
   const recomputeHealth = useCallback(() => {
+    const now = Date.now();
     if (!onlineRef.current) {
       setHealth('disconnected');
       return;
@@ -235,11 +254,12 @@ export function RealtimeProvider({ children }: { children: React.ReactNode }) {
       return;
     }
 
-    const heartbeatAge = Date.now() - observedLeaderHeartbeatAtRef.current;
+    const heartbeatAge = now - observedLeaderHeartbeatAtRef.current;
     if (heartbeatAge > REALTIME_SIGNAL_DISCONNECTED_MS) {
       setHealth('disconnected');
       return;
     }
+
     if (heartbeatAge > REALTIME_SIGNAL_STALE_MS) {
       setHealth('reconnecting');
       return;
@@ -260,9 +280,29 @@ export function RealtimeProvider({ children }: { children: React.ReactNode }) {
     if (reconnectTimerRef.current !== null) return;
     reconnectTimerRef.current = window.setTimeout(() => {
       reconnectTimerRef.current = null;
+      try {
+        supabase.realtime.connect();
+      } catch (error) {
+        console.warn('Failed to trigger realtime socket reconnect', error);
+      }
       setChannelRetryEpoch((previous) => previous + 1);
     }, Math.max(500, delayMs));
   }, []);
+
+  const triggerLeaderRecovery = useCallback((force = false) => {
+    if (!leaderRef.current || !onlineRef.current) return;
+    const now = Date.now();
+    if (!force && (now - lastLeaderRecoveryRetryAtRef.current) < REALTIME_LEADER_RECOVERY_RETRY_MS) {
+      return;
+    }
+    lastLeaderRecoveryRetryAtRef.current = now;
+    setLeaderChannelHealth('reconnecting');
+    try {
+      supabase.realtime.connect();
+    } catch (error) {
+      console.warn('Failed to trigger realtime socket reconnect', error);
+    }
+  }, [setLeaderChannelHealth]);
 
   const notifyScopeListeners = useCallback((scope: RealtimeScope, payload: Record<string, unknown>) => {
     listenersRef.current[scope].forEach((listener) => {
@@ -307,6 +347,10 @@ export function RealtimeProvider({ children }: { children: React.ReactNode }) {
   }, [isLeader]);
 
   useEffect(() => {
+    healthRef.current = health;
+  }, [health]);
+
+  useEffect(() => {
     if (!tabIdRef.current) {
       tabIdRef.current = `site-rt-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     }
@@ -331,6 +375,7 @@ export function RealtimeProvider({ children }: { children: React.ReactNode }) {
       if (payload.type === 'realtime_heartbeat') {
         observedLeaderHeartbeatAtRef.current = Date.now();
         observedLeaderHealthRef.current = payload.leaderHealth;
+        observedLeaderHealthSinceRef.current = payload.leaderStateSince;
         recomputeHealth();
       } else if (payload.type === 'realtime_scope_event') {
         notifyScopeListeners(payload.scope, payload.payload);
@@ -362,11 +407,13 @@ export function RealtimeProvider({ children }: { children: React.ReactNode }) {
         markSignal();
         observedLeaderHeartbeatAtRef.current = now;
         observedLeaderHealthRef.current = leaderChannelHealthRef.current;
+        observedLeaderHealthSinceRef.current = leaderHealthSinceRef.current > 0 ? leaderHealthSinceRef.current : now;
         try {
           broadcast.postMessage({
             type: 'realtime_heartbeat',
             leaderTabId: tabIdRef.current,
             leaderHealth: leaderChannelHealthRef.current,
+            leaderStateSince: leaderHealthSinceRef.current > 0 ? leaderHealthSinceRef.current : now,
             timestamp: now
           } satisfies RealtimeMessage);
         } catch {
@@ -415,6 +462,11 @@ export function RealtimeProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     if (!isLeader) return;
+    try {
+      supabase.realtime.connect();
+    } catch (error) {
+      console.warn('Failed to open realtime socket for leader tab', error);
+    }
 
     const emitNotification = (message: string, timestamp?: string | null) => {
       const createdAt = safeIsoTimestamp(timestamp);
@@ -506,20 +558,32 @@ export function RealtimeProvider({ children }: { children: React.ReactNode }) {
         if (status === 'SUBSCRIBED') {
           clearReconnectTimer();
           markSignal();
-          leaderChannelHealthRef.current = 'live';
+          setLeaderChannelHealth('live');
           recomputeHealth();
           return;
         }
         if (status === 'TIMED_OUT' || status === 'CHANNEL_ERROR') {
-          leaderChannelHealthRef.current = 'reconnecting';
+          setLeaderChannelHealth('reconnecting');
           recomputeHealth();
-          scheduleChannelReconnect(1500);
+          try {
+            supabase.realtime.connect();
+          } catch (error) {
+            console.warn('Failed to trigger realtime socket reconnect', error);
+          }
+          scheduleChannelReconnect(2000);
           return;
         }
         if (status === 'CLOSED') {
-          leaderChannelHealthRef.current = 'disconnected';
+          setLeaderChannelHealth(onlineRef.current ? 'reconnecting' : 'disconnected');
           recomputeHealth();
-          scheduleChannelReconnect(1200);
+          if (onlineRef.current) {
+            try {
+              supabase.realtime.connect();
+            } catch (error) {
+              console.warn('Failed to trigger realtime socket reconnect', error);
+            }
+            scheduleChannelReconnect(2400);
+          }
         }
       });
 
@@ -527,16 +591,21 @@ export function RealtimeProvider({ children }: { children: React.ReactNode }) {
       clearReconnectTimer();
       void supabase.removeChannel(channel);
     };
-  }, [channelRetryEpoch, clearReconnectTimer, emitScopeEvent, isLeader, markSignal, recomputeHealth, scheduleChannelReconnect]);
+  }, [channelRetryEpoch, clearReconnectTimer, emitScopeEvent, isLeader, markSignal, recomputeHealth, scheduleChannelReconnect, setLeaderChannelHealth]);
 
   useEffect(() => {
+    const triggerActiveRecovery = (forceLeaderReconnect = false) => {
+      markSignal();
+      recomputeHealth();
+      if (forceLeaderReconnect || healthRef.current !== 'live') {
+        triggerLeaderRecovery(forceLeaderReconnect);
+      }
+    };
+
     const handleOnline = () => {
       onlineRef.current = true;
       setIsOnline(true);
-      recomputeHealth();
-      if (leaderRef.current) {
-        setChannelRetryEpoch((previous) => previous + 1);
-      }
+      triggerActiveRecovery(true);
     };
     const handleOffline = () => {
       onlineRef.current = false;
@@ -544,21 +613,37 @@ export function RealtimeProvider({ children }: { children: React.ReactNode }) {
       clearReconnectTimer();
       recomputeHealth();
     };
+    const handleWindowFocus = () => {
+      if (document.hidden) return;
+      triggerActiveRecovery(false);
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState !== 'visible') return;
+      triggerActiveRecovery(false);
+    };
 
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
+    window.addEventListener('focus', handleWindowFocus);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
 
     const timer = window.setInterval(() => {
       recomputeHealth();
+      if (document.hidden) return;
+      if (!onlineRef.current) return;
+      if (healthRef.current === 'live') return;
+      triggerLeaderRecovery(false);
     }, 2500);
 
     return () => {
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
+      window.removeEventListener('focus', handleWindowFocus);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
       window.clearInterval(timer);
       clearReconnectTimer();
     };
-  }, [clearReconnectTimer, recomputeHealth]);
+  }, [clearReconnectTimer, markSignal, recomputeHealth, triggerLeaderRecovery]);
 
   const value = useMemo<RealtimeContextValue>(() => ({
     isLeader,

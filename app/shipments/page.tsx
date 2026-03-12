@@ -1,9 +1,9 @@
 'use client';
 
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import Link from 'next/link';
 import { supabase } from '@/lib/supabase';
-import ShipmentCard, { Shipment } from '@/components/ShipmentCard';
+import ShipmentCard, { Shipment, ShipmentPT } from '@/components/ShipmentCard';
 import OCRCamera from '@/components/OCRCamera';
 import { isPTArchived } from '@/lib/utils';
 import { exportShipmentSummaryPdf, ShipmentPdfLoad } from '@/lib/shipmentPdf';
@@ -20,6 +20,10 @@ const SHIPPED_TO_ARCHIVED_DAYS = 7;
 const HIDE_ARCHIVED_AFTER_DAYS = 21;
 const OCR_TOGGLE_STORAGE_KEY = 'shipments_ocr_required';
 const SHIPMENTS_FALLBACK_FULL_SYNC_MS = 180000;
+const SHIPMENTS_FALLBACK_DEGRADED_SYNC_MS = 12000;
+const PLANNER_SOURCE_LANE_SWITCH_PENALTY = 6.0;
+const PLANNER_STAGING_LANE_SWITCH_PENALTY = 3.0;
+const PLANNER_SOURCE_LANE_DISTANCE_WEIGHT = 0.15;
 
 type ShipmentSnapshotMap = Record<string, Shipment>;
 type StaleSnapshotRow = {
@@ -88,12 +92,49 @@ type PlannerQueueRow = {
   cumulative_score: number;
 };
 
+type PlannerStagingLanePreviewEntry = {
+  ptId: number;
+  ptNumber: string;
+  poNumber: string;
+  customer: string;
+  status: string;
+  palletCount: number;
+  lane: string | null;
+  compiledPalletId: number | null;
+  orderRank: number;
+};
+
+type PlannerStagingLanePreviewData = {
+  row: PlannerQueueRow;
+  shipment: Shipment;
+  lane: string;
+  entries: PlannerStagingLanePreviewEntry[];
+  stagedPtCount: number;
+  stagedPalletCount: number;
+};
+
+type LaneAssignmentOrderRow = {
+  id: number;
+  pt_id: number;
+  compiled_pallet_id: number | null;
+  order_position: number | null;
+};
+
+type PlannerPuDateFilterOption = {
+  puDate: string;
+  shipmentCount: number;
+};
+
 function shipmentKey(shipment: Shipment) {
   return buildPuLoadKey(shipment.pu_number, shipment.pu_date) || `${shipment.pu_number}-${shipment.pu_date}`;
 }
 
 function cloneShipmentSnapshot(shipment: Shipment): Shipment {
   return JSON.parse(JSON.stringify(shipment)) as Shipment;
+}
+
+function compareTextNumeric(a: string, b: string): number {
+  return a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
 }
 
 function describeSupabaseError(error: { code?: string; message?: string; details?: string; hint?: string } | null) {
@@ -116,6 +157,22 @@ function toTrimmedText(value: unknown): string {
   if (typeof value === 'string') return value.trim();
   if (value === null || value === undefined) return '';
   return String(value).trim();
+}
+
+function sumUniqueCompiledPallets(pts: ShipmentPT[]): number {
+  const seenCompiledIds = new Set<number>();
+  let total = 0;
+
+  pts.forEach((pt) => {
+    const compiledId = Number(pt.compiled_pallet_id);
+    if (Number.isFinite(compiledId)) {
+      if (seenCompiledIds.has(compiledId)) return;
+      seenCompiledIds.add(compiledId);
+    }
+    total += Math.max(0, Number(pt.actual_pallet_count || 0));
+  });
+
+  return total;
 }
 
 function plannerRowHasStagingLane(row: PlannerQueueRow): boolean {
@@ -171,6 +228,137 @@ function normalizePlannerQueueRows(rows: PlannerQueueRow[]): PlannerQueueRow[] {
   }));
 }
 
+function parsePlannerLaneNumber(value: string | null | undefined): number | null {
+  const lane = toTrimmedText(value);
+  if (!/^[0-9]+$/.test(lane)) return null;
+  const parsed = Number(lane);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function plannerTransitionSortTuple(row: PlannerQueueRow, transitionScore: number): [number, number, number, number, string, number] {
+  return [
+    transitionScore,
+    toSafeNumber(row.base_score, 0),
+    toSafeNumber(row.pallets_in_front, 0),
+    toSafeNumber(row.days_until_pu, 0),
+    toTrimmedText(row.source_lane),
+    toSafeNumber(row.representative_pt_id, 0)
+  ];
+}
+
+function comparePlannerSortTuple(a: [number, number, number, number, string, number], b: [number, number, number, number, string, number]): number {
+  for (let index = 0; index < 4; index += 1) {
+    if (a[index] !== b[index]) return a[index] - b[index];
+  }
+  if (a[4] !== b[4]) return compareTextNumeric(a[4], b[4]);
+  return a[5] - b[5];
+}
+
+function computePlannerTransitionScore(candidate: PlannerQueueRow, previous: PlannerQueueRow | null): number {
+  const baseScore = toSafeNumber(candidate.base_score, 0);
+  if (!previous) return baseScore;
+
+  const sourcePenalty = toTrimmedText(candidate.source_lane) === toTrimmedText(previous.source_lane)
+    ? 0
+    : PLANNER_SOURCE_LANE_SWITCH_PENALTY;
+
+  const candidateStaging = toTrimmedText(candidate.staging_lane) || null;
+  const previousStaging = toTrimmedText(previous.staging_lane) || null;
+  const stagingPenalty = candidateStaging === previousStaging
+    ? 0
+    : PLANNER_STAGING_LANE_SWITCH_PENALTY;
+
+  const candidateSourceNum = parsePlannerLaneNumber(candidate.source_lane);
+  const previousSourceNum = parsePlannerLaneNumber(previous.source_lane);
+  const laneDistancePenalty = candidateSourceNum !== null && previousSourceNum !== null
+    ? Math.abs(candidateSourceNum - previousSourceNum) * PLANNER_SOURCE_LANE_DISTANCE_WEIGHT
+    : 0;
+
+  return baseScore + sourcePenalty + stagingPenalty + laneDistancePenalty;
+}
+
+function recomputePlannerQueueOrdering(rows: PlannerQueueRow[]): PlannerQueueRow[] {
+  if (rows.length === 0) return [];
+
+  const remaining = [...rows];
+  const ordered: PlannerQueueRow[] = [];
+  let previous: PlannerQueueRow | null = null;
+  let cumulative = 0;
+
+  while (remaining.length > 0) {
+    let bestIndex = 0;
+    let bestTransitionScore = computePlannerTransitionScore(remaining[0], previous);
+    let bestTuple = plannerTransitionSortTuple(remaining[0], bestTransitionScore);
+
+    for (let index = 1; index < remaining.length; index += 1) {
+      const candidate = remaining[index];
+      const candidateTransitionScore = computePlannerTransitionScore(candidate, previous);
+      const candidateTuple = plannerTransitionSortTuple(candidate, candidateTransitionScore);
+      if (comparePlannerSortTuple(candidateTuple, bestTuple) < 0) {
+        bestIndex = index;
+        bestTransitionScore = candidateTransitionScore;
+        bestTuple = candidateTuple;
+      }
+    }
+
+    const nextRow = remaining.splice(bestIndex, 1)[0];
+    cumulative += bestTransitionScore;
+    ordered.push({
+      ...nextRow,
+      step_no: ordered.length + 1,
+      transition_score: bestTransitionScore,
+      cumulative_score: cumulative
+    });
+    previous = nextRow;
+  }
+
+  return ordered;
+}
+
+function plannerPuDateFilterKey(value: unknown): string {
+  const normalized = toTrimmedText(value);
+  return normalized || 'N/A';
+}
+
+function buildPlannerPuDateFilterOptions(rows: PlannerQueueRow[]): PlannerPuDateFilterOption[] {
+  const shipmentKeysByDate = new Map<string, Set<string>>();
+
+  rows.forEach((row) => {
+    const puDate = plannerPuDateFilterKey(row.pu_date);
+    const existingSet = shipmentKeysByDate.get(puDate) || new Set<string>();
+    existingSet.add(`${toSafeNumber(row.shipment_id, 0)}|${toTrimmedText(row.pu_number)}|${toTrimmedText(row.pu_date)}`);
+    shipmentKeysByDate.set(puDate, existingSet);
+  });
+
+  const sortKey = (value: string): number => {
+    const normalized = toTrimmedText(value);
+    if (!normalized || normalized === 'N/A') return Number.POSITIVE_INFINITY;
+    const isoCandidate = /^[0-9]{4}-[0-9]{2}-[0-9]{2}/.test(normalized) ? normalized.slice(0, 10) : normalized;
+    const parsedMs = Date.parse(isoCandidate);
+    return Number.isFinite(parsedMs) ? parsedMs : Number.POSITIVE_INFINITY;
+  };
+
+  return Array.from(shipmentKeysByDate.entries())
+    .map(([puDate, shipmentKeys]) => ({
+      puDate,
+      shipmentCount: shipmentKeys.size
+    }))
+    .sort((a, b) => {
+      const aSort = sortKey(a.puDate);
+      const bSort = sortKey(b.puDate);
+      if (aSort !== bSort) return aSort - bSort;
+      return compareTextNumeric(a.puDate, b.puDate);
+    });
+}
+
+function buildFilteredOptimizedPlannerQueue(rows: PlannerQueueRow[], selectedPuDates: string[]): PlannerQueueRow[] {
+  if (rows.length === 0) return [];
+  const selectedSet = new Set(selectedPuDates.map((value) => plannerPuDateFilterKey(value)).filter(Boolean));
+  if (selectedSet.size === 0) return [];
+  const filteredRows = rows.filter((row) => selectedSet.has(plannerPuDateFilterKey(row.pu_date)));
+  return recomputePlannerQueueOrdering(filteredRows);
+}
+
 function getDaysSince(timestamp?: string | null, fallbackDate?: string): number | null {
   const primaryDate = timestamp ? new Date(timestamp) : null;
   if (primaryDate && !Number.isNaN(primaryDate.getTime())) {
@@ -199,7 +387,10 @@ export default function ShipmentsPage() {
   const [requireOCRForStaging, setRequireOCRForStaging] = useState(true);
   const [verifyingOCRTogglePassword, setVerifyingOCRTogglePassword] = useState(false);
   const [ocrToggleToast, setOcrToggleToast] = useState('');
+  const [plannerQueueRaw, setPlannerQueueRaw] = useState<PlannerQueueRow[]>([]);
   const [plannerQueue, setPlannerQueue] = useState<PlannerQueueRow[]>([]);
+  const [plannerSelectedPuDates, setPlannerSelectedPuDates] = useState<string[]>([]);
+  const [plannerDateFilterOpen, setPlannerDateFilterOpen] = useState(false);
   const [plannerLoading, setPlannerLoading] = useState(false);
   const [plannerExecutingAssignmentId, setPlannerExecutingAssignmentId] = useState<number | null>(null);
   const [plannerAssigningShipmentKey, setPlannerAssigningShipmentKey] = useState<string | null>(null);
@@ -209,6 +400,9 @@ export default function ShipmentsPage() {
   const [plannerIncludeFinalized, setPlannerIncludeFinalized] = useState(false);
   const [plannerModalOpen, setPlannerModalOpen] = useState(false);
   const [plannerScanningRow, setPlannerScanningRow] = useState<PlannerQueueRow | null>(null);
+  const [plannerLanePreviewData, setPlannerLanePreviewData] = useState<PlannerStagingLanePreviewData | null>(null);
+  const [plannerLanePreviewLoading, setPlannerLanePreviewLoading] = useState(false);
+  const [plannerLanePreviewError, setPlannerLanePreviewError] = useState<string | null>(null);
   const [mobileMoreOptionsOpen, setMobileMoreOptionsOpen] = useState(false);
   const shipmentRefreshTimerRef = useRef<number | null>(null);
   const shipmentFetchInFlightRef = useRef(false);
@@ -218,10 +412,16 @@ export default function ShipmentsPage() {
   const staleRefreshRequestedRef = useRef(false);
   const pendingVisibleRefreshRef = useRef(false);
   const pageHiddenAtRef = useRef<number | null>(null);
+  const plannerDateFilterInitializedRef = useRef(false);
   const focusedShipmentKeyRef = useRef<string | null>(null);
   const plannerQueueContainerRef = useRef<HTMLDivElement | null>(null);
   const fetchShipmentsRef = useRef<() => Promise<void>>(async () => { });
   const fetchStaleSnapshotsRef = useRef<() => Promise<void>>(async () => { });
+
+  const plannerPuDateFilterOptions = useMemo(
+    () => buildPlannerPuDateFilterOptions(plannerQueueRaw),
+    [plannerQueueRaw]
+  );
 
   useEffect(() => {
     void fetchShipmentsRef.current();
@@ -251,28 +451,32 @@ export default function ShipmentsPage() {
 
   useEffect(() => {
     if (!plannerModalOpen || isGuest || plannerLoading) return;
-    if (plannerQueue.length === 0 || plannerQueueStale) {
+    if (!plannerDateFilterInitializedRef.current || plannerQueueStale) {
       void buildPlannerQueue({ silent: true });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [plannerModalOpen, isGuest, plannerLoading, plannerQueue.length, plannerQueueStale]);
+  }, [plannerModalOpen, isGuest, plannerLoading, plannerQueueStale]);
 
   useEffect(() => {
     if (plannerModalOpen) return;
     setPlannerScanningRow(null);
+    setPlannerLanePreviewData(null);
+    setPlannerLanePreviewLoading(false);
+    setPlannerLanePreviewError(null);
+    setPlannerDateFilterOpen(false);
   }, [plannerModalOpen]);
 
   const refreshShipmentView = useCallback((shipmentKeyToFocus: string, includeStale = false) => {
     focusedShipmentKeyRef.current = shipmentKeyToFocus;
     setExpandedShipmentKey(shipmentKeyToFocus);
-    if (plannerModalOpen || plannerQueue.length > 0) {
+    if (plannerModalOpen || plannerQueueRaw.length > 0) {
       setPlannerQueueStale(true);
     }
     void fetchShipmentsRef.current();
     if (includeStale) {
       void fetchStaleSnapshotsRef.current();
     }
-  }, [plannerModalOpen, plannerQueue.length]);
+  }, [plannerModalOpen, plannerQueueRaw.length]);
 
   const ensureHistoricalShipmentsLoaded = useCallback(async () => {
     if (includeHistoricalShipmentsRef.current || historicalShipmentsLoading) return;
@@ -377,17 +581,28 @@ export default function ShipmentsPage() {
       }
 
       const typedRows = normalizePlannerQueueRows((data || []) as PlannerQueueRow[]);
-      setPlannerQueue(typedRows);
+      const nextDateOptions = buildPlannerPuDateFilterOptions(typedRows);
+      const allDateSelections = nextDateOptions.map((option) => option.puDate);
+      const currentSelectedSet = new Set(plannerSelectedPuDates.map((value) => toTrimmedText(value)));
+      const nextSelectedDates = plannerDateFilterInitializedRef.current
+        ? allDateSelections.filter((date) => currentSelectedSet.has(date))
+        : allDateSelections;
+      plannerDateFilterInitializedRef.current = true;
+      const filteredRows = buildFilteredOptimizedPlannerQueue(typedRows, nextSelectedDates);
+
+      setPlannerQueueRaw(typedRows);
+      setPlannerSelectedPuDates(nextSelectedDates);
+      setPlannerQueue(filteredRows);
       setPlannerQueueStale(false);
 
       if (!options?.silent) {
-        if (typedRows.length === 0) {
+        if (filteredRows.length === 0) {
           setPlannerToast({ message: 'No stage candidates found right now.', type: 'info' });
         } else {
-          setPlannerToast({ message: `Planner queue built (${typedRows.length} step${typedRows.length === 1 ? '' : 's'})`, type: 'success' });
+          setPlannerToast({ message: `Planner queue built (${filteredRows.length} step${filteredRows.length === 1 ? '' : 's'})`, type: 'success' });
         }
       }
-      return typedRows;
+      return filteredRows;
     } catch (error) {
       console.error('Failed to build planner queue:', error);
       setPlannerToast({ message: 'Failed to build planner queue', type: 'error' });
@@ -400,6 +615,158 @@ export default function ShipmentsPage() {
   function scrollPlannerQueueToTop(behavior: ScrollBehavior = 'auto') {
     if (!plannerQueueContainerRef.current) return;
     plannerQueueContainerRef.current.scrollTo({ top: 0, behavior });
+  }
+
+  function closePlannerLanePreview() {
+    setPlannerLanePreviewData(null);
+    setPlannerLanePreviewLoading(false);
+    setPlannerLanePreviewError(null);
+  }
+
+  const applyPlannerPuDateFilterSelection = useCallback((selectedDates: string[], rowsOverride?: PlannerQueueRow[]) => {
+    const sourceRows = rowsOverride || plannerQueueRaw;
+    const options = buildPlannerPuDateFilterOptions(sourceRows);
+    const selectedSet = new Set(selectedDates.map((value) => plannerPuDateFilterKey(value)));
+    const orderedUniqueSelected = options
+      .map((option) => option.puDate)
+      .filter((puDate, index, orderedDates) => {
+        if (orderedDates.indexOf(puDate) !== index) return false;
+        return selectedSet.has(puDate);
+      });
+    setPlannerSelectedPuDates(orderedUniqueSelected);
+    setPlannerQueue(buildFilteredOptimizedPlannerQueue(sourceRows, orderedUniqueSelected));
+  }, [plannerQueueRaw]);
+
+  const togglePlannerPuDateFilter = useCallback((puDate: string) => {
+    const normalizedDate = plannerPuDateFilterKey(puDate);
+    if (!normalizedDate) return;
+    const selectedSet = new Set(plannerSelectedPuDates.map((value) => plannerPuDateFilterKey(value)));
+    if (selectedSet.has(normalizedDate)) {
+      selectedSet.delete(normalizedDate);
+    } else {
+      selectedSet.add(normalizedDate);
+    }
+    applyPlannerPuDateFilterSelection(Array.from(selectedSet));
+  }, [applyPlannerPuDateFilterSelection, plannerSelectedPuDates]);
+
+  const plannerAllDatesSelected = plannerPuDateFilterOptions.length > 0
+    && plannerPuDateFilterOptions.every((option) => plannerSelectedPuDates.includes(option.puDate));
+
+  const togglePlannerSelectAllDates = useCallback(() => {
+    if (plannerPuDateFilterOptions.length === 0) return;
+    if (plannerAllDatesSelected) {
+      applyPlannerPuDateFilterSelection([]);
+      return;
+    }
+    applyPlannerPuDateFilterSelection(plannerPuDateFilterOptions.map((option) => option.puDate));
+  }, [applyPlannerPuDateFilterSelection, plannerAllDatesSelected, plannerPuDateFilterOptions]);
+
+  async function openPlannerLanePreview(row: PlannerQueueRow) {
+    const lane = toTrimmedText(row.staging_lane);
+    if (!lane) return;
+
+    const shipmentKeyValue = plannerRowShipmentKey(row);
+    const shipment = shipments.find((candidate) => shipmentKey(candidate) === shipmentKeyValue) || null;
+    if (!shipment) {
+      setPlannerToast({
+        message: `Shipment ${row.pu_number} (${row.pu_date}) is not loaded in the current view.`,
+        type: 'error'
+      });
+      return;
+    }
+
+    setPlannerLanePreviewData({
+      row,
+      shipment,
+      lane,
+      entries: [],
+      stagedPtCount: 0,
+      stagedPalletCount: 0
+    });
+    setPlannerLanePreviewError(null);
+    setPlannerLanePreviewLoading(true);
+
+    try {
+      const stagedPts = shipment.pts.filter((pt) => (
+        pt.moved_to_staging
+        && !pt.removed_from_staging
+        && toTrimmedText(pt.assigned_lane) === lane
+      ));
+
+      const shipmentPtIds = shipment.pts.map((pt) => Number(pt.id)).filter((id) => Number.isFinite(id) && id > 0);
+      const rankByLaneUnit = new Map<string, number>();
+
+      if (shipmentPtIds.length > 0) {
+        const { data: orderRows, error: orderError } = await supabase
+          .from('lane_assignments')
+          .select('id, pt_id, compiled_pallet_id, order_position')
+          .eq('lane_number', lane)
+          .in('pt_id', shipmentPtIds);
+
+        if (orderError) throw orderError;
+
+        const sortedOrderRows = ((orderRows || []) as LaneAssignmentOrderRow[])
+          .sort((a, b) => {
+            const aOrder = Number.isFinite(Number(a.order_position)) ? Number(a.order_position) : Number.MAX_SAFE_INTEGER;
+            const bOrder = Number.isFinite(Number(b.order_position)) ? Number(b.order_position) : Number.MAX_SAFE_INTEGER;
+            if (aOrder !== bOrder) return aOrder - bOrder;
+            return Number(a.id || 0) - Number(b.id || 0);
+          });
+
+        sortedOrderRows.forEach((orderRow, index) => {
+          const compiledId = Number(orderRow.compiled_pallet_id);
+          const laneUnitKey = Number.isFinite(compiledId) && compiledId > 0
+            ? `cp:${compiledId}`
+            : `pt:${Number(orderRow.pt_id)}`;
+          if (!rankByLaneUnit.has(laneUnitKey)) {
+            rankByLaneUnit.set(laneUnitKey, index + 1);
+          }
+        });
+      }
+
+      const entries: PlannerStagingLanePreviewEntry[] = stagedPts
+        .map((pt) => {
+          const compiledId = Number(pt.compiled_pallet_id);
+          const laneUnitKey = Number.isFinite(compiledId) && compiledId > 0
+            ? `cp:${compiledId}`
+            : `pt:${Number(pt.id)}`;
+          const laneUnitRank = rankByLaneUnit.get(laneUnitKey);
+
+          return {
+            ptId: Number(pt.id),
+            ptNumber: toTrimmedText(pt.pt_number) || String(pt.id),
+            poNumber: toTrimmedText(pt.po_number) || '-',
+            customer: toTrimmedText(pt.customer) || '-',
+            status: toTrimmedText(pt.status) || '-',
+            palletCount: Math.max(0, Number(pt.actual_pallet_count || 0)),
+            lane: toTrimmedText(pt.assigned_lane) || null,
+            compiledPalletId: Number.isFinite(compiledId) && compiledId > 0 ? compiledId : null,
+            orderRank: Number.isFinite(Number(laneUnitRank)) ? Number(laneUnitRank) : Number.MAX_SAFE_INTEGER
+          };
+        })
+        .sort((a, b) => {
+          if (a.orderRank !== b.orderRank) return a.orderRank - b.orderRank;
+          const aCompiled = Number(a.compiledPalletId || 0);
+          const bCompiled = Number(b.compiledPalletId || 0);
+          if (aCompiled !== bCompiled) return aCompiled - bCompiled;
+          return compareTextNumeric(a.ptNumber, b.ptNumber);
+        });
+
+      setPlannerLanePreviewData({
+        row,
+        shipment,
+        lane,
+        entries,
+        stagedPtCount: entries.length,
+        stagedPalletCount: sumUniqueCompiledPallets(stagedPts)
+      });
+      setPlannerLanePreviewError(null);
+    } catch (error) {
+      console.error('Failed to load staging lane preview:', error);
+      setPlannerLanePreviewError(`Failed to load lane preview: ${describeUnknownStageError(error)}`);
+    } finally {
+      setPlannerLanePreviewLoading(false);
+    }
   }
 
   async function executePlannerStageViaAssignmentFlow(row: PlannerQueueRow) {
@@ -596,7 +963,7 @@ export default function ShipmentsPage() {
     if (includeStale) {
       staleRefreshRequestedRef.current = true;
     }
-    if (plannerModalOpen || plannerQueue.length > 0) {
+    if (plannerModalOpen || plannerQueueRaw.length > 0) {
       setPlannerQueueStale(true);
     }
     if (document.hidden) {
@@ -614,7 +981,7 @@ export default function ShipmentsPage() {
       }
       shipmentRefreshTimerRef.current = null;
     }, 450);
-  }, [plannerModalOpen, plannerQueue.length, staleSnapshotStoreAvailable]);
+  }, [plannerModalOpen, plannerQueueRaw.length, staleSnapshotStoreAvailable]);
 
   useEffect(() => {
     const handleVisibilityChange = () => {
@@ -662,7 +1029,7 @@ export default function ShipmentsPage() {
   }, [scheduleShipmentRefresh, subscribeScope]);
 
   useEffect(() => {
-    if (realtimeHealth !== 'disconnected') return;
+    if (realtimeHealth === 'live') return;
     if (document.hidden) return;
     void fetchShipmentsRef.current();
     if (staleSnapshotStoreAvailable) {
@@ -671,16 +1038,22 @@ export default function ShipmentsPage() {
   }, [realtimeHealth, staleSnapshotStoreAvailable]);
 
   useEffect(() => {
+    const intervalMs = realtimeHealth === 'live'
+      ? SHIPMENTS_FALLBACK_FULL_SYNC_MS
+      : SHIPMENTS_FALLBACK_DEGRADED_SYNC_MS;
     const timer = window.setInterval(() => {
       if (document.hidden) return;
       void fetchShipmentsRef.current();
       if (staleSnapshotStoreAvailable) {
         void fetchStaleSnapshotsRef.current();
       }
-    }, SHIPMENTS_FALLBACK_FULL_SYNC_MS);
+      if (realtimeHealth !== 'live' && (plannerModalOpen || plannerQueueRaw.length > 0)) {
+        setPlannerQueueStale(true);
+      }
+    }, intervalMs);
 
     return () => window.clearInterval(timer);
-  }, [staleSnapshotStoreAvailable]);
+  }, [plannerModalOpen, plannerQueueRaw.length, realtimeHealth, staleSnapshotStoreAvailable]);
 
   async function fetchStaleSnapshotsFromSupabase() {
     const { data, error } = await supabase
@@ -1563,22 +1936,76 @@ export default function ShipmentsPage() {
                 </button>
                 <button
                   onClick={() => {
+                    plannerDateFilterInitializedRef.current = false;
+                    setPlannerQueueRaw([]);
                     setPlannerQueue([]);
+                    setPlannerSelectedPuDates([]);
                     setPlannerQueueStale(false);
                   }}
-                  disabled={plannerLoading || plannerExecutingAssignmentId !== null || plannerAssigningShipmentKey !== null || plannerScanningRow !== null || plannerQueue.length === 0}
+                  disabled={plannerLoading || plannerExecutingAssignmentId !== null || plannerAssigningShipmentKey !== null || plannerScanningRow !== null || (plannerQueue.length === 0 && plannerQueueRaw.length === 0)}
                   className="bg-slate-700 hover:bg-slate-600 disabled:bg-gray-700 px-4 py-2 rounded-lg font-semibold text-sm"
                 >
                   Clear
                 </button>
               </div>
 
+              {plannerPuDateFilterOptions.length > 0 && (
+                <div className="w-full rounded-lg border border-slate-700 bg-slate-950/70 p-2.5 md:p-3">
+                  <button
+                    type="button"
+                    onClick={() => setPlannerDateFilterOpen((prev) => !prev)}
+                    className="w-full flex items-center justify-between gap-2 text-left"
+                    aria-expanded={plannerDateFilterOpen}
+                    aria-label="Toggle PU date filter"
+                  >
+                    <div className="text-[11px] md:text-xs text-slate-300">
+                      PU Date Filter ({plannerSelectedPuDates.length}/{plannerPuDateFilterOptions.length} selected)
+                    </div>
+                    <span className="text-[11px] md:text-xs text-slate-300 font-semibold">
+                      {plannerDateFilterOpen ? 'Hide ▲' : 'Show ▼'}
+                    </span>
+                  </button>
+                  {plannerDateFilterOpen && (
+                    <div className="mt-2">
+                      <div className="flex items-center justify-end mb-2">
+                        <button
+                          onClick={togglePlannerSelectAllDates}
+                          disabled={plannerLoading || plannerExecutingAssignmentId !== null || plannerAssigningShipmentKey !== null || plannerScanningRow !== null}
+                          className="bg-slate-700 hover:bg-slate-600 disabled:bg-gray-700 px-2.5 py-1 rounded text-[11px] md:text-xs font-semibold"
+                        >
+                          {plannerAllDatesSelected ? 'Uncheck All' : 'Check All'}
+                        </button>
+                      </div>
+                      <div className="max-h-28 overflow-y-auto pr-1">
+                        <div className="flex flex-wrap gap-2">
+                          {plannerPuDateFilterOptions.map((option) => (
+                            <label
+                              key={option.puDate}
+                              className="inline-flex items-center gap-1.5 rounded border border-slate-700 bg-slate-900/80 px-2 py-1 text-[11px] md:text-xs text-slate-200"
+                            >
+                              <input
+                                type="checkbox"
+                                checked={plannerSelectedPuDates.includes(option.puDate)}
+                                onChange={() => togglePlannerPuDateFilter(option.puDate)}
+                                className="h-3.5 w-3.5"
+                              />
+                              <span className="whitespace-nowrap">{option.puDate}</span>
+                              <span className="text-slate-400">({option.shipmentCount})</span>
+                            </label>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
               {realtimeHealth !== 'live' && (
                 <div className={`border px-3 py-2 rounded text-sm ${realtimeHealth === 'disconnected'
                   ? 'bg-red-900/60 border-red-500 text-red-200'
                   : 'bg-amber-900/60 border-amber-500 text-amber-200'
                   }`}>
-                  Realtime status is {realtimeHealth}. Queue may be stale. The optimizer will auto-refresh when you return to this tab, and retries once on transient stage errors.
+                  Realtime status is {realtimeHealth}. Queue may be stale. Auto-refresh is running in degraded mode, and stage retries once on transient errors.
                 </div>
               )}
 
@@ -1610,12 +2037,22 @@ export default function ShipmentsPage() {
                                 <div className="text-[11px] text-slate-400">Source</div>
                                 <div className="text-base font-bold text-cyan-200">{row.source_lane ? `L${row.source_lane}` : 'N/A'}</div>
                               </div>
-                              <div className="rounded border border-slate-700 bg-slate-950 p-2 text-center">
-                                <div className="text-[11px] text-slate-400">Stage</div>
-                                <div className={`text-base font-bold ${rowHasStagingLane ? 'text-green-300' : 'text-amber-300'}`}>
-                                  {rowHasStagingLane ? `L${row.staging_lane}` : 'Not Set'}
+                              {rowHasStagingLane ? (
+                                <button
+                                  type="button"
+                                  onClick={() => void openPlannerLanePreview(row)}
+                                  className="rounded border border-slate-700 bg-slate-950 p-2 text-center hover:border-cyan-400"
+                                  title="View staged PTs in this staging lane"
+                                >
+                                  <div className="text-[11px] text-slate-400">Stage</div>
+                                  <div className="text-base font-bold text-green-300">L{row.staging_lane}</div>
+                                </button>
+                              ) : (
+                                <div className="rounded border border-slate-700 bg-slate-950 p-2 text-center">
+                                  <div className="text-[11px] text-slate-400">Stage</div>
+                                  <div className="text-base font-bold text-amber-300">Not Set</div>
                                 </div>
-                              </div>
+                              )}
                               <div className="rounded border border-slate-700 bg-slate-950 p-2 text-center">
                                 <div className="text-[11px] text-slate-400">Pallets</div>
                                 <div className="text-base font-bold text-white">{row.pallets_to_move}p</div>
@@ -1698,8 +2135,19 @@ export default function ShipmentsPage() {
                               <td className="py-2 px-3 whitespace-nowrap">{row.representative_pt_number || String(row.representative_pt_id || 'N/A')}</td>
                               <td className="py-2 px-3 whitespace-nowrap">{row.representative_po_number || 'N/A'}</td>
                               <td className="py-2 px-3 whitespace-nowrap">{row.source_lane ? `L${row.source_lane}` : 'N/A'}</td>
-                              <td className={`py-2 px-3 whitespace-nowrap font-semibold ${rowHasStagingLane ? 'text-green-300' : 'text-amber-300'}`}>
-                                {rowHasStagingLane ? `L${row.staging_lane}` : 'Not Set'}
+                              <td className="py-2 px-3 whitespace-nowrap">
+                                {rowHasStagingLane ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => void openPlannerLanePreview(row)}
+                                    className="font-semibold text-green-300 hover:text-cyan-200 hover:underline"
+                                    title="View staged PTs in this staging lane"
+                                  >
+                                    L{row.staging_lane}
+                                  </button>
+                                ) : (
+                                  <span className="font-semibold text-amber-300">Not Set</span>
+                                )}
                               </td>
                               <td className="py-2 px-3 whitespace-nowrap">{row.pallets_to_move}p</td>
                               <td className="py-2 px-3 whitespace-nowrap">{row.pallets_in_front}p</td>
@@ -1735,6 +2183,90 @@ export default function ShipmentsPage() {
                   <div className="p-4 text-sm text-slate-300">Build queue to see optimized staging rows.</div>
                 )}
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {plannerLanePreviewData && (
+        <div
+          className="fixed inset-0 z-[110] bg-black/80 p-2 md:p-6 overflow-y-auto"
+          onClick={(event) => {
+            if (event.target === event.currentTarget) {
+              closePlannerLanePreview();
+            }
+          }}
+        >
+          <div className="mx-auto w-full max-w-5xl bg-slate-950 border border-slate-600 rounded-xl shadow-2xl">
+            <div className="flex items-start justify-between gap-2 p-3 md:p-4 border-b border-slate-700">
+              <div>
+                <h3 className="text-lg md:text-2xl font-bold text-cyan-200">Staging Lane Rear View</h3>
+                <p className="text-xs md:text-sm text-slate-300 mt-1">
+                  PU {plannerLanePreviewData.row.pu_number || 'N/A'} | {plannerLanePreviewData.row.pu_date || 'N/A'} | Carrier {plannerLanePreviewData.shipment.carrier || 'N/A'} | Stage L{plannerLanePreviewData.lane}
+                </p>
+              </div>
+              <button
+                onClick={closePlannerLanePreview}
+                className="text-3xl leading-none text-slate-200 hover:text-red-400 px-2"
+                aria-label="Close lane rear view"
+              >
+                &times;
+              </button>
+            </div>
+
+            <div className="p-2 md:p-4 space-y-2">
+              <div className="text-[11px] md:text-xs text-slate-300">
+                Staged PTs: <span className="font-semibold text-white">{plannerLanePreviewData.stagedPtCount}</span>
+                {' '}| Unique pallets: <span className="font-semibold text-white">{plannerLanePreviewData.stagedPalletCount}</span>
+                {' '}| Move type: <span className="font-semibold text-white">{plannerLanePreviewData.row.move_type === 'compiled_group' ? 'compiled' : 'single'}</span>
+              </div>
+
+              {plannerLanePreviewLoading ? (
+                <div className="py-8 text-sm text-slate-300 animate-pulse">Loading staged PT breakdown...</div>
+              ) : plannerLanePreviewError ? (
+                <div className="border border-red-500 bg-red-900/40 text-red-200 rounded px-3 py-2 text-sm">
+                  {plannerLanePreviewError}
+                </div>
+              ) : plannerLanePreviewData.entries.length === 0 ? (
+                <div className="border border-slate-700 bg-slate-900 text-slate-300 rounded px-3 py-4 text-sm">
+                  No staged PTs currently found in lane L{plannerLanePreviewData.lane} for this load.
+                </div>
+              ) : (
+                <div className="border border-slate-700 rounded-lg overflow-hidden">
+                  <div className="overflow-hidden">
+                    <table className="w-full table-fixed text-[10px] md:text-xs">
+                      <thead className="bg-slate-950 text-slate-300 border-b border-slate-700">
+                        <tr className="[&>th]:py-1 [&>th]:px-1.5 md:[&>th]:px-2 [&>th]:font-semibold [&>th]:text-center [&>th]:align-middle">
+                          <th className="w-6 md:w-10">#</th>
+                          <th className="w-16 md:w-24">PT</th>
+                          <th className="w-16 md:w-24">PO</th>
+                          <th className="w-24 md:w-auto">Cust</th>
+                          <th className="w-16 md:w-24">Status</th>
+                          <th className="w-14 md:w-20">Lane</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {plannerLanePreviewData.entries.map((entry, index) => (
+                          <tr
+                            key={`${entry.ptId}-${index}`}
+                            className="border-b border-slate-800 bg-slate-900/70 [&>td]:py-1 [&>td]:px-1.5 md:[&>td]:px-2 [&>td]:text-center [&>td]:align-middle"
+                          >
+                            <td className="text-slate-300">{index + 1}</td>
+                            <td className="font-semibold text-white truncate">{entry.ptNumber}</td>
+                            <td className="truncate">{entry.poNumber}</td>
+                            <td className="truncate">{entry.customer}</td>
+                            <td className="truncate">{entry.status || '-'}</td>
+                            <td className="truncate">
+                              <div className="font-semibold text-green-300 leading-tight">{entry.lane ? `L${entry.lane}` : '-'}</div>
+                              <div className="text-[9px] md:text-[10px] text-slate-400 leading-tight">{entry.palletCount}p</div>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         </div>
