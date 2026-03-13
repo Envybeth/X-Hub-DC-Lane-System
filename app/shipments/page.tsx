@@ -12,7 +12,11 @@ import { useAuth } from '@/components/AuthProvider';
 import { useRealtimeCoordinator } from '@/components/RealtimeProvider';
 import ActionToast from '@/components/ActionToast';
 import { buildPuLoadKey, normalizePuDate, normalizePuNumber } from '@/lib/shipmentIdentity';
-import { formatPuLoadLabel, isShipmentLoadMismatch } from '@/lib/shipmentLoadConflicts';
+import {
+  buildDuplicateStagingLaneConflictMaps,
+  formatPuLoadLabel,
+  isShipmentLoadMismatch
+} from '@/lib/shipmentLoadConflicts';
 import { setShipmentStagingLaneWithAutoLink } from '@/lib/setShipmentStagingLane';
 import { buildSetShipmentStagingLaneErrorMessage, buildSetShipmentStagingLaneSuccessMessage } from '@/lib/setShipmentStagingLaneFeedback';
 import { describeUnknownStageError, stageLaneAssignmentIntoShipment } from '@/lib/stageShipmentExecution';
@@ -177,6 +181,24 @@ function buildLoadConflictMessage(params: {
   }
 
   return `${ptLabel}${poPart} is still sitting in ${locationLabel}, but it now belongs to ${destinationLabel}. Move it out before staging more PTs or finalizing this load.`;
+}
+
+function hasShipmentBlockingConflict(shipment: Shipment | null | undefined): boolean {
+  if (!shipment) return false;
+  return Boolean(
+    shipment.has_load_change_conflict
+    || shipment.has_duplicate_staging_lane_conflict
+  );
+}
+
+function getShipmentBlockingConflictMessage(shipment: Shipment | null | undefined, fallbackPuNumber?: string | null): string {
+  const puNumber = toTrimmedText(fallbackPuNumber) || toTrimmedText(shipment?.pu_number) || 'N/A';
+
+  if (shipment?.has_duplicate_staging_lane_conflict) {
+    return `PU ${puNumber} is blocked because its staging lane is shared by another active load. Resolve that duplicate staging lane conflict first.`;
+  }
+
+  return `PU ${puNumber} is blocked by a stale PT load mismatch. Resolve that hazard before staging more PTs.`;
 }
 
 function buildShipmentLoadConflictMaps(params: {
@@ -953,7 +975,7 @@ export default function ShipmentsPage() {
         .filter((row) => row.pending_member_count > 0)
         .filter((row) => {
           const shipment = shipmentsByKey.get(plannerRowShipmentKey(row));
-          return !shipment?.has_load_change_conflict;
+          return !hasShipmentBlockingConflict(shipment);
         });
       const nextDateOptions = buildPlannerPuDateFilterOptions(typedRows);
       const allDateSelections = nextDateOptions.map((option) => option.puDate);
@@ -1084,9 +1106,9 @@ export default function ShipmentsPage() {
       });
       return;
     }
-    if (shipment.has_load_change_conflict) {
+    if (hasShipmentBlockingConflict(shipment)) {
       setPlannerToast({
-        message: `PU ${row.pu_number || 'N/A'} is blocked by a stale PT load mismatch. Resolve that hazard before staging more PTs.`,
+        message: getShipmentBlockingConflictMessage(shipment, row.pu_number),
         type: 'error'
       });
       return;
@@ -1202,9 +1224,9 @@ export default function ShipmentsPage() {
   async function executePlannerStage(row: PlannerQueueRow) {
     if (isGuest || plannerExecutingAssignmentId !== null || plannerAssigningShipmentKey !== null) return;
     const shipment = shipmentsByKey.get(plannerRowShipmentKey(row));
-    if (shipment?.has_load_change_conflict) {
+    if (hasShipmentBlockingConflict(shipment)) {
       setPlannerToast({
-        message: `PU ${row.pu_number || 'N/A'} is blocked by a stale PT load mismatch. Resolve that hazard before staging more PTs.`,
+        message: getShipmentBlockingConflictMessage(shipment, row.pu_number),
         type: 'error'
       });
       return;
@@ -1291,9 +1313,9 @@ export default function ShipmentsPage() {
 
   async function stagePlannerRow(row: PlannerQueueRow) {
     const shipment = shipmentsByKey.get(plannerRowShipmentKey(row));
-    if (shipment?.has_load_change_conflict) {
+    if (hasShipmentBlockingConflict(shipment)) {
       setPlannerToast({
-        message: `PU ${row.pu_number || 'N/A'} is blocked by a stale PT load mismatch. Resolve that hazard before staging more PTs.`,
+        message: getShipmentBlockingConflictMessage(shipment, row.pu_number),
         type: 'error'
       });
       return;
@@ -1788,6 +1810,7 @@ export default function ShipmentsPage() {
         shipmentPtRows: typedShipmentPtRows,
         pickticketById
       });
+      const duplicateLaneConflictMaps = buildDuplicateStagingLaneConflictMaps(shipmentRowsForLinks);
 
       shipmentRowsForLinks.forEach((shipmentRow) => {
         const key = buildPuLoadKey(shipmentRow.pu_number, shipmentRow.pu_date);
@@ -1828,6 +1851,40 @@ export default function ShipmentsPage() {
         });
         existingShipment.has_load_change_conflict = true;
         existingShipment.load_change_conflicts = [...conflicts];
+      });
+
+      shipmentRowsForLinks.forEach((shipmentRow) => {
+        const key = buildPuLoadKey(shipmentRow.pu_number, shipmentRow.pu_date);
+        if (!key) return;
+
+        const duplicateConflicts = duplicateLaneConflictMaps.conflictsByShipmentKey.get(key) || [];
+        if (duplicateConflicts.length === 0) return;
+
+        const normalizedPuNumber = normalizePuNumber(shipmentRow.pu_number);
+        const normalizedPuDate = normalizePuDate(shipmentRow.pu_date);
+        if (!normalizedPuNumber || !normalizedPuDate) return;
+
+        const existingShipment = groupedShipments[key];
+        if (!existingShipment) {
+          groupedShipments[key] = {
+            pu_number: normalizedPuNumber,
+            pu_date: normalizedPuDate,
+            carrier: shipmentRow.carrier || '',
+            pts: [],
+            staging_lane: shipmentRow.staging_lane,
+            status: shipmentRow.status === 'not_started' || shipmentRow.status === 'in_process' || shipmentRow.status === 'finalized'
+              ? shipmentRow.status
+              : 'in_process',
+            archived: shipmentRow.archived || false,
+            shipped_at: shipmentRow.updated_at || shipmentRow.created_at || null,
+            has_duplicate_staging_lane_conflict: true,
+            duplicate_staging_lane_conflicts: [...duplicateConflicts]
+          };
+          return;
+        }
+
+        existingShipment.has_duplicate_staging_lane_conflict = true;
+        existingShipment.duplicate_staging_lane_conflicts = [...duplicateConflicts];
       });
 
       const syncReference = latestSync ? new Date(latestSync) : mostRecentSync;
@@ -1953,7 +2010,7 @@ export default function ShipmentsPage() {
 
   const isInActiveSection = useCallback((shipment: Shipment) => {
     if (shipment.archived) return false;
-    if (shipment.has_load_change_conflict) return true;
+    if (hasShipmentBlockingConflict(shipment)) return true;
     const hasShippedPT = shipment.pts.some(pt => pt.status === 'shipped');
     if (hasShippedPT) return false;
     const allArchivedBySync = shipment.pts.every(pt => isPTArchived(pt, mostRecentSync));
@@ -1984,8 +2041,8 @@ export default function ShipmentsPage() {
   const activeShipments = shipments
     .filter((shipment) => isInActiveSection(shipment))
     .sort((a, b) => {
-      const hazardRankA = a.has_load_change_conflict ? 0 : 1;
-      const hazardRankB = b.has_load_change_conflict ? 0 : 1;
+      const hazardRankA = hasShipmentBlockingConflict(a) ? 0 : 1;
+      const hazardRankB = hasShipmentBlockingConflict(b) ? 0 : 1;
       if (hazardRankA !== hazardRankB) return hazardRankA - hazardRankB;
 
       const rankA = activeStatusSortOrder[a.status] ?? Number.MAX_SAFE_INTEGER;

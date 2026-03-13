@@ -8,7 +8,10 @@ import ActionToast from './ActionToast';
 import CompiledPalletVerificationModal from './CompiledPalletVerificationModal';
 import { isPTArchived } from '@/lib/utils';
 import { exportShipmentSummaryPdf, ShipmentPdfLoad } from '@/lib/shipmentPdf';
-import { setShipmentStagingLaneWithAutoLink } from '@/lib/setShipmentStagingLane';
+import {
+  findActiveShipmentLaneConflicts,
+  setShipmentStagingLaneWithAutoLink
+} from '@/lib/setShipmentStagingLane';
 import {
   buildStagedLaneAssignmentUnits,
   normalizeStagedLaneAssignmentsBatch
@@ -26,6 +29,7 @@ import {
   getRangeLabel,
   normalizeDigits
 } from '@/lib/compiledPalletDisplay';
+import { type ShipmentDuplicateStagingLaneConflict } from '@/lib/shipmentLoadConflicts';
 
 import OCRCamera from './OCRCamera';
 
@@ -75,6 +79,8 @@ export interface Shipment {
   shipped_at?: string | null;
   has_load_change_conflict?: boolean;
   load_change_conflicts?: ShipmentLoadConflict[];
+  has_duplicate_staging_lane_conflict?: boolean;
+  duplicate_staging_lane_conflicts?: ShipmentDuplicateStagingLaneConflict[];
 }
 
 const SHIPMENT_STATUS_OPTIONS: Shipment['status'][] = ['not_started', 'in_process', 'finalized'];
@@ -270,23 +276,29 @@ export default function ShipmentCard({
   const hasReadyToShipPT = shipment.pts.some(pt => pt.status === 'ready_to_ship');
   const isReadyToShipLoad = shipment.status === 'finalized' && hasReadyToShipPT && !hasShippedPT && !shipment.archived;
   const loadChangeConflicts = shipment.load_change_conflicts || [];
+  const duplicateStagingLaneConflicts = shipment.duplicate_staging_lane_conflicts || [];
   const hasLoadChangeConflict = Boolean(shipment.has_load_change_conflict && loadChangeConflicts.length > 0);
+  const hasDuplicateStagingLaneConflict = Boolean(
+    shipment.has_duplicate_staging_lane_conflict && duplicateStagingLaneConflicts.length > 0
+  );
+  const hasBlockingShipmentConflict = hasLoadChangeConflict || hasDuplicateStagingLaneConflict;
 
   const statusConfig = {
     not_started: { label: 'Not Started', color: 'bg-red-600', textColor: 'text-red-400' },
     in_process: { label: 'In Process', color: 'bg-orange-600', textColor: 'text-orange-400' },
     finalized: { label: 'Finalized', color: 'bg-green-600', textColor: 'text-green-400' }
   };
-  const headerStatus = hasLoadChangeConflict
+  const headerStatus = hasBlockingShipmentConflict
     ? { label: 'Action Needed', color: 'bg-red-700 text-white' }
     : hasShippedPT
     ? { label: 'Shipped', color: 'bg-blue-600 text-white' }
     : statusConfig[shipment.status];
   const blockedByLoadChangeMessage = 'Resolve the stale PT load mismatch before staging or finalizing this load.';
-  const cardContainerClassName = hasLoadChangeConflict
+  const blockedByDuplicateStagingLaneMessage = 'Resolve the duplicate staging lane conflict before staging or finalizing this load.';
+  const cardContainerClassName = hasBlockingShipmentConflict
     ? 'bg-red-950/25 rounded-lg border-2 border-red-500'
     : 'bg-gray-800 rounded-lg border-2 border-gray-600';
-  const headerButtonClassName = hasLoadChangeConflict
+  const headerButtonClassName = hasBlockingShipmentConflict
     ? 'w-full p-3 md:p-5 flex flex-col sm:flex-row items-start sm:items-center justify-between hover:bg-red-950/35 transition-colors gap-3'
     : 'w-full p-3 md:p-5 flex flex-col sm:flex-row items-start sm:items-center justify-between hover:bg-gray-750 transition-colors gap-3';
 
@@ -318,7 +330,7 @@ export default function ShipmentCard({
 
   // THE WATCHDOG: Automatically syncs PTs in the staging lane to staged/ready_to_ship based on shipment status.
   useEffect(() => {
-    if (readOnly || hasLoadChangeConflict) return;
+    if (readOnly || hasBlockingShipmentConflict) return;
 
     const unsyncedPTs = shipment.pts.filter(pt =>
       pt.assigned_lane === shipment.staging_lane &&
@@ -329,10 +341,24 @@ export default function ShipmentCard({
       autoSyncPTs(unsyncedPTs);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasLoadChangeConflict, readOnly, shipment.pts, shipment.staging_lane]);
+  }, [hasBlockingShipmentConflict, readOnly, shipment.pts, shipment.staging_lane]);
 
   function showBlockedByLoadChangeToast() {
     showToast(blockedByLoadChangeMessage, 'error');
+  }
+
+  function showBlockedByDuplicateStagingLaneToast() {
+    showToast(blockedByDuplicateStagingLaneMessage, 'error');
+  }
+
+  function showBlockedShipmentConflictToast() {
+    if (hasLoadChangeConflict) {
+      showBlockedByLoadChangeToast();
+      return;
+    }
+    if (hasDuplicateStagingLaneConflict) {
+      showBlockedByDuplicateStagingLaneToast();
+    }
   }
 
   //OCR move PT
@@ -423,6 +449,11 @@ export default function ShipmentCard({
   }
 
   async function stageShipmentUnit(pts: ShipmentPT[]) {
+    if (hasBlockingShipmentConflict) {
+      showBlockedShipmentConflictToast();
+      return;
+    }
+
     const uniquePts = Array.from(new Map(pts.map((pt) => [pt.id, pt])).values());
     const ptIds = uniquePts.map((pt) => pt.id);
     const isCompiledUnit = uniquePts.length > 1;
@@ -482,6 +513,10 @@ export default function ShipmentCard({
   }
 
   function handleUnfinalizeShipment() {
+    if (hasBlockingShipmentConflict) {
+      showBlockedShipmentConflictToast();
+      return;
+    }
     showConfirm(
       'Un-Finalize Shipment',
       'Move this PU load back to In Process? Ready to Ship PTs will return to Staged so you can continue adding PTs.',
@@ -493,6 +528,10 @@ export default function ShipmentCard({
   }
 
   async function unfinalizeShipmentAction() {
+    if (hasBlockingShipmentConflict) {
+      showBlockedShipmentConflictToast();
+      return;
+    }
     try {
       await supabase
         .from('shipments')
@@ -919,7 +958,7 @@ export default function ShipmentCard({
 
   async function handleSetStagingLane() {
     if (hasLoadChangeConflict) {
-      showBlockedByLoadChangeToast();
+      showBlockedShipmentConflictToast();
       return;
     }
     if (stagingLaneBusyRef.current || stagingLaneBusy) return;
@@ -974,7 +1013,7 @@ export default function ShipmentCard({
 
   async function handleChangeStagingLane() {
     if (hasLoadChangeConflict) {
-      showBlockedByLoadChangeToast();
+      showBlockedShipmentConflictToast();
       return;
     }
     if (stagingLaneBusyRef.current || stagingLaneBusy) return;
@@ -1002,6 +1041,29 @@ export default function ShipmentCard({
         window.alert(
           `Lane ${targetLaneNumber} cannot be selected for this shipment.\n\n` +
           `It has ${occupancy.foreignPtIds.length} PT(s) from other shipment(s).`
+        );
+        return;
+      }
+
+      const conflictingShipments = await findActiveShipmentLaneConflicts({
+        targetLane: targetLaneNumber,
+        excludePuNumber: shipment.pu_number,
+        excludePuDate: shipment.pu_date
+      });
+      if (conflictingShipments.length > 0) {
+        const conflictingLoadList = conflictingShipments
+          .map((conflict) => {
+            const puNumber = asTrimmedText(conflict.puNumber);
+            const puDate = asTrimmedText(conflict.puDate);
+            if (puNumber && puDate) return `PU ${puNumber} (${puDate})`;
+            if (puNumber) return `PU ${puNumber}`;
+            return `Shipment ${conflict.shipmentId}`;
+          })
+          .join('\n• ');
+
+        window.alert(
+          `Lane ${targetLaneNumber} cannot be selected for this shipment.\n\n` +
+          `It is already assigned to another active load:\n• ${conflictingLoadList}`
         );
         return;
       }
@@ -1118,8 +1180,8 @@ export default function ShipmentCard({
   }
 
   async function handleMovePT(pt: ShipmentPT) {
-    if (hasLoadChangeConflict) {
-      showBlockedByLoadChangeToast();
+    if (hasBlockingShipmentConflict) {
+      showBlockedShipmentConflictToast();
       return;
     }
     if (!shipment.staging_lane) {
@@ -1151,8 +1213,8 @@ export default function ShipmentCard({
   }
 
   async function confirmManualCompiledStage() {
-    if (hasLoadChangeConflict) {
-      showBlockedByLoadChangeToast();
+    if (hasBlockingShipmentConflict) {
+      showBlockedShipmentConflictToast();
       return;
     }
     if (!manualCompiledStagePTs || manualCompiledStagePTs.length === 0) return;
@@ -1184,8 +1246,8 @@ export default function ShipmentCard({
   }
 
   async function handleFinalizeShipment() {
-    if (hasLoadChangeConflict) {
-      showBlockedByLoadChangeToast();
+    if (hasBlockingShipmentConflict) {
+      showBlockedShipmentConflictToast();
       return;
     }
     const allMoved = shipment.pts.every(pt => pt.moved_to_staging && !pt.removed_from_staging);
@@ -1204,8 +1266,8 @@ export default function ShipmentCard({
   }
 
   async function finalizeShipmentAction() {
-    if (hasLoadChangeConflict) {
-      showBlockedByLoadChangeToast();
+    if (hasBlockingShipmentConflict) {
+      showBlockedShipmentConflictToast();
       return;
     }
     try {
@@ -1292,6 +1354,11 @@ export default function ShipmentCard({
                 ⚠️ Stale PT in staging lane
               </div>
             )}
+            {hasDuplicateStagingLaneConflict && (
+              <div className="bg-red-700 px-2 md:px-4 py-1 md:py-2 rounded-lg font-bold text-l md:text-base text-white">
+                ⚠️ Lane shared by another load
+              </div>
+            )}
             <div className="relative inline-flex mt-1 sm:mt-0">
               <div className={`px-2 md:px-4 py-1 md:py-2 rounded-lg font-bold text-xs md:text-base ${headerStatus.color}`}>
                 {headerStatus.label}
@@ -1321,6 +1388,26 @@ export default function ShipmentCard({
                   {loadChangeConflicts.map((conflict) => (
                     <div
                       key={`load-conflict-${conflict.pt_id}`}
+                      className="bg-black/25 border border-red-700 rounded-lg px-3 py-2 text-xs md:text-sm text-red-50 break-all"
+                    >
+                      {conflict.message}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            {hasDuplicateStagingLaneConflict && (
+              <div className="bg-red-950/70 border-2 border-red-500 p-3 md:p-4 rounded-lg">
+                <div className="font-bold text-base md:text-lg text-red-200">
+                  Action required: another active load is sharing this staging lane
+                </div>
+                <div className="text-sm md:text-base text-red-100 mt-2">
+                  This load is blocked until only one active PU load owns this staging lane. Change one of the loads to a different lane before staging more PTs or finalizing.
+                </div>
+                <div className="mt-3 space-y-2">
+                  {duplicateStagingLaneConflicts.map((conflict) => (
+                    <div
+                      key={`duplicate-lane-conflict-${conflict.conflicting_shipment_id}-${conflict.lane}`}
                       className="bg-black/25 border border-red-700 rounded-lg px-3 py-2 text-xs md:text-sm text-red-50 break-all"
                     >
                       {conflict.message}
@@ -1537,7 +1624,7 @@ export default function ShipmentCard({
                     <div className="flex flex-col sm:flex-row gap-2 w-full sm:w-auto">
                       <button
                         onClick={handleFinalizeShipment}
-                        disabled={hasLoadChangeConflict}
+                        disabled={hasBlockingShipmentConflict}
                         className="w-full sm:w-auto bg-green-600 hover:bg-green-700 disabled:bg-gray-600 px-4 md:px-6 py-2 md:py-3 rounded-lg font-bold text-sm md:text-base"
                       >
                         Finalize
@@ -1690,7 +1777,7 @@ export default function ShipmentCard({
                         !isCurrentlyStaged &&
                         Boolean(shipment.staging_lane) &&
                         shipment.status !== 'finalized' &&
-                        !hasLoadChangeConflict;
+                        !hasBlockingShipmentConflict;
 
                       const representativeDepth = ptDepthInfo[primary.id];
                       const depthColor = representativeDepth

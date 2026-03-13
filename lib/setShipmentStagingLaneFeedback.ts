@@ -12,6 +12,17 @@ function toTrimmedText(value: unknown): string {
   return String(value).trim();
 }
 
+function formatConflictingShipmentLabel(params: {
+  puNumber?: string | null;
+  puDate?: string | null;
+}): string {
+  const puNumber = toTrimmedText(params.puNumber);
+  const puDate = toTrimmedText(params.puDate);
+  if (puNumber && puDate) return `PU ${puNumber} (${puDate})`;
+  if (puNumber) return `PU ${puNumber}`;
+  return 'another active load';
+}
+
 export function buildSetShipmentStagingLaneSuccessMessage(options: SuccessFeedbackOptions): string {
   const puNumber = toTrimmedText(options.puNumber);
   let message = `Set staging lane L${options.result.targetLane}`;
@@ -45,6 +56,20 @@ export function buildSetShipmentStagingLaneErrorMessage(error: unknown, requeste
 
     if (error.code === 'lane_conflict') {
       return `Lane ${requestedLaneLabel} has ${error.foreignPtIds.length} PT(s) from other load(s).`;
+    }
+
+    if (error.code === 'staging_lane_conflict') {
+      const conflictingLabels = error.conflictingShipments
+        .slice(0, 2)
+        .map((shipment) => formatConflictingShipmentLabel({
+          puNumber: shipment.puNumber,
+          puDate: shipment.puDate
+        }));
+      const suffix = error.conflictingShipments.length > 2 ? '...' : '';
+      const details = conflictingLabels.length > 0
+        ? ` It is already assigned to ${conflictingLabels.join(', ')}${suffix}.`
+        : '';
+      return `Lane ${requestedLaneLabel} is already assigned to another active load.${details}`;
     }
 
     if (error.code === 'invalid_input') {

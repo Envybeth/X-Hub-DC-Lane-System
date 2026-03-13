@@ -1,5 +1,5 @@
 import { supabase } from '@/lib/supabase';
-import { normalizePuDate, normalizePuNumber } from '@/lib/shipmentIdentity';
+import { buildPuLoadKey, normalizePuDate, normalizePuNumber } from '@/lib/shipmentIdentity';
 import {
   buildStagedLaneAssignmentUnits,
   normalizeStagedLaneAssignmentsBatch
@@ -24,26 +24,49 @@ type ShipmentUpsertRow = {
   status: string | null;
 };
 
+type ActiveShipmentLaneConflictRow = {
+  id: number;
+  pu_number: string | null;
+  pu_date: string | null;
+  status: string | null;
+  staging_lane: string | null;
+  archived?: boolean | null;
+};
+
+export type ActiveShipmentLaneConflict = {
+  shipmentId: number;
+  puNumber: string | null;
+  puDate: string | null;
+  status: string | null;
+};
+
 export type SetShipmentStagingLaneErrorCode =
   | 'invalid_input'
   | 'lane_missing'
-  | 'lane_conflict';
+  | 'lane_conflict'
+  | 'staging_lane_conflict';
 
 export class SetShipmentStagingLaneError extends Error {
   readonly code: SetShipmentStagingLaneErrorCode;
   readonly targetLane: string | null;
   readonly foreignPtIds: number[];
+  readonly conflictingShipments: ActiveShipmentLaneConflict[];
 
   constructor(
     code: SetShipmentStagingLaneErrorCode,
     message: string,
-    options?: { targetLane?: string | null; foreignPtIds?: number[] }
+    options?: {
+      targetLane?: string | null;
+      foreignPtIds?: number[];
+      conflictingShipments?: ActiveShipmentLaneConflict[];
+    }
   ) {
     super(message);
     this.name = 'SetShipmentStagingLaneError';
     this.code = code;
     this.targetLane = options?.targetLane ?? null;
     this.foreignPtIds = options?.foreignPtIds ?? [];
+    this.conflictingShipments = options?.conflictingShipments ?? [];
   }
 }
 
@@ -66,6 +89,45 @@ function toTrimmedText(value: unknown): string {
   if (typeof value === 'string') return value.trim();
   if (value === null || value === undefined) return '';
   return String(value).trim();
+}
+
+export async function findActiveShipmentLaneConflicts(params: {
+  targetLane: string | number;
+  excludePuNumber?: string | null;
+  excludePuDate?: string | null;
+}): Promise<ActiveShipmentLaneConflict[]> {
+  const targetLane = toTrimmedText(params.targetLane);
+  if (!targetLane) return [];
+
+  const excludedLoadKey = buildPuLoadKey(
+    normalizePuNumber(params.excludePuNumber),
+    normalizePuDate(params.excludePuDate)
+  );
+
+  const { data, error } = await supabase
+    .from('shipments')
+    .select('id, pu_number, pu_date, status, staging_lane, archived')
+    .eq('archived', false)
+    .eq('staging_lane', targetLane);
+  if (error) throw error;
+
+  const seenLoadKeys = new Set<string>();
+
+  return ((data || []) as ActiveShipmentLaneConflictRow[])
+    .filter((row) => {
+      const rowLoadKey = buildPuLoadKey(normalizePuNumber(row.pu_number), normalizePuDate(row.pu_date));
+      if (!rowLoadKey) return false;
+      if (rowLoadKey === excludedLoadKey) return false;
+      if (seenLoadKeys.has(rowLoadKey)) return false;
+      seenLoadKeys.add(rowLoadKey);
+      return true;
+    })
+    .map((row) => ({
+      shipmentId: Number(row.id),
+      puNumber: normalizePuNumber(row.pu_number) || null,
+      puDate: normalizePuDate(row.pu_date) || null,
+      status: toTrimmedText(row.status) || null
+    }));
 }
 
 export async function setShipmentStagingLaneWithAutoLink(
@@ -94,6 +156,19 @@ export async function setShipmentStagingLaneWithAutoLink(
       'lane_missing',
       `Lane ${targetLane} does not exist.`,
       { targetLane }
+    );
+  }
+
+  const conflictingShipments = await findActiveShipmentLaneConflicts({
+    targetLane,
+    excludePuNumber: puNumber,
+    excludePuDate: puDate
+  });
+  if (conflictingShipments.length > 0) {
+    throw new SetShipmentStagingLaneError(
+      'staging_lane_conflict',
+      `Lane ${targetLane} is already assigned to ${conflictingShipments.length} other active shipment(s).`,
+      { targetLane, conflictingShipments }
     );
   }
 

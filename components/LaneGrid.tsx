@@ -9,7 +9,11 @@ import StorageLaneModal from './StorageLaneModal';
 import { StorageAssignment, StorageGroup } from '@/types/storage';
 import { useRealtimeCoordinator } from './RealtimeProvider';
 import { normalizePuNumber } from '@/lib/shipmentIdentity';
-import { isShipmentLoadMismatch } from '@/lib/shipmentLoadConflicts';
+import {
+  buildDuplicateStagingLaneConflictMaps,
+  formatPuLoadLabel,
+  isShipmentLoadMismatch
+} from '@/lib/shipmentLoadConflicts';
 
 const LANE_GRID_FALLBACK_FULL_SYNC_MS = 900000;
 const LANE_GRID_FALLBACK_DEGRADED_SYNC_MS = 30000;
@@ -27,6 +31,9 @@ interface Lane {
   storageAssignments?: StorageAssignment[];
   hasLoadChangeConflict?: boolean;
   staleConflictCount?: number;
+  hasDuplicateStagingLaneConflict?: boolean;
+  duplicateStagingShipmentCount?: number;
+  duplicateStagingShipmentLabels?: string[];
 }
 
 type ViewMode = 'regular' | 'storage';
@@ -246,27 +253,29 @@ export default function LaneGrid({ readOnly = false }: LaneGridProps) {
         currentPalletsByLane.set(laneKey, (currentPalletsByLane.get(laneKey) || 0) + (assignment.pallet_count || 0));
       });
 
-      const activeShipmentByLane = new Map<string, ShipmentLaneRow>();
+      const activeShipmentsByLane = new Map<string, ShipmentLaneRow[]>();
       ((shipmentResponse.data || []) as ShipmentLaneRow[]).forEach((shipment) => {
         const laneKey = String(shipment.staging_lane || '').trim();
         if (!laneKey) return;
 
-        const existing = activeShipmentByLane.get(laneKey);
-        if (!existing) {
-          activeShipmentByLane.set(laneKey, shipment);
-          return;
-        }
-
-        const existingUpdatedAt = existing.updated_at ? new Date(existing.updated_at).getTime() : 0;
-        const candidateUpdatedAt = shipment.updated_at ? new Date(shipment.updated_at).getTime() : 0;
-        if (candidateUpdatedAt > existingUpdatedAt) {
-          activeShipmentByLane.set(laneKey, shipment);
-        }
+        const laneShipments = activeShipmentsByLane.get(laneKey) || [];
+        laneShipments.push(shipment);
+        activeShipmentsByLane.set(laneKey, laneShipments);
       });
 
-      const activeShipments = Array.from(activeShipmentByLane.values());
+      activeShipmentsByLane.forEach((laneShipments) => {
+        laneShipments.sort((a, b) => {
+          const aUpdatedAt = a.updated_at ? new Date(a.updated_at).getTime() : 0;
+          const bUpdatedAt = b.updated_at ? new Date(b.updated_at).getTime() : 0;
+          if (aUpdatedAt !== bUpdatedAt) return bUpdatedAt - aUpdatedAt;
+          return Number(b.id) - Number(a.id);
+        });
+      });
+
+      const activeShipments = Array.from(activeShipmentsByLane.values()).flat();
       const activeShipmentById = new Map(activeShipments.map((shipment) => [shipment.id, shipment] as const));
       const staleConflictCountByLane = new Map<string, number>();
+      const duplicateLaneConflictMaps = buildDuplicateStagingLaneConflictMaps(activeShipments);
 
       if (activeShipments.length > 0) {
         const shipmentIds = activeShipments.map((shipment) => shipment.id);
@@ -326,20 +335,28 @@ export default function LaneGrid({ readOnly = false }: LaneGridProps) {
 
       const lanesWithCapacity = laneRows.map((lane) => {
         const laneKey = String(lane.lane_number);
-        const activeShipment = activeShipmentByLane.get(laneKey);
+        const laneShipments = activeShipmentsByLane.get(laneKey) || [];
+        const activeShipment = laneShipments[0];
+        const duplicateLaneShipments = duplicateLaneConflictMaps.shipmentsByLane.get(laneKey) || [];
+        const hasDuplicateStagingLaneConflict = duplicateLaneShipments.length > 1;
         const laneStorageAssignments = storageByLane.get(laneKey) || [];
         const staleConflictCount = staleConflictCountByLane.get(laneKey) || 0;
 
         return {
           ...lane,
           current_pallets: currentPalletsByLane.get(laneKey) || 0,
-          isStaging: Boolean(activeShipment),
-          stagingPuNumber: normalizePuNumber(activeShipment?.pu_number) || null,
-          isFinalized: activeShipment?.status === 'finalized',
+          isStaging: laneShipments.length > 0,
+          stagingPuNumber: hasDuplicateStagingLaneConflict ? null : normalizePuNumber(activeShipment?.pu_number) || null,
+          isFinalized: !hasDuplicateStagingLaneConflict && activeShipment?.status === 'finalized',
           hasStorage: laneStorageAssignments.length > 0,
           storageAssignments: laneStorageAssignments,
           hasLoadChangeConflict: staleConflictCount > 0,
-          staleConflictCount
+          staleConflictCount,
+          hasDuplicateStagingLaneConflict,
+          duplicateStagingShipmentCount: duplicateLaneShipments.length,
+          duplicateStagingShipmentLabels: duplicateLaneShipments.map((shipmentRow) => (
+            formatPuLoadLabel(shipmentRow.pu_number, shipmentRow.pu_date)
+          ))
         } as Lane;
       });
 
@@ -551,6 +568,16 @@ export default function LaneGrid({ readOnly = false }: LaneGridProps) {
       return;
     }
 
+    if (lane.hasDuplicateStagingLaneConflict) {
+      const conflictingLoadList = (lane.duplicateStagingShipmentLabels || [])
+        .map((label) => `• ${label}`)
+        .join('\n');
+      window.alert(
+        `Lane ${lane.lane_number} is blocked because multiple active PU loads share this staging lane.\n\n${conflictingLoadList}\n\nMove one of those loads to a different staging lane from the shipments page before staging or finalizing.`
+      );
+      return;
+    }
+
     if (lane.hasLoadChangeConflict) {
       window.alert(`Lane ${lane.lane_number} is blocked by a stale PT load mismatch. Move the stale PT out before assigning more PTs to this staging lane.`);
       return;
@@ -584,6 +611,7 @@ export default function LaneGrid({ readOnly = false }: LaneGridProps) {
   }
 
   function getLaneColor(lane: Lane) {
+    if (lane.hasDuplicateStagingLaneConflict) return 'bg-red-800 border-red-400';
     if (lane.hasLoadChangeConflict) return 'bg-red-800 border-red-400';
     if (lane.hasStorage) return 'bg-gray-700 border-gray-500';
     if (lane.isFinalized) return 'bg-yellow-600 border-yellow-400';
@@ -606,8 +634,8 @@ export default function LaneGrid({ readOnly = false }: LaneGridProps) {
     return (
       <div className={`flex flex-col items-center justify-center h-full ${compact ? 'space-y-0.5' : 'space-y-1'}`}>
         <div className={`${compact ? 'text-sm md:text-base' : 'text-base md:text-2xl'} font-bold`}>
-          {!lane.hasStorage && lane.hasLoadChangeConflict && '⚠️ '}
-          {!lane.hasStorage && !lane.hasLoadChangeConflict && lane.isStaging && '📦 '}
+          {!lane.hasStorage && (lane.hasDuplicateStagingLaneConflict || lane.hasLoadChangeConflict) && '⚠️ '}
+          {!lane.hasStorage && !lane.hasDuplicateStagingLaneConflict && !lane.hasLoadChangeConflict && lane.isStaging && '📦 '}
           {lane.lane_number}
         </div>
 
@@ -626,6 +654,21 @@ export default function LaneGrid({ readOnly = false }: LaneGridProps) {
           </div>
         ) : (
           <>
+            {lane.hasDuplicateStagingLaneConflict && (
+              <>
+                <div className={`${compact ? 'text-[9px] md:text-[10px] px-1.5 py-0.5' : 'text-[10px] md:text-xs px-2 py-0.5'} font-bold text-red-100 bg-black/30 rounded shadow-sm`}>
+                  Shared by {lane.duplicateStagingShipmentCount || 0} loads
+                </div>
+                {(lane.duplicateStagingShipmentLabels || []).slice(0, 2).map((label) => (
+                  <div
+                    key={`duplicate-lane-${lane.lane_number}-${label}`}
+                    className={`${compact ? 'text-[9px] md:text-[10px] px-1.5 py-0.5' : 'text-[10px] md:text-xs px-2 py-0.5'} font-bold text-red-100 bg-black/30 rounded shadow-sm break-all`}
+                  >
+                    {label}
+                  </div>
+                ))}
+              </>
+            )}
             {lane.stagingPuNumber && (
               <div className={`${compact ? 'text-[9px] md:text-[10px] px-1.5 py-0.5' : 'text-[10px] md:text-xs px-2 py-0.5'} font-bold text-purple-100 bg-black/30 rounded shadow-sm break-all`}>
                 PU: {lane.stagingPuNumber}
@@ -634,6 +677,11 @@ export default function LaneGrid({ readOnly = false }: LaneGridProps) {
             <div className={compact ? 'text-[10px] md:text-xs' : 'text-xs md:text-sm'}>
               {lane.current_pallets || 0}/{lane.max_capacity}
             </div>
+            {lane.hasDuplicateStagingLaneConflict && (
+              <div className={`${compact ? 'mt-0.5 text-[9px] md:text-[10px] px-1.5 py-0.5' : 'mt-1 text-[10px] md:text-xs px-2 py-1'} bg-red-950/80 text-red-100 font-bold rounded shadow-sm uppercase text-center`}>
+                Shared Lane
+              </div>
+            )}
             {lane.hasLoadChangeConflict && (
               <div className={`${compact ? 'mt-0.5 text-[9px] md:text-[10px] px-1.5 py-0.5' : 'mt-1 text-[10px] md:text-xs px-2 py-1'} bg-red-950/80 text-red-100 font-bold rounded shadow-sm uppercase text-center`}>
                 Hazard{lane.staleConflictCount ? ` · ${lane.staleConflictCount}` : ''}
