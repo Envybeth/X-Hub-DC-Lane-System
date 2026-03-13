@@ -9,8 +9,10 @@ import StorageLaneModal from './StorageLaneModal';
 import { StorageAssignment, StorageGroup } from '@/types/storage';
 import { useRealtimeCoordinator } from './RealtimeProvider';
 import { normalizePuNumber } from '@/lib/shipmentIdentity';
+import { isShipmentLoadMismatch } from '@/lib/shipmentLoadConflicts';
 
-const LANE_GRID_FALLBACK_FULL_SYNC_MS = 180000;
+const LANE_GRID_FALLBACK_FULL_SYNC_MS = 900000;
+const LANE_GRID_FALLBACK_DEGRADED_SYNC_MS = 30000;
 
 interface Lane {
   id: number;
@@ -23,6 +25,8 @@ interface Lane {
   isFinalized?: boolean;
   hasStorage?: boolean;
   storageAssignments?: StorageAssignment[];
+  hasLoadChangeConflict?: boolean;
+  staleConflictCount?: number;
 }
 
 type ViewMode = 'regular' | 'storage';
@@ -40,8 +44,23 @@ interface ShipmentLaneRow {
   id: number;
   staging_lane: string | null;
   pu_number: string;
+  pu_date: string | null;
   status: string;
   updated_at: string | null;
+}
+
+interface ShipmentLanePtRow {
+  shipment_id: number;
+  pt_id: number;
+  removed_from_staging: boolean;
+}
+
+interface ShipmentLaneConflictPtRow {
+  id: number;
+  pu_number: string | null;
+  pu_date: string | null;
+  status: string | null;
+  assigned_lane: string | null;
 }
 
 function describeSupabaseError(error: { code?: string; message?: string; details?: string; hint?: string } | null) {
@@ -207,7 +226,7 @@ export default function LaneGrid({ readOnly = false }: LaneGridProps) {
         laneNumbers.length > 0
           ? supabase
             .from('shipments')
-            .select('id, staging_lane, pu_number, status, updated_at')
+            .select('id, staging_lane, pu_number, pu_date, status, updated_at')
             .eq('archived', false)
             .in('staging_lane', laneNumbers)
           : Promise.resolve({ data: [], error: null })
@@ -245,10 +264,71 @@ export default function LaneGrid({ readOnly = false }: LaneGridProps) {
         }
       });
 
+      const activeShipments = Array.from(activeShipmentByLane.values());
+      const activeShipmentById = new Map(activeShipments.map((shipment) => [shipment.id, shipment] as const));
+      const staleConflictCountByLane = new Map<string, number>();
+
+      if (activeShipments.length > 0) {
+        const shipmentIds = activeShipments.map((shipment) => shipment.id);
+        const { data: conflictShipmentPtRows, error: conflictShipmentPtRowsError } = await supabase
+          .from('shipment_pts')
+          .select('shipment_id, pt_id, removed_from_staging')
+          .in('shipment_id', shipmentIds)
+          .eq('removed_from_staging', true);
+        if (conflictShipmentPtRowsError) {
+          console.error('Failed to load shipment hazard links:', conflictShipmentPtRowsError);
+        } else {
+          const typedConflictShipmentPtRows = (conflictShipmentPtRows || []) as ShipmentLanePtRow[];
+          const ptIds = Array.from(
+            new Set(
+              typedConflictShipmentPtRows
+                .map((row) => Number(row.pt_id))
+                .filter((ptId) => Number.isFinite(ptId))
+            )
+          );
+
+          if (ptIds.length > 0) {
+            const { data: conflictPtRows, error: conflictPtRowsError } = await supabase
+              .from('picktickets')
+              .select('id, pu_number, pu_date, status, assigned_lane')
+              .in('id', ptIds);
+            if (conflictPtRowsError) {
+              console.error('Failed to load shipment hazard PTs:', conflictPtRowsError);
+            } else {
+              const ptById = new Map<number, ShipmentLaneConflictPtRow>();
+              ((conflictPtRows || []) as ShipmentLaneConflictPtRow[]).forEach((row) => {
+                ptById.set(Number(row.id), row);
+              });
+
+              typedConflictShipmentPtRows.forEach((row) => {
+                const shipment = activeShipmentById.get(row.shipment_id);
+                const pt = ptById.get(Number(row.pt_id));
+                if (!shipment || !pt) return;
+                if (String(pt.status || '').trim().toLowerCase() === 'shipped') return;
+                if (String(pt.assigned_lane || '').trim() !== String(shipment.staging_lane || '').trim()) return;
+                if (!isShipmentLoadMismatch({
+                  shipmentPuNumber: shipment.pu_number,
+                  shipmentPuDate: shipment.pu_date,
+                  ptPuNumber: pt.pu_number,
+                  ptPuDate: pt.pu_date
+                })) {
+                  return;
+                }
+
+                const laneKey = String(shipment.staging_lane || '').trim();
+                if (!laneKey) return;
+                staleConflictCountByLane.set(laneKey, (staleConflictCountByLane.get(laneKey) || 0) + 1);
+              });
+            }
+          }
+        }
+      }
+
       const lanesWithCapacity = laneRows.map((lane) => {
         const laneKey = String(lane.lane_number);
         const activeShipment = activeShipmentByLane.get(laneKey);
         const laneStorageAssignments = storageByLane.get(laneKey) || [];
+        const staleConflictCount = staleConflictCountByLane.get(laneKey) || 0;
 
         return {
           ...lane,
@@ -257,7 +337,9 @@ export default function LaneGrid({ readOnly = false }: LaneGridProps) {
           stagingPuNumber: normalizePuNumber(activeShipment?.pu_number) || null,
           isFinalized: activeShipment?.status === 'finalized',
           hasStorage: laneStorageAssignments.length > 0,
-          storageAssignments: laneStorageAssignments
+          storageAssignments: laneStorageAssignments,
+          hasLoadChangeConflict: staleConflictCount > 0,
+          staleConflictCount
         } as Lane;
       });
 
@@ -309,19 +391,22 @@ export default function LaneGrid({ readOnly = false }: LaneGridProps) {
   }, [scheduleLaneRefresh, subscribeScope]);
 
   useEffect(() => {
-    if (realtimeHealth !== 'disconnected') return;
+    if (realtimeHealth === 'live') return;
     if (document.hidden) return;
     void fetchLanes();
   }, [fetchLanes, realtimeHealth]);
 
   useEffect(() => {
+    const intervalMs = realtimeHealth === 'live'
+      ? LANE_GRID_FALLBACK_FULL_SYNC_MS
+      : LANE_GRID_FALLBACK_DEGRADED_SYNC_MS;
     const timer = window.setInterval(() => {
       if (document.hidden) return;
       void fetchLanes();
-    }, LANE_GRID_FALLBACK_FULL_SYNC_MS);
+    }, intervalMs);
 
     return () => window.clearInterval(timer);
-  }, [fetchLanes]);
+  }, [fetchLanes, realtimeHealth]);
 
   useEffect(() => {
     const params = new URLSearchParams(searchParams.toString());
@@ -466,6 +551,11 @@ export default function LaneGrid({ readOnly = false }: LaneGridProps) {
       return;
     }
 
+    if (lane.hasLoadChangeConflict) {
+      window.alert(`Lane ${lane.lane_number} is blocked by a stale PT load mismatch. Move the stale PT out before assigning more PTs to this staging lane.`);
+      return;
+    }
+
     if (readOnly) {
       return;
     }
@@ -494,6 +584,7 @@ export default function LaneGrid({ readOnly = false }: LaneGridProps) {
   }
 
   function getLaneColor(lane: Lane) {
+    if (lane.hasLoadChangeConflict) return 'bg-red-800 border-red-400';
     if (lane.hasStorage) return 'bg-gray-700 border-gray-500';
     if (lane.isFinalized) return 'bg-yellow-600 border-yellow-400';
     if (lane.isStaging) return 'bg-purple-700 border-purple-500';
@@ -515,7 +606,8 @@ export default function LaneGrid({ readOnly = false }: LaneGridProps) {
     return (
       <div className={`flex flex-col items-center justify-center h-full ${compact ? 'space-y-0.5' : 'space-y-1'}`}>
         <div className={`${compact ? 'text-sm md:text-base' : 'text-base md:text-2xl'} font-bold`}>
-          {!lane.hasStorage && lane.isStaging && '📦 '}
+          {!lane.hasStorage && lane.hasLoadChangeConflict && '⚠️ '}
+          {!lane.hasStorage && !lane.hasLoadChangeConflict && lane.isStaging && '📦 '}
           {lane.lane_number}
         </div>
 
@@ -542,6 +634,11 @@ export default function LaneGrid({ readOnly = false }: LaneGridProps) {
             <div className={compact ? 'text-[10px] md:text-xs' : 'text-xs md:text-sm'}>
               {lane.current_pallets || 0}/{lane.max_capacity}
             </div>
+            {lane.hasLoadChangeConflict && (
+              <div className={`${compact ? 'mt-0.5 text-[9px] md:text-[10px] px-1.5 py-0.5' : 'mt-1 text-[10px] md:text-xs px-2 py-1'} bg-red-950/80 text-red-100 font-bold rounded shadow-sm uppercase text-center`}>
+                Hazard{lane.staleConflictCount ? ` · ${lane.staleConflictCount}` : ''}
+              </div>
+            )}
             {lane.isFinalized && (
               <div className={`${compact ? 'mt-0.5 text-[9px] md:text-[10px] px-1.5 py-0.5' : 'mt-1 text-[10px] md:text-xs px-2 py-1'} bg-green-600 text-white font-bold rounded shadow-sm uppercase`}>
                 Finished

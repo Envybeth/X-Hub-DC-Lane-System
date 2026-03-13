@@ -4,12 +4,13 @@ import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { useAuth } from './AuthProvider';
-import { supabase } from '@/lib/supabase';
 import { useRealtimeCoordinator } from './RealtimeProvider';
 
 type NotificationItem = {
   id: string;
+  title: string | null;
   message: string;
+  details: string[];
   createdAt: string;
 };
 
@@ -19,9 +20,7 @@ export default function AppAuthMenu() {
   const { subscribeScope } = useRealtimeCoordinator();
   const displayName = profile?.display_name || profile?.username || 'user';
   const username = profile?.username || displayName;
-  const profileId = profile?.id || null;
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
-  const [creatorAdminId, setCreatorAdminId] = useState<string | null>(null);
   const [notificationOpen, setNotificationOpen] = useState(false);
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [seenById, setSeenById] = useState<Record<string, true>>({});
@@ -30,7 +29,6 @@ export default function AppAuthMenu() {
   const notificationMenuRef = useRef<HTMLDivElement | null>(null);
   const notificationButtonRef = useRef<HTMLButtonElement | null>(null);
   const notificationOpenRef = useRef(false);
-  const isCreatorAdmin = Boolean(isAdmin && profileId && creatorAdminId && profileId === creatorAdminId);
 
   useEffect(() => {
     notificationOpenRef.current = notificationOpen;
@@ -123,40 +121,16 @@ export default function AppAuthMenu() {
   }, [mobileMenuOpen, notificationOpen]);
 
   useEffect(() => {
-    if (!isAdmin || !profileId) return;
-
-    let isActive = true;
-    async function resolveCreatorAdmin() {
-      const { data, error } = await supabase
-        .from('user_profiles')
-        .select('id')
-        .eq('role', 'admin')
-        .order('created_at', { ascending: true })
-        .limit(1)
-        .maybeSingle();
-
-      if (!isActive) return;
-      if (error) {
-        console.error('Failed to resolve creator admin account:', error);
-        return;
-      }
-      setCreatorAdminId(data?.id || null);
-    }
-
-    void resolveCreatorAdmin();
-
-    return () => {
-      isActive = false;
-    };
-  }, [isAdmin, profileId]);
-
-  useEffect(() => {
-    if (!isCreatorAdmin) return;
+    if (!isAdmin) return;
 
     const unsubscribe = subscribeScope('notifications', (payload) => {
       const id = typeof payload.id === 'string' ? payload.id.trim() : '';
       const message = typeof payload.message === 'string' ? payload.message.trim() : '';
       if (!id || !message) return;
+      const title = typeof payload.title === 'string' && payload.title.trim() ? payload.title.trim() : null;
+      const details = Array.isArray(payload.details)
+        ? payload.details.map((item) => (typeof item === 'string' ? item.trim() : '')).filter(Boolean)
+        : [];
 
       const createdAtCandidate = typeof payload.createdAt === 'string' ? payload.createdAt : '';
       const createdAt = Number.isFinite(Date.parse(createdAtCandidate))
@@ -165,7 +139,7 @@ export default function AppAuthMenu() {
 
       setNotifications((previous) => {
         if (previous.some((item) => item.id === id)) return previous;
-        return [{ id, message, createdAt }, ...previous].slice(0, 80);
+        return [{ id, title, message, details, createdAt }, ...previous].slice(0, 80);
       });
 
       if (notificationOpenRef.current) {
@@ -174,7 +148,7 @@ export default function AppAuthMenu() {
     });
 
     return () => unsubscribe();
-  }, [isCreatorAdmin, subscribeScope]);
+  }, [isAdmin, subscribeScope]);
 
   if (loading || !isAuthenticated || pathname === '/login' || modalOverlayActive) {
     return null;
@@ -205,7 +179,7 @@ export default function AppAuthMenu() {
 
   return (
     <>
-      {isCreatorAdmin && (
+      {isAdmin && (
         <div className="fixed top-2.5 right-14 md:top-4 md:right-4 z-[131]">
           <button
             ref={notificationButtonRef}
@@ -247,7 +221,19 @@ export default function AppAuthMenu() {
                       <div className="text-[11px] text-gray-500 mb-1">
                         {new Date(item.createdAt).toLocaleString()}
                       </div>
+                      {item.title && (
+                        <div className="text-xs font-semibold text-blue-200 mb-1">{item.title}</div>
+                      )}
                       <div className="text-xs text-gray-100 leading-snug">{item.message}</div>
+                      {item.details.length > 0 && (
+                        <div className="mt-2 space-y-1">
+                          {item.details.map((detail) => (
+                            <div key={`${item.id}-${detail}`} className="text-[11px] text-gray-300 leading-snug">
+                              - {detail}
+                            </div>
+                          ))}
+                        </div>
+                      )}
                       <div className="mt-1.5">
                         <button
                           type="button"

@@ -58,6 +58,25 @@ begin
     raise exception 'Shipment has no staging lane';
   end if;
 
+  if exists (
+    select 1
+    from public.shipment_pts sp
+    join public.picktickets p
+      on p.id = sp.pt_id
+    where sp.shipment_id = v_shipment_id
+      and coalesce(sp.removed_from_staging, false) = true
+      and coalesce(p.status, '') <> 'shipped'
+      and btrim(coalesce(p.assigned_lane::text, '')) = v_staging_lane
+      and (
+        nullif(btrim(coalesce(p.pu_number, '')), '') is null
+        or p.pu_date is null
+        or btrim(coalesce(p.pu_number, '')) <> btrim(p_pu_number)
+        or p.pu_date::text <> p_pu_date
+      )
+  ) then
+    raise exception 'Shipment has stale PT load conflict in staging lane; move the stale PT out before staging more';
+  end if;
+
   select
     p.assigned_lane,
     coalesce(p.actual_pallet_count, 0)::integer

@@ -258,14 +258,27 @@ function buildAuditSummary(
     : (ptId ? `PT ID ${ptId}` : 'PT');
 
   if (isGoogleSheetSyncLog(row)) {
+    const details = toDetailsObject(row);
+    const reconciliation = (details.reconciliation && typeof details.reconciliation === 'object' && !Array.isArray(details.reconciliation))
+      ? details.reconciliation as Record<string, unknown>
+      : {};
     const sourceSheet = readDetailAny(row, 'source_sheet') || row.target_id || 'Unknown sheet';
     const syncedCount = readDetailAny(row, 'synced_count') || '0';
     const skippedCount = readDetailAny(row, 'skipped_count') || '0';
     const errorCount = readDetailAny(row, 'error_count') || '0';
+    const newLoadGroupCount = readDetailAny(row, 'new_load_group_count') || '0';
+    const staleConflictShipments = toText(reconciliation.stale_conflict_shipments) || '0';
+    const finalizedReopened = toText(reconciliation.finalized_reopened) || '0';
+    const summarySuffixParts = [
+      newLoadGroupCount !== '0' ? `${newLoadGroupCount} new load${newLoadGroupCount === '1' ? '' : 's'}` : null,
+      staleConflictShipments !== '0' ? `${staleConflictShipments} blocked load${staleConflictShipments === '1' ? '' : 's'}` : null,
+      finalizedReopened !== '0' ? `${finalizedReopened} reopened` : null
+    ].filter(Boolean);
+    const summarySuffix = summarySuffixParts.length > 0 ? ` • ${summarySuffixParts.join(' • ')}` : '';
     if (errorCount !== '0') {
-      return `Google Sheet sync completed with errors (${syncedCount} synced, ${skippedCount} skipped, ${errorCount} errors)`;
+      return `Google Sheet sync completed with errors (${syncedCount} synced, ${skippedCount} skipped, ${errorCount} errors)${summarySuffix}`;
     }
-    return `Google Sheet sync completed (${syncedCount} synced, ${skippedCount} skipped) from ${sourceSheet}`;
+    return `Google Sheet sync completed (${syncedCount} synced, ${skippedCount} skipped) from ${sourceSheet}${summarySuffix}`;
   }
 
   if (row.target_table === 'lane_assignments') {

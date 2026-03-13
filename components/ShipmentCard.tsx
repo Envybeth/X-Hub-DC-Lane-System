@@ -48,6 +48,20 @@ export interface ShipmentPT {
   last_synced_at?: string;
   compiled_pallet_id?: number | null;
   compiled_with?: ShipmentPT[];
+  current_pu_number?: string | null;
+  current_pu_date?: string | null;
+  stale_load_conflict?: boolean;
+  stale_load_message?: string | null;
+}
+
+export interface ShipmentLoadConflict {
+  pt_id: number;
+  pt_number: string;
+  po_number: string;
+  current_pu_number: string | null;
+  current_pu_date: string | null;
+  current_status: string | null;
+  message: string;
 }
 
 export interface Shipment {
@@ -59,6 +73,8 @@ export interface Shipment {
   status: 'not_started' | 'in_process' | 'finalized';
   archived?: boolean;
   shipped_at?: string | null;
+  has_load_change_conflict?: boolean;
+  load_change_conflicts?: ShipmentLoadConflict[];
 }
 
 const SHIPMENT_STATUS_OPTIONS: Shipment['status'][] = ['not_started', 'in_process', 'finalized'];
@@ -158,8 +174,13 @@ function getShipmentPtCardClass(options: {
   isShipped: boolean;
   isCurrentlyStaged: boolean;
   hasLaneLocation: boolean;
+  hasLoadMismatch: boolean;
 }): string {
   const base = 'p-3 md:p-4 rounded-lg border-2';
+
+  if (options.hasLoadMismatch) {
+    return `${base} bg-red-950/45 border-red-500`;
+  }
 
   if (options.isCompiled) {
     const stagedOverlay = options.isCurrentlyStaged && !options.isShipped
@@ -248,15 +269,26 @@ export default function ShipmentCard({
   const hasShippedPT = shipment.pts.some(pt => pt.status === 'shipped');
   const hasReadyToShipPT = shipment.pts.some(pt => pt.status === 'ready_to_ship');
   const isReadyToShipLoad = shipment.status === 'finalized' && hasReadyToShipPT && !hasShippedPT && !shipment.archived;
+  const loadChangeConflicts = shipment.load_change_conflicts || [];
+  const hasLoadChangeConflict = Boolean(shipment.has_load_change_conflict && loadChangeConflicts.length > 0);
 
   const statusConfig = {
     not_started: { label: 'Not Started', color: 'bg-red-600', textColor: 'text-red-400' },
     in_process: { label: 'In Process', color: 'bg-orange-600', textColor: 'text-orange-400' },
     finalized: { label: 'Finalized', color: 'bg-green-600', textColor: 'text-green-400' }
   };
-  const headerStatus = hasShippedPT
+  const headerStatus = hasLoadChangeConflict
+    ? { label: 'Action Needed', color: 'bg-red-700 text-white' }
+    : hasShippedPT
     ? { label: 'Shipped', color: 'bg-blue-600 text-white' }
     : statusConfig[shipment.status];
+  const blockedByLoadChangeMessage = 'Resolve the stale PT load mismatch before staging or finalizing this load.';
+  const cardContainerClassName = hasLoadChangeConflict
+    ? 'bg-red-950/25 rounded-lg border-2 border-red-500'
+    : 'bg-gray-800 rounded-lg border-2 border-gray-600';
+  const headerButtonClassName = hasLoadChangeConflict
+    ? 'w-full p-3 md:p-5 flex flex-col sm:flex-row items-start sm:items-center justify-between hover:bg-red-950/35 transition-colors gap-3'
+    : 'w-full p-3 md:p-5 flex flex-col sm:flex-row items-start sm:items-center justify-between hover:bg-gray-750 transition-colors gap-3';
 
   // Sync with prop
   useEffect(() => {
@@ -286,7 +318,7 @@ export default function ShipmentCard({
 
   // THE WATCHDOG: Automatically syncs PTs in the staging lane to staged/ready_to_ship based on shipment status.
   useEffect(() => {
-    if (readOnly) return;
+    if (readOnly || hasLoadChangeConflict) return;
 
     const unsyncedPTs = shipment.pts.filter(pt =>
       pt.assigned_lane === shipment.staging_lane &&
@@ -297,7 +329,11 @@ export default function ShipmentCard({
       autoSyncPTs(unsyncedPTs);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [readOnly, shipment.pts, shipment.staging_lane]);
+  }, [hasLoadChangeConflict, readOnly, shipment.pts, shipment.staging_lane]);
+
+  function showBlockedByLoadChangeToast() {
+    showToast(blockedByLoadChangeMessage, 'error');
+  }
 
   //OCR move PT
   async function performMovePT(pt: ShipmentPT) {
@@ -882,6 +918,10 @@ export default function ShipmentCard({
   }
 
   async function handleSetStagingLane() {
+    if (hasLoadChangeConflict) {
+      showBlockedByLoadChangeToast();
+      return;
+    }
     if (stagingLaneBusyRef.current || stagingLaneBusy) return;
 
     if (!selectedLaneInput.trim()) {
@@ -933,6 +973,10 @@ export default function ShipmentCard({
   }
 
   async function handleChangeStagingLane() {
+    if (hasLoadChangeConflict) {
+      showBlockedByLoadChangeToast();
+      return;
+    }
     if (stagingLaneBusyRef.current || stagingLaneBusy) return;
     if (!newStagingLane.trim() || !shipment.staging_lane) return;
 
@@ -1074,6 +1118,10 @@ export default function ShipmentCard({
   }
 
   async function handleMovePT(pt: ShipmentPT) {
+    if (hasLoadChangeConflict) {
+      showBlockedByLoadChangeToast();
+      return;
+    }
     if (!shipment.staging_lane) {
       showToast('Select staging lane first', 'error');
       return;
@@ -1103,6 +1151,10 @@ export default function ShipmentCard({
   }
 
   async function confirmManualCompiledStage() {
+    if (hasLoadChangeConflict) {
+      showBlockedByLoadChangeToast();
+      return;
+    }
     if (!manualCompiledStagePTs || manualCompiledStagePTs.length === 0) return;
 
     const entered = normalizeDigits(manualCompiledInput);
@@ -1132,6 +1184,10 @@ export default function ShipmentCard({
   }
 
   async function handleFinalizeShipment() {
+    if (hasLoadChangeConflict) {
+      showBlockedByLoadChangeToast();
+      return;
+    }
     const allMoved = shipment.pts.every(pt => pt.moved_to_staging && !pt.removed_from_staging);
     const message = allMoved
       ? 'Finalize this PU load now? This will set staged PTs to Ready to Ship.'
@@ -1148,6 +1204,10 @@ export default function ShipmentCard({
   }
 
   async function finalizeShipmentAction() {
+    if (hasLoadChangeConflict) {
+      showBlockedByLoadChangeToast();
+      return;
+    }
     try {
       await supabase
         .from('shipments')
@@ -1204,11 +1264,11 @@ export default function ShipmentCard({
 
   return (
     <>
-      <div className="bg-gray-800 rounded-lg border-2 border-gray-600">
+      <div className={cardContainerClassName}>
         {/* Header - mobile responsive */}
         <button
           onClick={handleToggle}
-          className="w-full p-3 md:p-5 flex flex-col sm:flex-row items-start sm:items-center justify-between hover:bg-gray-750 transition-colors gap-3"
+          className={headerButtonClassName}
         >
           <div className="flex items-center gap-3 md:gap-6 w-full sm:w-auto">
             <div className="text-xl md:text-2xl text-blue-400">
@@ -1225,6 +1285,11 @@ export default function ShipmentCard({
             {shipment.staging_lane && (
               <div className="bg-purple-700 px-2 md:px-4 py-1 md:py-2 rounded-lg font-bold text-l md:text-base">
                 Staging: L{shipment.staging_lane}
+              </div>
+            )}
+            {hasLoadChangeConflict && (
+              <div className="bg-red-700 px-2 md:px-4 py-1 md:py-2 rounded-lg font-bold text-l md:text-base text-white">
+                ⚠️ Stale PT in staging lane
               </div>
             )}
             <div className="relative inline-flex mt-1 sm:mt-0">
@@ -1244,6 +1309,26 @@ export default function ShipmentCard({
         {/* Expanded content */}
         {expanded && (
           <div className="p-3 md:p-6 border-t-2 border-gray-600 space-y-4 md:space-y-6">
+            {hasLoadChangeConflict && (
+              <div className="bg-red-950/70 border-2 border-red-500 p-3 md:p-4 rounded-lg">
+                <div className="font-bold text-base md:text-lg text-red-200">
+                  Action required: stale PT still sitting in this staging lane
+                </div>
+                <div className="text-sm md:text-base text-red-100 mt-2">
+                  This load is blocked until the stale PT is moved out of the staging lane. You cannot stage more PTs into this load or finalize it yet.
+                </div>
+                <div className="mt-3 space-y-2">
+                  {loadChangeConflicts.map((conflict) => (
+                    <div
+                      key={`load-conflict-${conflict.pt_id}`}
+                      className="bg-black/25 border border-red-700 rounded-lg px-3 py-2 text-xs md:text-sm text-red-50 break-all"
+                    >
+                      {conflict.message}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
             {allowAdminStatusEdit && (
               <div className="bg-indigo-900 border border-indigo-600 p-3 md:p-4 rounded-lg">
                 <div className="font-bold text-sm md:text-base text-indigo-200 mb-3">
@@ -1291,7 +1376,7 @@ export default function ShipmentCard({
                 {shipment.staging_lane && !changingStagingLane && (
                   <button
                     onClick={() => setChangingStagingLane(true)}
-                    disabled={stagingLaneBusy}
+                    disabled={stagingLaneBusy || hasLoadChangeConflict}
                     className="bg-purple-600 hover:bg-purple-700 disabled:bg-gray-600 px-3 md:px-6 py-2 md:py-3 rounded-lg font-bold text-sm md:text-base whitespace-nowrap border border-purple-700 mr-3"
                   >
                     Change Lane
@@ -1452,7 +1537,8 @@ export default function ShipmentCard({
                     <div className="flex flex-col sm:flex-row gap-2 w-full sm:w-auto">
                       <button
                         onClick={handleFinalizeShipment}
-                        className="w-full sm:w-auto bg-green-600 hover:bg-green-700 px-4 md:px-6 py-2 md:py-3 rounded-lg font-bold text-sm md:text-base"
+                        disabled={hasLoadChangeConflict}
+                        className="w-full sm:w-auto bg-green-600 hover:bg-green-700 disabled:bg-gray-600 px-4 md:px-6 py-2 md:py-3 rounded-lg font-bold text-sm md:text-base"
                       >
                         Finalize
                       </button>
@@ -1584,6 +1670,7 @@ export default function ShipmentCard({
                       const isShipped = members.some((member) => member.status === 'shipped');
                       const isArchived = members.every((member) => isPTArchived(member, mostRecentSync));
                       const isCurrentlyStaged = members.every((member) => member.moved_to_staging && !member.removed_from_staging);
+                      const hasStaleLoadConflict = members.some((member) => Boolean(member.stale_load_conflict));
                       const isStagingInProgress = members.some((member) => stagingPTIds.includes(member.id));
 
                       const laneLocations = Array.from(
@@ -1602,7 +1689,8 @@ export default function ShipmentCard({
                         hasLaneAssigned &&
                         !isCurrentlyStaged &&
                         Boolean(shipment.staging_lane) &&
-                        shipment.status !== 'finalized';
+                        shipment.status !== 'finalized' &&
+                        !hasLoadChangeConflict;
 
                       const representativeDepth = ptDepthInfo[primary.id];
                       const depthColor = representativeDepth
@@ -1621,7 +1709,8 @@ export default function ShipmentCard({
                         isCompiled,
                         isShipped,
                         isCurrentlyStaged,
-                        hasLaneLocation: laneLocations.length > 0
+                        hasLaneLocation: laneLocations.length > 0,
+                        hasLoadMismatch: hasStaleLoadConflict
                       });
 
                       return (
@@ -1669,6 +1758,17 @@ export default function ShipmentCard({
                               <div className="text-xs md:text-sm text-gray-200 mt-2 break-all">
                                 {customerLabel} | <span className="text-yellow-300 font-bold">{groupPalletCount}p</span>
                               </div>
+                              {hasStaleLoadConflict && (
+                                <div className="mt-2 space-y-1">
+                                  {members
+                                    .filter((member) => Boolean(member.stale_load_conflict))
+                                    .map((member) => (
+                                      <div key={`stale-note-${member.id}`} className="text-xs md:text-sm font-semibold text-red-200 break-all">
+                                        {member.stale_load_message || `PT ${member.pt_number} changed to a different load while it was in staging.`}
+                                      </div>
+                                    ))}
+                                </div>
+                              )}
 
                               {isShipped ? (
                                 <div className="text-sm md:text-base font-bold text-green-400 mt-2">✈️ Shipped</div>

@@ -2,6 +2,11 @@ import 'server-only';
 import { google } from 'googleapis';
 import { getSupabaseAdmin } from './supabaseAdmin';
 import { buildPuLoadKey, normalizePuDate, normalizePuNumber } from './shipmentIdentity';
+import {
+  formatPuLoadLabel,
+  isActiveShipmentStageStatus,
+  isShipmentLoadMismatch
+} from './shipmentLoadConflicts';
 
 function parseDate(dateStr: string | undefined): string | null {
   if (!dateStr || dateStr.trim() === '') return null;
@@ -81,6 +86,9 @@ type ReconcileResult = {
   shipmentDatesReconciled: number;
   mergedRows: number;
   finalizedReopened: number;
+  staleStageConflicts: number;
+  staleConflictShipments: number;
+  shipmentLinksRemoved: number;
 };
 
 type SyncGoogleSheetOptions = {
@@ -161,8 +169,6 @@ async function loadPickticketStateRows(supabaseAdmin: SupabaseAdminClient): Prom
   const { data, error } = await supabaseAdmin
     .from('picktickets')
     .select('id, pu_number, pu_date, status, carrier')
-    .not('pu_number', 'is', null)
-    .not('pu_date', 'is', null)
     .neq('customer', 'PAPER');
   if (error) throw error;
   return (data || []) as PickticketStateRow[];
@@ -228,7 +234,10 @@ async function reconcileShipmentIdentityAndStatus(
     shipmentRowsNormalized: 0,
     shipmentDatesReconciled: 0,
     mergedRows: 0,
-    finalizedReopened: 0
+    finalizedReopened: 0,
+    staleStageConflicts: 0,
+    staleConflictShipments: 0,
+    shipmentLinksRemoved: 0
   };
 
   const nowIso = new Date().toISOString();
@@ -250,8 +259,6 @@ async function reconcileShipmentIdentityAndStatus(
     const normalizedPuNumber = normalizePuNumber(row.pu_number);
     const normalizedPuDate = normalizePuDate(row.pu_date);
     const key = buildPuLoadKey(normalizedPuNumber, normalizedPuDate);
-    if (!normalizedPuNumber || !normalizedPuDate || !key) return;
-
     const normalizedCarrier = trimToNull(row.carrier);
     pickticketById.set(row.id, {
       ...row,
@@ -259,6 +266,8 @@ async function reconcileShipmentIdentityAndStatus(
       pu_date: normalizedPuDate,
       carrier: normalizedCarrier
     });
+
+    if (!normalizedPuNumber || !normalizedPuDate || !key) return;
 
     if (normalizedCarrier && !carrierByPuKey.has(key)) {
       carrierByPuKey.set(key, normalizedCarrier);
@@ -284,11 +293,112 @@ async function reconcileShipmentIdentityAndStatus(
     linksByShipmentId.set(row.shipment_id, existing);
   });
 
+  const staleStagePtIds = new Set<number>();
+  const staleShipmentIdsToTouch = new Set<number>();
+  const finalizedShipmentIdsToReopen = new Set<number>();
+  const shipmentLinksToMarkRemoved: Array<{ shipmentId: number; ptId: number }> = [];
+  const shipmentLinksToDelete: Array<{ shipmentId: number; ptId: number }> = [];
+
   for (const shipment of shipments) {
     const shipmentLinks = linksByShipmentId.get(shipment.id) || [];
-    const linkedKeys = new Set<string>();
 
     shipmentLinks.forEach((linkRow) => {
+      if (Boolean(linkRow.removed_from_staging)) return;
+
+      const ptRow = pickticketById.get(linkRow.pt_id);
+      if (!isShipmentLoadMismatch({
+        shipmentPuNumber: shipment.pu_number,
+        shipmentPuDate: shipment.pu_date,
+        ptPuNumber: ptRow?.pu_number,
+        ptPuDate: ptRow?.pu_date
+      })) {
+        return;
+      }
+
+      if (isActiveShipmentStageStatus(ptRow?.status)) {
+        linkRow.removed_from_staging = true;
+        shipmentLinksToMarkRemoved.push({ shipmentId: shipment.id, ptId: linkRow.pt_id });
+        staleStagePtIds.add(linkRow.pt_id);
+        staleShipmentIdsToTouch.add(shipment.id);
+        result.staleStageConflicts += 1;
+
+        if (ptRow) {
+          ptRow.status = 'labeled';
+        }
+
+        if ((shipment.status || '').trim().toLowerCase() === 'finalized') {
+          finalizedShipmentIdsToReopen.add(shipment.id);
+        }
+        return;
+      }
+
+      shipmentLinksToDelete.push({ shipmentId: shipment.id, ptId: linkRow.pt_id });
+    });
+  }
+
+  result.staleConflictShipments = staleShipmentIdsToTouch.size;
+
+  for (const link of shipmentLinksToDelete) {
+    const { error } = await supabaseAdmin
+      .from('shipment_pts')
+      .delete()
+      .eq('shipment_id', link.shipmentId)
+      .eq('pt_id', link.ptId);
+    if (error) throw error;
+
+    const existing = linksByShipmentId.get(link.shipmentId) || [];
+    linksByShipmentId.set(
+      link.shipmentId,
+      existing.filter((row) => row.pt_id !== link.ptId)
+    );
+    result.shipmentLinksRemoved += 1;
+  }
+
+  for (const link of shipmentLinksToMarkRemoved) {
+    const { error } = await supabaseAdmin
+      .from('shipment_pts')
+      .update({ removed_from_staging: true })
+      .eq('shipment_id', link.shipmentId)
+      .eq('pt_id', link.ptId);
+    if (error) throw error;
+  }
+
+  if (staleStagePtIds.size > 0) {
+    const { error: demoteStalePtsError } = await supabaseAdmin
+      .from('picktickets')
+      .update({ status: 'labeled' })
+      .in('id', Array.from(staleStagePtIds))
+      .in('status', ['staged', 'ready_to_ship']);
+    if (demoteStalePtsError) throw demoteStalePtsError;
+  }
+
+  for (const shipment of shipments) {
+    if (!staleShipmentIdsToTouch.has(shipment.id) && !finalizedShipmentIdsToReopen.has(shipment.id)) {
+      continue;
+    }
+
+    const nextStatus = finalizedShipmentIdsToReopen.has(shipment.id) ? 'in_process' : shipment.status;
+    const { error: updateShipmentError } = await supabaseAdmin
+      .from('shipments')
+      .update({
+        status: nextStatus,
+        updated_at: nowIso
+      })
+      .eq('id', shipment.id);
+    if (updateShipmentError) throw updateShipmentError;
+
+    shipment.status = nextStatus;
+    if (finalizedShipmentIdsToReopen.has(shipment.id)) {
+      result.finalizedReopened += 1;
+    }
+  }
+
+  for (const shipment of shipments) {
+    const shipmentLinks = linksByShipmentId.get(shipment.id) || [];
+    const activeShipmentLinks = shipmentLinks.filter((linkRow) => !Boolean(linkRow.removed_from_staging));
+    const linkedKeys = new Set<string>();
+
+    activeShipmentLinks.forEach((linkRow) => {
       const ptRow = pickticketById.get(linkRow.pt_id);
       const key = buildPuLoadKey(ptRow?.pu_number, ptRow?.pu_date);
       if (key) linkedKeys.add(key);
@@ -324,7 +434,7 @@ async function reconcileShipmentIdentityAndStatus(
 
     const conflictingRow = ((conflictingRows || []) as ShipmentRow[])[0];
     if (conflictingRow) {
-      await mergeShipmentRows(supabaseAdmin, shipment, conflictingRow, shipmentLinks, nowIso);
+      await mergeShipmentRows(supabaseAdmin, shipment, conflictingRow, activeShipmentLinks, nowIso);
       result.mergedRows += 1;
       continue;
     }
@@ -358,6 +468,7 @@ async function reconcileShipmentIdentityAndStatus(
   const reconciledShipmentPtRows = await loadShipmentPtRows(supabaseAdmin, activeShipmentIds);
   const linkedPtIdsByShipment = new Map<number, Set<number>>();
   reconciledShipmentPtRows.forEach((row) => {
+    if (Boolean(row.removed_from_staging)) return;
     const existing = linkedPtIdsByShipment.get(row.shipment_id) || new Set<number>();
     existing.add(row.pt_id);
     linkedPtIdsByShipment.set(row.shipment_id, existing);
@@ -408,6 +519,18 @@ async function logSyncSummaryEvent(
     syncedCount: number;
     skippedCount: number;
     errorCount: number;
+    sheetRowCount: number;
+    candidateRowCount: number;
+    containerCount: number;
+    activeSheetLoadCount: number;
+    newLoadGroupCount: number;
+    newLoadGroupExamples: string[];
+    skippedBreakdown: {
+      picked_up: number;
+      paper: number;
+      missing_pt_or_po: number;
+    };
+    reconciliation: ReconcileResult;
   }
 ) {
   const actorUserId = trimToNull(options.actorUserId);
@@ -423,7 +546,23 @@ async function logSyncSummaryEvent(
         source_sheet: payload.sourceSheetName,
         synced_count: payload.syncedCount,
         skipped_count: payload.skippedCount,
-        error_count: payload.errorCount
+        error_count: payload.errorCount,
+        sheet_row_count: payload.sheetRowCount,
+        candidate_row_count: payload.candidateRowCount,
+        container_count: payload.containerCount,
+        active_sheet_load_count: payload.activeSheetLoadCount,
+        new_load_group_count: payload.newLoadGroupCount,
+        new_load_group_examples: payload.newLoadGroupExamples,
+        skipped_breakdown: payload.skippedBreakdown,
+        reconciliation: {
+          shipment_rows_normalized: payload.reconciliation.shipmentRowsNormalized,
+          shipment_dates_reconciled: payload.reconciliation.shipmentDatesReconciled,
+          merged_rows: payload.reconciliation.mergedRows,
+          finalized_reopened: payload.reconciliation.finalizedReopened,
+          stale_stage_conflicts: payload.reconciliation.staleStageConflicts,
+          stale_conflict_shipments: payload.reconciliation.staleConflictShipments,
+          shipment_links_removed: payload.reconciliation.shipmentLinksRemoved
+        }
       }
     });
   if (error) {
@@ -452,8 +591,16 @@ export async function syncGoogleSheetData(options: SyncGoogleSheetOptions = {}) 
     }
     const supabaseAdmin = getSupabaseAdmin();
     const sourceSheetName = await resolveSourceSheetName(spreadsheetId);
+    const existingPickticketRows = await loadPickticketStateRows(supabaseAdmin);
+    const existingLoadKeys = new Set<string>();
 
     console.log(`📊 Syncing from sheet: ${sourceSheetName}`);
+
+    existingPickticketRows.forEach((row) => {
+      if ((row.status || '').trim().toLowerCase() === 'shipped') return;
+      const key = buildPuLoadKey(normalizePuNumber(row.pu_number), normalizePuDate(row.pu_date));
+      if (key) existingLoadKeys.add(key);
+    });
 
     // Fetch columns A through S (19 columns)
     const response = await sheets.spreadsheets.values.get({
@@ -465,7 +612,60 @@ export async function syncGoogleSheetData(options: SyncGoogleSheetOptions = {}) 
 
     if (!rows || rows.length === 0) {
       console.log('No data found.');
-      return { success: false, message: 'No data found', sourceSheet: sourceSheetName, count: 0, skipped: 0, errors: 0 };
+      await logSyncSummaryEvent(supabaseAdmin, options, {
+        sourceSheetName,
+        syncedCount: 0,
+        skippedCount: 0,
+        errorCount: 0,
+        sheetRowCount: 0,
+        candidateRowCount: 0,
+        containerCount: 0,
+        activeSheetLoadCount: 0,
+        newLoadGroupCount: 0,
+        newLoadGroupExamples: [],
+        skippedBreakdown: {
+          picked_up: 0,
+          paper: 0,
+          missing_pt_or_po: 0
+        },
+        reconciliation: {
+          shipmentRowsNormalized: 0,
+          shipmentDatesReconciled: 0,
+          mergedRows: 0,
+          finalizedReopened: 0,
+          staleStageConflicts: 0,
+          staleConflictShipments: 0,
+          shipmentLinksRemoved: 0
+        }
+      });
+      return {
+        success: false,
+        message: 'No data found',
+        sourceSheet: sourceSheetName,
+        count: 0,
+        skipped: 0,
+        errors: 0,
+        sheetRowCount: 0,
+        candidateRowCount: 0,
+        containerCount: 0,
+        activeSheetLoadCount: 0,
+        newLoadGroupCount: 0,
+        newLoadGroupExamples: [],
+        skipped_breakdown: {
+          picked_up: 0,
+          paper: 0,
+          missing_pt_or_po: 0
+        },
+        reconciliation: {
+          shipmentRowsNormalized: 0,
+          shipmentDatesReconciled: 0,
+          mergedRows: 0,
+          finalizedReopened: 0,
+          staleStageConflicts: 0,
+          staleConflictShipments: 0,
+          shipmentLinksRemoved: 0
+        }
+      };
     }
 
     const dataRows = rows.slice(1);
@@ -478,6 +678,7 @@ export async function syncGoogleSheetData(options: SyncGoogleSheetOptions = {}) 
       missing_pt_or_po: 0
     };
     const containerNumbers = new Set<string>();
+    const sheetLoadLabelsByKey = new Map<string, string>();
     const nowIso = new Date().toISOString();
     type PickticketUpsertRow = {
       customer?: string;
@@ -533,6 +734,7 @@ export async function syncGoogleSheetData(options: SyncGoogleSheetOptions = {}) 
       const normalizedContainerNumber = trimToNull(container_number);
       const normalizedRoutingNumber = trimToNull(routing_number);
       const normalizedPuNumber = normalizePuNumber(pu_number);
+      const normalizedPuDate = normalizePuDate(parseDate(pu_date));
       const normalizedCarrier = trimToNull(carrier);
       const normalizedPickupStatus = trimToNull(pickup_status);
 
@@ -574,9 +776,14 @@ export async function syncGoogleSheetData(options: SyncGoogleSheetOptions = {}) 
         routing_number: normalizedRoutingNumber,
         pu_number: normalizedPuNumber,
         carrier: normalizedCarrier,
-        pu_date: normalizePuDate(parseDate(pu_date)),
+        pu_date: normalizedPuDate,
         last_synced_at: nowIso,
       });
+
+      const loadKey = buildPuLoadKey(normalizedPuNumber, normalizedPuDate);
+      if (loadKey && !sheetLoadLabelsByKey.has(loadKey)) {
+        sheetLoadLabelsByKey.set(loadKey, formatPuLoadLabel(normalizedPuNumber, normalizedPuDate));
+      }
     }
 
     const containerRows = Array.from(containerNumbers).map((value) => ({ container_number: value }));
@@ -630,12 +837,24 @@ export async function syncGoogleSheetData(options: SyncGoogleSheetOptions = {}) 
     const message = success
       ? `Synced ${syncedCount} picktickets from "${sourceSheetName}"`
       : `Sync completed with errors from "${sourceSheetName}"`;
+    const newLoadGroupLabels = Array.from(sheetLoadLabelsByKey.entries())
+      .filter(([key]) => !existingLoadKeys.has(key))
+      .map(([, label]) => label);
+    const newLoadGroupExamples = newLoadGroupLabels.slice(0, 6);
 
     await logSyncSummaryEvent(supabaseAdmin, options, {
       sourceSheetName,
       syncedCount,
       skippedCount,
-      errorCount
+      errorCount,
+      sheetRowCount: dataRows.length,
+      candidateRowCount: pickticketRows.length,
+      containerCount: containerNumbers.size,
+      activeSheetLoadCount: sheetLoadLabelsByKey.size,
+      newLoadGroupCount: newLoadGroupLabels.length,
+      newLoadGroupExamples,
+      skippedBreakdown,
+      reconciliation: reconcileResult
     });
 
     console.log(`✅ ${message}. skipped=${skippedCount} errors=${errorCount}`);
@@ -647,6 +866,12 @@ export async function syncGoogleSheetData(options: SyncGoogleSheetOptions = {}) 
       skipped_breakdown: skippedBreakdown,
       errors: errorCount,
       sourceSheet: sourceSheetName,
+      sheetRowCount: dataRows.length,
+      candidateRowCount: pickticketRows.length,
+      containerCount: containerNumbers.size,
+      activeSheetLoadCount: sheetLoadLabelsByKey.size,
+      newLoadGroupCount: newLoadGroupLabels.length,
+      newLoadGroupExamples,
       reconciliation: reconcileResult
     };
 

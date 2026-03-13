@@ -9,7 +9,15 @@ import PTDetails from '@/components/PTDetails';
 import { Suspense } from 'react';
 import { Pickticket } from '@/types/pickticket';
 import { useAuth } from '@/components/AuthProvider';
+import { buildSyncDetailSections, buildSyncPrimarySection, normalizeSyncSummaryData, type SyncSummarySection } from '@/lib/syncSummary';
 export const dynamic = 'force-dynamic';
+
+type SyncSummaryModalState = {
+  title: string;
+  success: boolean;
+  primaryLines: string[];
+  detailSections: SyncSummarySection[];
+} | null;
 
 export default function Home() {
   const { session, isGuest } = useAuth();
@@ -17,6 +25,7 @@ export default function Home() {
   const [syncing, setSyncing] = useState(false);
   const [lastSync, setLastSync] = useState<Date | null>(null);
   const [viewingPTDetails, setViewingPTDetails] = useState<Pickticket | null>(null);
+  const [syncSummary, setSyncSummary] = useState<SyncSummaryModalState>(null);
 
   const checkLastSync = useCallback(async () => {
     const { data } = await supabase
@@ -30,6 +39,16 @@ export default function Home() {
       setLastSync(new Date(data.last_synced_at));  // CHANGE to last_synced_at
     }
   }, []);
+
+  function openSyncSummary(raw: unknown, fallbackTitle: string) {
+    const summary = normalizeSyncSummaryData(raw);
+    setSyncSummary({
+      title: fallbackTitle,
+      success: summary.success,
+      primaryLines: buildSyncPrimarySection(summary),
+      detailSections: buildSyncDetailSections(summary)
+    });
+  }
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -54,34 +73,25 @@ export default function Home() {
       });
       const data = await response.json();
 
-      const skippedBreakdown = typeof data.skipped_breakdown === 'object' && data.skipped_breakdown !== null
-        ? data.skipped_breakdown as {
-          picked_up?: number;
-          paper?: number;
-          missing_pt_or_po?: number;
-        }
-        : null;
-      const skippedDetails = skippedBreakdown
-        ? `\n- picked up: ${skippedBreakdown.picked_up || 0}\n- PAPER: ${skippedBreakdown.paper || 0}\n- missing PT/PO: ${skippedBreakdown.missing_pt_or_po || 0}`
-        : '';
-
       if (data.success) {
-        const sourceText = data.sourceSheet ? ` from "${data.sourceSheet}"` : '';
-        const skippedText = typeof data.skipped === 'number' ? `\nSkipped: ${data.skipped}` : '';
-        alert(`✅ Synced ${data.count} picktickets${sourceText}${skippedText}${skippedDetails ? `\nSkip reasons:${skippedDetails}` : ''}`);
-        setLastSync(new Date());
-        window.location.reload();
+        await checkLastSync();
+        openSyncSummary(data, 'Sync Completed');
       } else {
-        const errorText = data.error || data.details || data.message || 'Sync failed';
-        const sourceText = data.sourceSheet ? `\nSource sheet: ${data.sourceSheet}` : '';
-        const syncedText = typeof data.count === 'number' ? `\nSynced: ${data.count}` : '';
-        const skippedText = typeof data.skipped === 'number' ? `\nSkipped: ${data.skipped}` : '';
-        const errorsText = typeof data.errors === 'number' ? `\nRow errors: ${data.errors}` : '';
-        alert(`❌ ${errorText}${sourceText}${syncedText}${skippedText}${errorsText}${skippedDetails ? `\nSkip reasons:${skippedDetails}` : ''}`);
+        openSyncSummary({
+          ...data,
+          success: false,
+          message: data.error || data.details || data.message || 'Sync failed'
+        }, 'Sync Completed With Errors');
       }
     } catch (error) {
       console.error('Sync error:', error);
-      alert('❌ Sync failed');
+      openSyncSummary({
+        success: false,
+        message: error instanceof Error ? error.message : 'Sync failed',
+        count: 0,
+        skipped: 0,
+        errors: 1
+      }, 'Sync Failed');
     }
     setSyncing(false);
   }
@@ -158,6 +168,54 @@ export default function Home() {
           pt={viewingPTDetails}
           onClose={() => setViewingPTDetails(null)}
         />
+      )}
+
+      {syncSummary && (
+        <div className="fixed inset-0 z-[140] bg-black/75 flex items-center justify-center p-4">
+          <div className="w-full max-w-2xl bg-gray-900 border border-gray-700 rounded-2xl shadow-2xl overflow-hidden">
+            <div className={`px-5 py-4 border-b ${syncSummary.success ? 'bg-green-900/40 border-green-700' : 'bg-red-900/40 border-red-700'}`}>
+              <div className="text-xl font-bold">{syncSummary.title}</div>
+              <div className={`text-sm mt-1 ${syncSummary.success ? 'text-green-200' : 'text-red-200'}`}>
+                {syncSummary.success ? 'Sync finished successfully.' : 'Sync finished with errors or requires attention.'}
+              </div>
+            </div>
+
+            <div className="p-5 space-y-4 max-h-[80vh] overflow-y-auto">
+              <div className="rounded-xl border border-gray-700 bg-gray-800/70 p-4">
+                <div className="text-sm font-semibold text-gray-200 uppercase tracking-wide mb-3">Summary</div>
+                <div className="space-y-2">
+                  {syncSummary.primaryLines.map((line) => (
+                    <div key={line} className="text-sm text-gray-100">
+                      {line}
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {syncSummary.detailSections.map((section) => (
+                <div key={section.title} className="rounded-xl border border-gray-700 bg-gray-800/50 p-4">
+                  <div className="text-sm font-semibold text-blue-200 uppercase tracking-wide mb-3">{section.title}</div>
+                  <div className="space-y-2">
+                    {section.lines.map((line) => (
+                      <div key={`${section.title}-${line}`} className="text-sm text-gray-200">
+                        {line}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="px-5 py-4 border-t border-gray-700 flex justify-end">
+              <button
+                onClick={() => setSyncSummary(null)}
+                className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg font-semibold"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

@@ -2,6 +2,12 @@
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { supabase } from '@/lib/supabase';
+import {
+  buildSyncNotificationDetails,
+  buildSyncNotificationMessage,
+  buildSyncNotificationTitle,
+  normalizeSyncSummaryData
+} from '@/lib/syncSummary';
 
 const REALTIME_LEADER_KEY = 'site_realtime_leader_v1';
 const REALTIME_BROADCAST_NAME = 'site-realtime-sync-v1';
@@ -468,10 +474,20 @@ export function RealtimeProvider({ children }: { children: React.ReactNode }) {
       console.warn('Failed to open realtime socket for leader tab', error);
     }
 
-    const emitNotification = (message: string, timestamp?: string | null) => {
+    const emitNotification = (
+      message: string,
+      timestamp?: string | null,
+      options?: { title?: string | null; details?: string[] }
+    ) => {
       const createdAt = safeIsoTimestamp(timestamp);
       const id = `notif-${createdAt}-${Math.random().toString(36).slice(2, 8)}`;
-      emitScopeEvent('notifications', { id, message, createdAt });
+      emitScopeEvent('notifications', {
+        id,
+        title: options?.title || null,
+        message,
+        details: options?.details || [],
+        createdAt
+      });
     };
 
     const handleShipmentChange = (payload: RealtimeDbPayload) => {
@@ -525,18 +541,14 @@ export function RealtimeProvider({ children }: { children: React.ReactNode }) {
     };
 
     const handleSyncSummaryLogInsert = (payload: RealtimeDbPayload) => {
-      const details = payload.new?.details;
-      let errorCount = 0;
-      if (details && typeof details === 'object') {
-        const raw = (details as Record<string, unknown>).error_count;
-        const parsed = Number(raw);
-        if (Number.isFinite(parsed)) {
-          errorCount = parsed;
-        }
-      }
+      const summary = normalizeSyncSummaryData(payload.new?.details);
       emitNotification(
-        errorCount > 0 ? 'A sync completed with errors.' : 'A sync completed.',
-        payload.commit_timestamp || asTrimmedText(payload.new?.created_at)
+        buildSyncNotificationMessage(summary),
+        payload.commit_timestamp || asTrimmedText(payload.new?.created_at),
+        {
+          title: buildSyncNotificationTitle(summary),
+          details: buildSyncNotificationDetails(summary)
+        }
       );
     };
 
