@@ -5,6 +5,7 @@ import Link from 'next/link';
 import { supabase } from '@/lib/supabase';
 import ShipmentCard, { Shipment, ShipmentPT } from '@/components/ShipmentCard';
 import OCRCamera from '@/components/OCRCamera';
+import CompiledPalletVerificationModal from '@/components/CompiledPalletVerificationModal';
 import { isPTArchived } from '@/lib/utils';
 import { exportShipmentSummaryPdf, ShipmentPdfLoad } from '@/lib/shipmentPdf';
 import { useAuth } from '@/components/AuthProvider';
@@ -14,6 +15,12 @@ import { buildPuLoadKey, normalizePuDate, normalizePuNumber } from '@/lib/shipme
 import { setShipmentStagingLaneWithAutoLink } from '@/lib/setShipmentStagingLane';
 import { buildSetShipmentStagingLaneErrorMessage, buildSetShipmentStagingLaneSuccessMessage } from '@/lib/setShipmentStagingLaneFeedback';
 import { describeUnknownStageError, stageLaneAssignmentIntoShipment } from '@/lib/stageShipmentExecution';
+import {
+  buildCompiledMembersById,
+  compareTextNumeric,
+  getRangeLabel,
+  normalizeDigits
+} from '@/lib/compiledPalletDisplay';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const SHIPPED_TO_ARCHIVED_DAYS = 7;
@@ -135,10 +142,6 @@ function cloneShipmentSnapshot(shipment: Shipment): Shipment {
   return JSON.parse(JSON.stringify(shipment)) as Shipment;
 }
 
-function compareTextNumeric(a: string, b: string): number {
-  return a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
-}
-
 function describeSupabaseError(error: { code?: string; message?: string; details?: string; hint?: string } | null) {
   if (!error) return 'Unknown Supabase error';
   return [error.code, error.message, error.details, error.hint].filter(Boolean).join(' | ') || 'Unknown Supabase error';
@@ -199,12 +202,6 @@ function plannerRowIsCompiledGroup(row: PlannerQueueRow): boolean {
 
 function plannerRowMemberCount(row: PlannerQueueRow): number {
   return Math.max(1, toSafeNumber(row.pending_member_count, 0));
-}
-
-function plannerRowTypeLabel(row: PlannerQueueRow): string {
-  return plannerRowIsCompiledGroup(row)
-    ? `compiled pallet (${plannerRowMemberCount(row)} PT${plannerRowMemberCount(row) === 1 ? '' : 's'})`
-    : 'single PT';
 }
 
 function plannerRowsMatchIdentity(a: PlannerQueueRow, b: PlannerQueueRow): boolean {
@@ -437,6 +434,10 @@ export default function ShipmentsPage() {
   const [plannerLanePreviewData, setPlannerLanePreviewData] = useState<PlannerStagingLanePreviewData | null>(null);
   const [plannerLanePreviewLoading, setPlannerLanePreviewLoading] = useState(false);
   const [plannerLanePreviewError, setPlannerLanePreviewError] = useState<string | null>(null);
+  const [plannerManualCompiledRow, setPlannerManualCompiledRow] = useState<PlannerQueueRow | null>(null);
+  const [plannerManualCompiledMembers, setPlannerManualCompiledMembers] = useState<ShipmentPT[]>([]);
+  const [plannerManualCompiledInput, setPlannerManualCompiledInput] = useState('');
+  const [plannerManualCompiledError, setPlannerManualCompiledError] = useState('');
   const [mobileMoreOptionsOpen, setMobileMoreOptionsOpen] = useState(false);
   const plannerSyncActive = plannerModalOpen || plannerQueueRaw.length > 0;
   const shipmentRefreshTimerRef = useRef<number | null>(null);
@@ -459,12 +460,45 @@ export default function ShipmentsPage() {
   const fetchShipmentsRef = useRef<() => Promise<void>>(async () => { });
   const fetchStaleSnapshotsRef = useRef<() => Promise<void>>(async () => { });
   const buildPlannerQueueRef = useRef<(options?: { silent?: boolean }) => Promise<PlannerQueueRow[] | null>>(async () => null);
-  const executePlannerStageRef = useRef<(row: PlannerQueueRow) => Promise<void>>(async () => { });
 
   const plannerPuDateFilterOptions = useMemo(
     () => buildPlannerPuDateFilterOptions(plannerQueueRaw),
     [plannerQueueRaw]
   );
+
+  const shipmentsByKey = useMemo(
+    () => new Map(shipments.map((shipment) => [shipmentKey(shipment), shipment] as const)),
+    [shipments]
+  );
+
+  const compiledMembersByShipmentKey = useMemo(() => {
+    const groups = new Map<string, Map<number, ShipmentPT[]>>();
+    shipments.forEach((shipment) => {
+      groups.set(shipmentKey(shipment), buildCompiledMembersById(shipment.pts));
+    });
+    return groups;
+  }, [shipments]);
+
+  const resolvePlannerCompiledGroupMembers = useCallback((row: PlannerQueueRow): ShipmentPT[] => {
+    if (!plannerRowIsCompiledGroup(row)) return [];
+
+    const shipment = shipmentsByKey.get(plannerRowShipmentKey(row));
+    if (!shipment) return [];
+
+    const pendingIds = new Set((row.pending_member_pt_ids || []).map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0));
+    const representative = shipment.pts.find((pt) => pt.id === row.representative_pt_id)
+      || shipment.pts.find((pt) => pendingIds.has(pt.id))
+      || null;
+
+    const compiledId = Number(representative?.compiled_pallet_id || 0);
+    if (Number.isFinite(compiledId) && compiledId > 0) {
+      return compiledMembersByShipmentKey.get(shipmentKey(shipment))?.get(compiledId) || [];
+    }
+
+    return shipment.pts
+      .filter((pt) => pt.id === row.representative_pt_id || pendingIds.has(pt.id))
+      .sort((left, right) => compareTextNumeric(left.pt_number, right.pt_number));
+  }, [compiledMembersByShipmentKey, shipmentsByKey]);
 
   useEffect(() => {
     void fetchShipmentsRef.current();
@@ -514,6 +548,10 @@ export default function ShipmentsPage() {
     setPlannerLanePreviewData(null);
     setPlannerLanePreviewLoading(false);
     setPlannerLanePreviewError(null);
+    setPlannerManualCompiledRow(null);
+    setPlannerManualCompiledMembers([]);
+    setPlannerManualCompiledInput('');
+    setPlannerManualCompiledError('');
     setPlannerDateFilterOpen(false);
   }, [plannerModalOpen]);
 
@@ -952,8 +990,6 @@ export default function ShipmentsPage() {
     }
   }
 
-  executePlannerStageRef.current = executePlannerStage;
-
   async function stagePlannerRow(row: PlannerQueueRow) {
     if (!plannerRowHasStagingLane(row)) {
       setPlannerToast({
@@ -965,7 +1001,29 @@ export default function ShipmentsPage() {
 
     if (plannerScanningRow !== null) return;
 
-    if (!requireOCRForStaging || plannerRowIsCompiledGroup(row)) {
+    if (plannerRowIsCompiledGroup(row)) {
+      if (!requireOCRForStaging) {
+        await executePlannerStage(row);
+        return;
+      }
+
+      const compiledMembers = resolvePlannerCompiledGroupMembers(row);
+      if (compiledMembers.length === 0) {
+        setPlannerToast({
+          message: 'Compiled pallet details are not loaded yet. Refresh shipments and try again.',
+          type: 'error'
+        });
+        return;
+      }
+
+      setPlannerManualCompiledRow(row);
+      setPlannerManualCompiledMembers(compiledMembers);
+      setPlannerManualCompiledInput('');
+      setPlannerManualCompiledError('');
+      return;
+    }
+
+    if (!requireOCRForStaging) {
       await executePlannerStage(row);
       return;
     }
@@ -973,12 +1031,35 @@ export default function ShipmentsPage() {
     setPlannerScanningRow(row);
   }
 
-  useEffect(() => {
-    if (!plannerScanningRow || !plannerRowIsCompiledGroup(plannerScanningRow)) return;
-    const compiledRow = plannerScanningRow;
-    setPlannerScanningRow(null);
-    void executePlannerStageRef.current(compiledRow);
-  }, [plannerScanningRow]);
+  async function confirmPlannerManualCompiledStage() {
+    if (!plannerManualCompiledRow || plannerManualCompiledMembers.length === 0) return;
+
+    const entered = normalizeDigits(plannerManualCompiledInput);
+    if (!entered) {
+      setPlannerManualCompiledError('Enter any PT or PO from this compiled pallet.');
+      return;
+    }
+
+    const allowedTokens = new Set<string>();
+    plannerManualCompiledMembers.forEach((pt) => {
+      const ptDigits = normalizeDigits(pt.pt_number);
+      const poDigits = normalizeDigits(pt.po_number);
+      if (ptDigits) allowedTokens.add(ptDigits);
+      if (poDigits) allowedTokens.add(poDigits);
+    });
+
+    if (!allowedTokens.has(entered)) {
+      setPlannerManualCompiledError('Input does not match any PT/PO in this compiled pallet.');
+      return;
+    }
+
+    const selectedRow = plannerManualCompiledRow;
+    setPlannerManualCompiledRow(null);
+    setPlannerManualCompiledMembers([]);
+    setPlannerManualCompiledInput('');
+    setPlannerManualCompiledError('');
+    await executePlannerStage(selectedRow);
+  }
 
   async function setPlannerShipmentStagingLane(row: PlannerQueueRow) {
     if (isGuest || plannerLoading || plannerExecutingAssignmentId !== null || plannerAssigningShipmentKey !== null || plannerScanningRow !== null) return;
@@ -2138,7 +2219,12 @@ export default function ShipmentsPage() {
                         const rowHasStagingLane = plannerRowHasStagingLane(row);
                         const rowShipmentKey = plannerRowShipmentKey(row);
                         const isCompiledRow = plannerRowIsCompiledGroup(row);
-                        const rowMemberCount = plannerRowMemberCount(row);
+                        const compiledMembers = isCompiledRow ? resolvePlannerCompiledGroupMembers(row) : [];
+                        const rowMemberCount = isCompiledRow && compiledMembers.length > 0
+                          ? compiledMembers.length
+                          : plannerRowMemberCount(row);
+                        const ptRangeLabel = isCompiledRow ? getRangeLabel(compiledMembers.map((member) => member.pt_number)) : '';
+                        const poRangeLabel = isCompiledRow ? getRangeLabel(compiledMembers.map((member) => member.po_number)) : '';
                         return (
                           <div
                             key={`${row.step_no}-${row.assignment_id}`}
@@ -2177,20 +2263,38 @@ export default function ShipmentsPage() {
                             </div>
 
                             {isCompiledRow && (
-                              <div className="inline-flex rounded-full border border-orange-500/70 bg-orange-950/70 px-2.5 py-1 text-[11px] font-bold uppercase tracking-[0.14em] text-orange-200">
-                                Compiled Pallet · {rowMemberCount} PTs
+                              <div className="space-y-2">
+                                <div className="inline-flex rounded-full border border-orange-500/70 bg-orange-950/70 px-2.5 py-1 text-[11px] font-bold uppercase tracking-[0.14em] text-orange-200">
+                                  Compiled Pallet · {rowMemberCount} PTs
+                                </div>
+                                <div className="rounded border border-orange-700/60 bg-orange-950/30 p-2 text-sm">
+                                  <div className="font-semibold text-white break-all">PT Range: {ptRangeLabel}</div>
+                                  <div className="text-gray-200 break-all">PO Range: {poRangeLabel}</div>
+                                  <details className="mt-2 rounded border border-orange-700/60 bg-orange-950/35 px-2 py-1">
+                                    <summary className="cursor-pointer text-xs text-orange-200">
+                                      Show PT/PO list
+                                    </summary>
+                                    <div className="mt-2 space-y-1">
+                                      {compiledMembers.map((member) => (
+                                        <div key={member.id} className="text-xs text-gray-100 break-all">
+                                          PT #{member.pt_number} | PO {member.po_number}
+                                        </div>
+                                      ))}
+                                    </div>
+                                  </details>
+                                </div>
                               </div>
                             )}
 
                             <div className="grid grid-cols-2 gap-2">
                               <div className="rounded border border-slate-700 bg-slate-950 p-2">
-                                <div className="text-[11px] text-slate-400">{isCompiledRow ? 'Rep PT #' : 'PT #'}</div>
+                                <div className="text-[11px] text-slate-400">{isCompiledRow ? 'Representative PT #' : 'PT #'}</div>
                                 <div className="text-sm font-semibold text-white">
                                   {row.representative_pt_number || String(row.representative_pt_id || 'N/A')}
                                 </div>
                               </div>
                               <div className="rounded border border-slate-700 bg-slate-950 p-2">
-                                <div className="text-[11px] text-slate-400">{isCompiledRow ? 'Rep PO #' : 'PO #'}</div>
+                                <div className="text-[11px] text-slate-400">{isCompiledRow ? 'Representative PO #' : 'PO #'}</div>
                                 <div className="text-sm font-semibold text-white">{row.representative_po_number || 'N/A'}</div>
                               </div>
                             </div>
@@ -2200,7 +2304,7 @@ export default function ShipmentsPage() {
                               <span>Date: {row.pu_date || 'N/A'}</span>
                               <span>In Front: {row.pallets_in_front}p</span>
                               <span>Pending: {row.pending_member_count}</span>
-                              <span>Type: {plannerRowTypeLabel(row)}</span>
+                              <span>Type: {isCompiledRow ? `compiled pallet (${rowMemberCount} PTs)` : 'single PT'}</span>
                             </div>
 
                             {rowHasStagingLane ? (
@@ -2248,7 +2352,12 @@ export default function ShipmentsPage() {
                           const rowHasStagingLane = plannerRowHasStagingLane(row);
                           const rowShipmentKey = plannerRowShipmentKey(row);
                           const isCompiledRow = plannerRowIsCompiledGroup(row);
-                          const rowMemberCount = plannerRowMemberCount(row);
+                          const compiledMembers = isCompiledRow ? resolvePlannerCompiledGroupMembers(row) : [];
+                          const rowMemberCount = isCompiledRow && compiledMembers.length > 0
+                            ? compiledMembers.length
+                            : plannerRowMemberCount(row);
+                          const ptRangeLabel = isCompiledRow ? getRangeLabel(compiledMembers.map((member) => member.pt_number)) : '';
+                          const poRangeLabel = isCompiledRow ? getRangeLabel(compiledMembers.map((member) => member.po_number)) : '';
                           return (
                             <tr
                               key={`${row.step_no}-${row.assignment_id}`}
@@ -2259,9 +2368,25 @@ export default function ShipmentsPage() {
                               <td className="py-2 px-3 whitespace-nowrap">{row.pu_date || 'N/A'}</td>
                               <td className="py-2 px-3 whitespace-nowrap">
                                 {isCompiledRow ? (
-                                  <div className="space-y-1">
+                                  <div className="space-y-1 min-w-[220px]">
                                     <div className="inline-flex rounded-full border border-orange-500/70 bg-orange-950/70 px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.14em] text-orange-200">
                                       Compiled · {rowMemberCount} PTs
+                                    </div>
+                                    <div className="text-white font-semibold break-all">PT Range: {ptRangeLabel}</div>
+                                    <details className="rounded border border-orange-700/60 bg-orange-950/35 px-2 py-1">
+                                      <summary className="cursor-pointer text-xs text-orange-200">
+                                        Show PT/PO list
+                                      </summary>
+                                      <div className="mt-2 space-y-1">
+                                        {compiledMembers.map((member) => (
+                                          <div key={member.id} className="text-xs text-gray-100 break-all">
+                                            PT #{member.pt_number} | PO {member.po_number}
+                                          </div>
+                                        ))}
+                                      </div>
+                                    </details>
+                                    <div className="text-[10px] uppercase tracking-[0.12em] text-slate-400">
+                                      Representative PT
                                     </div>
                                     <div>{row.representative_pt_number || String(row.representative_pt_id || 'N/A')}</div>
                                   </div>
@@ -2271,8 +2396,9 @@ export default function ShipmentsPage() {
                               </td>
                               <td className="py-2 px-3 whitespace-nowrap">
                                 {isCompiledRow ? (
-                                  <div>
-                                    <div className="text-[10px] uppercase tracking-[0.12em] text-slate-400">Rep PO</div>
+                                  <div className="min-w-[180px]">
+                                    <div className="text-white font-semibold break-all">PO Range: {poRangeLabel}</div>
+                                    <div className="text-[10px] uppercase tracking-[0.12em] text-slate-400 mt-1">Representative PO</div>
                                     <div>{row.representative_po_number || 'N/A'}</div>
                                   </div>
                                 ) : (
@@ -2296,7 +2422,7 @@ export default function ShipmentsPage() {
                               </td>
                               <td className="py-2 px-3 whitespace-nowrap">{row.pallets_to_move}p</td>
                               <td className="py-2 px-3 whitespace-nowrap">{row.pallets_in_front}p</td>
-                              <td className="py-2 px-3 whitespace-nowrap">{plannerRowTypeLabel(row)}</td>
+                              <td className="py-2 px-3 whitespace-nowrap">{isCompiledRow ? `compiled pallet (${rowMemberCount} PTs)` : 'single PT'}</td>
                               <td className="py-2 px-3 whitespace-nowrap">{row.pending_member_count}</td>
                               <td className="py-2 px-3 whitespace-nowrap">{row.days_until_pu === 9999 ? 'N/A' : row.days_until_pu}</td>
                               <td className="py-2 px-3">
@@ -2416,6 +2542,31 @@ export default function ShipmentsPage() {
           </div>
         </div>
       )}
+
+      <CompiledPalletVerificationModal
+        isOpen={Boolean(plannerManualCompiledRow)}
+        items={plannerManualCompiledMembers.map((pt) => ({
+          id: pt.id,
+          ptNumber: pt.pt_number,
+          poNumber: pt.po_number
+        }))}
+        value={plannerManualCompiledInput}
+        error={plannerManualCompiledError}
+        title="Stage Compiled Pallet"
+        description="Enter any PT or PO from this compiled pallet to stage all PTs together."
+        onValueChange={(value) => {
+          setPlannerManualCompiledInput(value);
+          setPlannerManualCompiledError('');
+        }}
+        onConfirm={() => void confirmPlannerManualCompiledStage()}
+        onClose={() => {
+          setPlannerManualCompiledRow(null);
+          setPlannerManualCompiledMembers([]);
+          setPlannerManualCompiledInput('');
+          setPlannerManualCompiledError('');
+        }}
+        zIndexClass="z-[111]"
+      />
 
       {plannerScanningRow && !plannerRowIsCompiledGroup(plannerScanningRow) && (
         <OCRCamera

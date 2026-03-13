@@ -5,6 +5,7 @@ import { supabase } from '@/lib/supabase';
 import ConfirmModal from './ConfirmModal';
 import PTDetails from './PTDetails';
 import ActionToast from './ActionToast';
+import CompiledPalletVerificationModal from './CompiledPalletVerificationModal';
 import { isPTArchived } from '@/lib/utils';
 import { exportShipmentSummaryPdf, ShipmentPdfLoad } from '@/lib/shipmentPdf';
 import { setShipmentStagingLaneWithAutoLink } from '@/lib/setShipmentStagingLane';
@@ -19,6 +20,12 @@ import {
 } from '@/lib/setShipmentStagingLaneFeedback';
 import { stageLaneAssignmentIntoShipment } from '@/lib/stageShipmentExecution';
 import { touchShipmentUpdatedAtByLoad } from '@/lib/touchShipmentUpdatedAt';
+import {
+  buildCompiledMembersById,
+  compareTextNumeric,
+  getRangeLabel,
+  normalizeDigits
+} from '@/lib/compiledPalletDisplay';
 
 import OCRCamera from './OCRCamera';
 
@@ -72,10 +79,6 @@ type ShipmentLaneDisplayGroup = {
   members: ShipmentPT[];
 };
 
-function normalizeDigits(value?: string | null): string {
-  return (value || '').replace(/\D/g, '');
-}
-
 function asTrimmedText(value: unknown): string {
   return String(value ?? '').trim();
 }
@@ -113,36 +116,6 @@ function describeError(error: unknown): string {
   }
 
   return 'Unknown error';
-}
-
-function compareTextNumeric(a: string, b: string): number {
-  const aDigits = normalizeDigits(a);
-  const bDigits = normalizeDigits(b);
-  if (aDigits && bDigits) {
-    const aNum = Number(aDigits);
-    const bNum = Number(bDigits);
-    if (Number.isFinite(aNum) && Number.isFinite(bNum) && aNum !== bNum) {
-      return aNum - bNum;
-    }
-  }
-  return a.localeCompare(b, undefined, { sensitivity: 'base', numeric: true });
-}
-
-function getSortedUniqueLabels(values: Array<string | null | undefined>): string[] {
-  return Array.from(
-    new Set(
-      values
-        .map((value) => String(value || '').trim())
-        .filter(Boolean)
-    )
-  ).sort(compareTextNumeric);
-}
-
-function getRangeLabel(values: Array<string | null | undefined>): string {
-  const labels = getSortedUniqueLabels(values);
-  if (labels.length === 0) return '-';
-  if (labels.length === 1) return labels[0];
-  return `${labels[0]} - ${labels[labels.length - 1]}`;
 }
 
 function sumUniquePallets(pts: ShipmentPT[], predicate: (pt: ShipmentPT) => boolean): number {
@@ -656,23 +629,7 @@ export default function ShipmentCard({
   }
 
   const compiledMembersById = useMemo(() => {
-    const groups = new Map<number, ShipmentPT[]>();
-    shipment.pts.forEach((pt) => {
-      const compiledId = pt.compiled_pallet_id;
-      if (compiledId === null || compiledId === undefined) return;
-      const existing = groups.get(compiledId) || [];
-      existing.push(pt);
-      groups.set(compiledId, existing);
-    });
-
-    groups.forEach((members, compiledId) => {
-      groups.set(
-        compiledId,
-        [...members].sort((a, b) => compareTextNumeric(a.pt_number, b.pt_number))
-      );
-    });
-
-    return groups;
+    return buildCompiledMembersById(shipment.pts);
   }, [shipment.pts]);
 
   function getCompiledMembers(pt: ShipmentPT): ShipmentPT[] {
@@ -1826,78 +1783,26 @@ export default function ShipmentCard({
         onCancel={() => setConfirmModal({ ...confirmModal, isOpen: false })}
       />
 
-      {manualCompiledStagePTs && (
-        <div className="fixed inset-0 bg-black/90 z-[105] flex items-center justify-center p-4">
-          <div className="w-full max-w-lg bg-gray-800 border border-orange-500 rounded-xl p-4 md:p-6">
-            <div className="flex items-center justify-between mb-3">
-              <h3 className="text-lg md:text-xl font-bold text-orange-300">Stage Compiled Pallet</h3>
-              <button
-                type="button"
-                onClick={() => {
-                  setManualCompiledStagePTs(null);
-                  setManualCompiledInput('');
-                  setManualCompiledError('');
-                }}
-                className="text-2xl leading-none hover:text-red-400"
-              >
-                &times;
-              </button>
-            </div>
-
-            <p className="text-sm text-gray-300 mb-3">
-              OCR is skipped for compiled pallets. Enter any PT or PO from this group to stage all PTs together.
-            </p>
-
-            <div className="mb-3 max-h-40 overflow-auto rounded border border-gray-700 bg-gray-900/70 p-2 space-y-1">
-              {manualCompiledStagePTs
-                .slice()
-                .sort((a, b) => compareTextNumeric(a.pt_number, b.pt_number))
-                .map((pt) => (
-                  <div key={pt.id} className="text-xs md:text-sm text-gray-200">
-                    PT #{pt.pt_number} | PO {pt.po_number}
-                  </div>
-                ))}
-            </div>
-
-            <input
-              type="text"
-              value={manualCompiledInput}
-              onChange={(event) => {
-                setManualCompiledInput(event.target.value);
-                setManualCompiledError('');
-              }}
-              placeholder="Enter any PT or PO from this group"
-              className="w-full bg-gray-900 border border-gray-600 rounded px-3 py-2 text-sm md:text-base"
-              autoFocus
-            />
-
-            {manualCompiledError && (
-              <div className="text-xs md:text-sm text-red-400 mt-2">{manualCompiledError}</div>
-            )}
-
-            <div className="mt-4 flex gap-2">
-              <button
-                type="button"
-                onClick={() => void confirmManualCompiledStage()}
-                className="flex-1 bg-green-600 hover:bg-green-700 px-3 py-2 rounded-lg font-semibold text-sm md:text-base"
-              >
-                Verify & Stage All
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setManualCompiledStagePTs(null);
-                  setManualCompiledInput('');
-                  setManualCompiledError('');
-                }}
-                className="flex-1 bg-gray-600 hover:bg-gray-700 px-3 py-2 rounded-lg font-semibold text-sm md:text-base"
-              >
-                Cancel
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      <CompiledPalletVerificationModal
+        isOpen={Boolean(manualCompiledStagePTs)}
+        items={(manualCompiledStagePTs || []).map((pt) => ({
+          id: pt.id,
+          ptNumber: pt.pt_number,
+          poNumber: pt.po_number
+        }))}
+        value={manualCompiledInput}
+        error={manualCompiledError}
+        onValueChange={(value) => {
+          setManualCompiledInput(value);
+          setManualCompiledError('');
+        }}
+        onConfirm={() => void confirmManualCompiledStage()}
+        onClose={() => {
+          setManualCompiledStagePTs(null);
+          setManualCompiledInput('');
+          setManualCompiledError('');
+        }}
+      />
 
       {/* OCR Camera Modal */}
       {scanningPT && (
