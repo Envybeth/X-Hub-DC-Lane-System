@@ -426,6 +426,7 @@ export default function ShipmentsPage() {
   const [mobileMoreOptionsOpen, setMobileMoreOptionsOpen] = useState(false);
   const plannerSyncActive = plannerModalOpen || plannerQueueRaw.length > 0;
   const shipmentRefreshTimerRef = useRef<number | null>(null);
+  const plannerRefreshTimerRef = useRef<number | null>(null);
   const shipmentFetchInFlightRef = useRef(false);
   const shipmentFetchQueuedRef = useRef(false);
   const hasLoadedShipmentsRef = useRef(false);
@@ -443,6 +444,7 @@ export default function ShipmentsPage() {
   const latestFetchedShipmentsRef = useRef<Shipment[]>([]);
   const fetchShipmentsRef = useRef<() => Promise<void>>(async () => { });
   const fetchStaleSnapshotsRef = useRef<() => Promise<void>>(async () => { });
+  const buildPlannerQueueRef = useRef<(options?: { silent?: boolean }) => Promise<PlannerQueueRow[] | null>>(async () => null);
 
   const plannerPuDateFilterOptions = useMemo(
     () => buildPlannerPuDateFilterOptions(plannerQueueRaw),
@@ -487,14 +489,7 @@ export default function ShipmentsPage() {
 
   useEffect(() => {
     if (!plannerModalOpen || isGuest || plannerLoading || plannerDateFilterInitializedRef.current) return;
-    if (shipmentFetchInFlightRef.current && latestFetchedShipmentsRef.current.length === 0) {
-      requestPlannerQueueRefresh();
-      return;
-    }
-    void buildPlannerQueue({
-      silent: true,
-      shipmentsOverride: latestFetchedShipmentsRef.current
-    });
+    void buildPlannerQueue({ silent: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [plannerModalOpen, isGuest, plannerLoading, requestPlannerQueueRefresh]);
 
@@ -593,7 +588,7 @@ export default function ShipmentsPage() {
     }
   }
 
-  async function buildPlannerQueue(options?: { silent?: boolean; shipmentsOverride?: Shipment[] }) {
+  async function buildPlannerQueue(options?: { silent?: boolean }) {
     if (plannerBuildInFlightRef.current) return null;
 
     plannerBuildInFlightRef.current = true;
@@ -622,23 +617,8 @@ export default function ShipmentsPage() {
         throw error;
       }
 
-      const shipmentSource = options?.shipmentsOverride
-        ?? (latestFetchedShipmentsRef.current.length > 0 ? latestFetchedShipmentsRef.current : shipments);
-      const shipmentStatusByKey = new Map(
-        shipmentSource
-          .map((shipment) => [buildPuLoadKey(shipment.pu_number, shipment.pu_date), shipment.status] as const)
-          .filter(([key]) => Boolean(key))
-      );
-
       const typedRows = normalizePlannerQueueRows((data || []) as PlannerQueueRow[])
-        .filter((row) => {
-          if (row.pending_member_count <= 0) return false;
-          if (!plannerIncludeFinalized) {
-            const localStatus = shipmentStatusByKey.get(plannerRowShipmentKey(row));
-            if (localStatus === 'finalized') return false;
-          }
-          return true;
-        });
+        .filter((row) => row.pending_member_count > 0);
       const nextDateOptions = buildPlannerPuDateFilterOptions(typedRows);
       const allDateSelections = nextDateOptions.map((option) => option.puDate);
       const currentSelectedSet = new Set(plannerSelectedPuDates.map((value) => toTrimmedText(value)));
@@ -678,18 +658,16 @@ export default function ShipmentsPage() {
       return null;
     } finally {
       const newerRefreshRequested = plannerRefreshRequestedRef.current > buildRequestVersion;
-      const nextShipmentSnapshot = latestFetchedShipmentsRef.current;
       const shouldReplayRefresh = newerRefreshRequested && plannerSyncActiveRef.current && !document.hidden;
       plannerBuildInFlightRef.current = false;
       setPlannerLoading(false);
       if (shouldReplayRefresh) {
-        void buildPlannerQueue({
-          silent: true,
-          shipmentsOverride: nextShipmentSnapshot
-        });
+        void buildPlannerQueue({ silent: true });
       }
     }
   }
+
+  buildPlannerQueueRef.current = buildPlannerQueue;
 
   function scrollPlannerQueueToTop(behavior: ScrollBehavior = 'auto') {
     if (!plannerQueueContainerRef.current) return;
@@ -1045,6 +1023,15 @@ export default function ShipmentsPage() {
       pendingVisibleRefreshRef.current = true;
       return;
     }
+    if (plannerSyncActiveRef.current) {
+      if (plannerRefreshTimerRef.current) {
+        window.clearTimeout(plannerRefreshTimerRef.current);
+      }
+      plannerRefreshTimerRef.current = window.setTimeout(() => {
+        plannerRefreshTimerRef.current = null;
+        void buildPlannerQueueRef.current({ silent: true });
+      }, 180);
+    }
     if (shipmentRefreshTimerRef.current) {
       window.clearTimeout(shipmentRefreshTimerRef.current);
     }
@@ -1074,6 +1061,9 @@ export default function ShipmentsPage() {
 
       pendingVisibleRefreshRef.current = false;
       requestPlannerQueueRefresh();
+      if (plannerSyncActiveRef.current) {
+        void buildPlannerQueueRef.current({ silent: true });
+      }
       void fetchShipmentsRef.current();
       if (staleSnapshotStoreAvailable && staleRefreshRequestedRef.current) {
         staleRefreshRequestedRef.current = false;
@@ -1104,6 +1094,9 @@ export default function ShipmentsPage() {
     if (realtimeHealth === 'live') return;
     if (document.hidden) return;
     requestPlannerQueueRefresh();
+    if (plannerSyncActiveRef.current) {
+      void buildPlannerQueueRef.current({ silent: true });
+    }
     void fetchShipmentsRef.current();
     if (staleSnapshotStoreAvailable) {
       void fetchStaleSnapshotsRef.current();
@@ -1118,6 +1111,9 @@ export default function ShipmentsPage() {
       if (document.hidden) return;
       if (realtimeHealth !== 'live') {
         requestPlannerQueueRefresh();
+      }
+      if (plannerSyncActiveRef.current) {
+        void buildPlannerQueueRef.current({ silent: true });
       }
       void fetchShipmentsRef.current();
       if (staleSnapshotStoreAvailable) {
@@ -1386,20 +1382,6 @@ export default function ShipmentsPage() {
       latestFetchedShipmentsRef.current = sortedShipments;
       setShipments(sortedShipments);
 
-      const shouldRefreshPlannerQueue = (
-        !isGuest
-        && plannerSyncActiveRef.current
-        && plannerRefreshRequestedRef.current > plannerRefreshCompletedRef.current
-        && !document.hidden
-        && !plannerBuildInFlightRef.current
-      );
-      if (shouldRefreshPlannerQueue) {
-        await buildPlannerQueue({
-          silent: true,
-          shipmentsOverride: sortedShipments
-        });
-      }
-
     } catch (error) {
       console.error('Error fetching shipments:', error);
     } finally {
@@ -1415,6 +1397,17 @@ export default function ShipmentsPage() {
 
   fetchShipmentsRef.current = fetchShipments;
   fetchStaleSnapshotsRef.current = fetchStaleSnapshotsFromSupabase;
+
+  useEffect(() => {
+    return () => {
+      if (plannerRefreshTimerRef.current) {
+        window.clearTimeout(plannerRefreshTimerRef.current);
+      }
+      if (shipmentRefreshTimerRef.current) {
+        window.clearTimeout(shipmentRefreshTimerRef.current);
+      }
+    };
+  }, []);
 
   const isInActiveSection = useCallback((shipment: Shipment) => {
     if (shipment.archived) return false;
