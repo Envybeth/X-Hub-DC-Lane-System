@@ -1119,7 +1119,7 @@ export default function ShipmentsPage() {
     await stagePlannerRow(plannerQueue[0]);
   }
 
-  const scheduleShipmentRefresh = useCallback((includeStale = false) => {
+  const schedulePlannerQueueRefresh = useCallback((includeStale = false) => {
     if (includeStale) {
       staleRefreshRequestedRef.current = true;
     }
@@ -1128,15 +1128,22 @@ export default function ShipmentsPage() {
       pendingVisibleRefreshRef.current = true;
       return;
     }
-    if (plannerSyncActiveRef.current) {
-      if (plannerRefreshTimerRef.current) {
-        window.clearTimeout(plannerRefreshTimerRef.current);
-      }
-      plannerRefreshTimerRef.current = window.setTimeout(() => {
-        plannerRefreshTimerRef.current = null;
-        void buildPlannerQueueRef.current({ silent: true });
-      }, 180);
+    if (!plannerSyncActiveRef.current) return;
+    if (plannerRefreshTimerRef.current) {
+      window.clearTimeout(plannerRefreshTimerRef.current);
     }
+    plannerRefreshTimerRef.current = window.setTimeout(() => {
+      plannerRefreshTimerRef.current = null;
+      void buildPlannerQueueRef.current({ silent: true });
+    }, 180);
+  }, [requestPlannerQueueRefresh]);
+
+  const scheduleShipmentRefresh = useCallback((includeStale = false) => {
+    if (includeStale) {
+      staleRefreshRequestedRef.current = true;
+    }
+    schedulePlannerQueueRefresh();
+    if (document.hidden) return;
     if (shipmentRefreshTimerRef.current) {
       window.clearTimeout(shipmentRefreshTimerRef.current);
     }
@@ -1148,7 +1155,7 @@ export default function ShipmentsPage() {
       }
       shipmentRefreshTimerRef.current = null;
     }, 450);
-  }, [requestPlannerQueueRefresh, staleSnapshotStoreAvailable]);
+  }, [schedulePlannerQueueRefresh, staleSnapshotStoreAvailable]);
 
   useEffect(() => {
     const handleVisibilityChange = () => {
@@ -1194,6 +1201,36 @@ export default function ShipmentsPage() {
       unsubscribeLaneGrid();
     };
   }, [scheduleShipmentRefresh, subscribeScope]);
+
+  useEffect(() => {
+    if (!plannerModalOpen || isGuest) return;
+
+    try {
+      supabase.realtime.connect();
+    } catch (error) {
+      console.warn('Failed to open planner realtime socket', error);
+    }
+
+    const handlePlannerSourceChange = () => {
+      schedulePlannerQueueRefresh();
+    };
+
+    const channel = supabase
+      .channel(`shipments-planner-realtime-${Math.random().toString(36).slice(2, 10)}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'shipments' }, handlePlannerSourceChange)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'shipment_pts' }, handlePlannerSourceChange)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'picktickets' }, handlePlannerSourceChange)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'lane_assignments' }, handlePlannerSourceChange)
+      .subscribe((status) => {
+        if (status === 'TIMED_OUT' || status === 'CHANNEL_ERROR') {
+          console.warn(`Planner realtime channel status: ${status}`);
+        }
+      });
+
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [isGuest, plannerModalOpen, schedulePlannerQueueRefresh]);
 
   useEffect(() => {
     if (realtimeHealth === 'live') return;
