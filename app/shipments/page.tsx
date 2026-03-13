@@ -193,6 +193,20 @@ function plannerRowShipmentKey(row: PlannerQueueRow): string {
   return buildPuLoadKey(row.pu_number, row.pu_date) || `${row.pu_number}-${row.pu_date}`;
 }
 
+function plannerRowIsCompiledGroup(row: PlannerQueueRow): boolean {
+  return toTrimmedText(row.move_type) === 'compiled_group';
+}
+
+function plannerRowMemberCount(row: PlannerQueueRow): number {
+  return Math.max(1, toSafeNumber(row.pending_member_count, 0));
+}
+
+function plannerRowTypeLabel(row: PlannerQueueRow): string {
+  return plannerRowIsCompiledGroup(row)
+    ? `compiled pallet (${plannerRowMemberCount(row)} PT${plannerRowMemberCount(row) === 1 ? '' : 's'})`
+    : 'single PT';
+}
+
 function plannerRowsMatchIdentity(a: PlannerQueueRow, b: PlannerQueueRow): boolean {
   return (
     toTrimmedText(a.pu_number) === toTrimmedText(b.pu_number)
@@ -445,6 +459,7 @@ export default function ShipmentsPage() {
   const fetchShipmentsRef = useRef<() => Promise<void>>(async () => { });
   const fetchStaleSnapshotsRef = useRef<() => Promise<void>>(async () => { });
   const buildPlannerQueueRef = useRef<(options?: { silent?: boolean }) => Promise<PlannerQueueRow[] | null>>(async () => null);
+  const executePlannerStageRef = useRef<(row: PlannerQueueRow) => Promise<void>>(async () => { });
 
   const plannerPuDateFilterOptions = useMemo(
     () => buildPlannerPuDateFilterOptions(plannerQueueRaw),
@@ -937,6 +952,8 @@ export default function ShipmentsPage() {
     }
   }
 
+  executePlannerStageRef.current = executePlannerStage;
+
   async function stagePlannerRow(row: PlannerQueueRow) {
     if (!plannerRowHasStagingLane(row)) {
       setPlannerToast({
@@ -948,13 +965,20 @@ export default function ShipmentsPage() {
 
     if (plannerScanningRow !== null) return;
 
-    if (!requireOCRForStaging) {
+    if (!requireOCRForStaging || plannerRowIsCompiledGroup(row)) {
       await executePlannerStage(row);
       return;
     }
 
     setPlannerScanningRow(row);
   }
+
+  useEffect(() => {
+    if (!plannerScanningRow || !plannerRowIsCompiledGroup(plannerScanningRow)) return;
+    const compiledRow = plannerScanningRow;
+    setPlannerScanningRow(null);
+    void executePlannerStageRef.current(compiledRow);
+  }, [plannerScanningRow]);
 
   async function setPlannerShipmentStagingLane(row: PlannerQueueRow) {
     if (isGuest || plannerLoading || plannerExecutingAssignmentId !== null || plannerAssigningShipmentKey !== null || plannerScanningRow !== null) return;
@@ -2113,6 +2137,8 @@ export default function ShipmentsPage() {
                       {plannerQueue.map((row) => {
                         const rowHasStagingLane = plannerRowHasStagingLane(row);
                         const rowShipmentKey = plannerRowShipmentKey(row);
+                        const isCompiledRow = plannerRowIsCompiledGroup(row);
+                        const rowMemberCount = plannerRowMemberCount(row);
                         return (
                           <div
                             key={`${row.step_no}-${row.assignment_id}`}
@@ -2150,15 +2176,21 @@ export default function ShipmentsPage() {
                               </div>
                             </div>
 
+                            {isCompiledRow && (
+                              <div className="inline-flex rounded-full border border-orange-500/70 bg-orange-950/70 px-2.5 py-1 text-[11px] font-bold uppercase tracking-[0.14em] text-orange-200">
+                                Compiled Pallet · {rowMemberCount} PTs
+                              </div>
+                            )}
+
                             <div className="grid grid-cols-2 gap-2">
                               <div className="rounded border border-slate-700 bg-slate-950 p-2">
-                                <div className="text-[11px] text-slate-400">PT #</div>
+                                <div className="text-[11px] text-slate-400">{isCompiledRow ? 'Rep PT #' : 'PT #'}</div>
                                 <div className="text-sm font-semibold text-white">
                                   {row.representative_pt_number || String(row.representative_pt_id || 'N/A')}
                                 </div>
                               </div>
                               <div className="rounded border border-slate-700 bg-slate-950 p-2">
-                                <div className="text-[11px] text-slate-400">PO #</div>
+                                <div className="text-[11px] text-slate-400">{isCompiledRow ? 'Rep PO #' : 'PO #'}</div>
                                 <div className="text-sm font-semibold text-white">{row.representative_po_number || 'N/A'}</div>
                               </div>
                             </div>
@@ -2168,7 +2200,7 @@ export default function ShipmentsPage() {
                               <span>Date: {row.pu_date || 'N/A'}</span>
                               <span>In Front: {row.pallets_in_front}p</span>
                               <span>Pending: {row.pending_member_count}</span>
-                              <span>Type: {row.move_type === 'compiled_group' ? 'compiled' : 'single'}</span>
+                              <span>Type: {plannerRowTypeLabel(row)}</span>
                             </div>
 
                             {rowHasStagingLane ? (
@@ -2177,7 +2209,7 @@ export default function ShipmentsPage() {
                                 disabled={plannerLoading || plannerExecutingAssignmentId !== null || plannerAssigningShipmentKey !== null || plannerScanningRow !== null}
                                 className="w-full bg-emerald-600 hover:bg-emerald-700 disabled:bg-gray-600 px-3 py-2 rounded font-semibold text-sm"
                               >
-                                {plannerExecutingAssignmentId === row.assignment_id ? 'Staging...' : 'Stage'}
+                                {plannerExecutingAssignmentId === row.assignment_id ? 'Staging...' : (isCompiledRow ? 'Stage All' : 'Stage')}
                               </button>
                             ) : (
                               <button
@@ -2215,6 +2247,8 @@ export default function ShipmentsPage() {
                         {plannerQueue.map((row) => {
                           const rowHasStagingLane = plannerRowHasStagingLane(row);
                           const rowShipmentKey = plannerRowShipmentKey(row);
+                          const isCompiledRow = plannerRowIsCompiledGroup(row);
+                          const rowMemberCount = plannerRowMemberCount(row);
                           return (
                             <tr
                               key={`${row.step_no}-${row.assignment_id}`}
@@ -2223,8 +2257,28 @@ export default function ShipmentsPage() {
                               <td className="py-2 px-3 font-bold">{row.step_no}</td>
                               <td className="py-2 px-3 whitespace-nowrap">{row.pu_number || 'N/A'}</td>
                               <td className="py-2 px-3 whitespace-nowrap">{row.pu_date || 'N/A'}</td>
-                              <td className="py-2 px-3 whitespace-nowrap">{row.representative_pt_number || String(row.representative_pt_id || 'N/A')}</td>
-                              <td className="py-2 px-3 whitespace-nowrap">{row.representative_po_number || 'N/A'}</td>
+                              <td className="py-2 px-3 whitespace-nowrap">
+                                {isCompiledRow ? (
+                                  <div className="space-y-1">
+                                    <div className="inline-flex rounded-full border border-orange-500/70 bg-orange-950/70 px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.14em] text-orange-200">
+                                      Compiled · {rowMemberCount} PTs
+                                    </div>
+                                    <div>{row.representative_pt_number || String(row.representative_pt_id || 'N/A')}</div>
+                                  </div>
+                                ) : (
+                                  row.representative_pt_number || String(row.representative_pt_id || 'N/A')
+                                )}
+                              </td>
+                              <td className="py-2 px-3 whitespace-nowrap">
+                                {isCompiledRow ? (
+                                  <div>
+                                    <div className="text-[10px] uppercase tracking-[0.12em] text-slate-400">Rep PO</div>
+                                    <div>{row.representative_po_number || 'N/A'}</div>
+                                  </div>
+                                ) : (
+                                  row.representative_po_number || 'N/A'
+                                )}
+                              </td>
                               <td className="py-2 px-3 whitespace-nowrap">{row.source_lane ? `L${row.source_lane}` : 'N/A'}</td>
                               <td className="py-2 px-3 whitespace-nowrap">
                                 {rowHasStagingLane ? (
@@ -2242,7 +2296,7 @@ export default function ShipmentsPage() {
                               </td>
                               <td className="py-2 px-3 whitespace-nowrap">{row.pallets_to_move}p</td>
                               <td className="py-2 px-3 whitespace-nowrap">{row.pallets_in_front}p</td>
-                              <td className="py-2 px-3 whitespace-nowrap">{row.move_type === 'compiled_group' ? 'compiled' : 'single'}</td>
+                              <td className="py-2 px-3 whitespace-nowrap">{plannerRowTypeLabel(row)}</td>
                               <td className="py-2 px-3 whitespace-nowrap">{row.pending_member_count}</td>
                               <td className="py-2 px-3 whitespace-nowrap">{row.days_until_pu === 9999 ? 'N/A' : row.days_until_pu}</td>
                               <td className="py-2 px-3">
@@ -2252,7 +2306,7 @@ export default function ShipmentsPage() {
                                     disabled={plannerLoading || plannerExecutingAssignmentId !== null || plannerAssigningShipmentKey !== null || plannerScanningRow !== null}
                                     className="bg-emerald-600 hover:bg-emerald-700 disabled:bg-gray-600 px-3 py-1.5 rounded font-semibold text-xs"
                                   >
-                                    {plannerExecutingAssignmentId === row.assignment_id ? 'Staging...' : 'Stage'}
+                                    {plannerExecutingAssignmentId === row.assignment_id ? 'Staging...' : (isCompiledRow ? 'Stage All' : 'Stage')}
                                   </button>
                                 ) : (
                                   <button
@@ -2363,7 +2417,7 @@ export default function ShipmentsPage() {
         </div>
       )}
 
-      {plannerScanningRow && (
+      {plannerScanningRow && !plannerRowIsCompiledGroup(plannerScanningRow) && (
         <OCRCamera
           expectedPT={toTrimmedText(plannerScanningRow.representative_pt_number) || String(plannerScanningRow.representative_pt_id || '')}
           expectedPO={toTrimmedText(plannerScanningRow.representative_po_number)}

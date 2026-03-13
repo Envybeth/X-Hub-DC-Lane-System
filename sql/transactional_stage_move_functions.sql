@@ -731,22 +731,39 @@ begin
       v_member_ids := array_append(v_member_ids, v_member.pt_id);
       v_member_count := v_member_count + 1;
 
-      insert into public.shipment_pts (
-        shipment_id,
-        pt_id,
-        original_lane,
-        removed_from_staging
-      )
-      values (
-        v_stage_row.shipment_id,
-        v_member.pt_id,
-        v_member.original_lane,
-        false
-      )
-      on conflict (shipment_id, pt_id)
-      do update set
-        original_lane = excluded.original_lane,
-        removed_from_staging = false;
+      -- Avoid ambiguous variable/column resolution with RETURNS TABLE output names
+      -- (e.g. output variable "shipment_id" vs table column "shipment_id").
+      update public.shipment_pts sp
+      set
+        original_lane = v_member.original_lane,
+        removed_from_staging = false
+      where sp.shipment_id = v_stage_row.shipment_id
+        and sp.pt_id = v_member.pt_id;
+
+      if not found then
+        begin
+          insert into public.shipment_pts (
+            shipment_id,
+            pt_id,
+            original_lane,
+            removed_from_staging
+          )
+          values (
+            v_stage_row.shipment_id,
+            v_member.pt_id,
+            v_member.original_lane,
+            false
+          );
+        exception
+          when unique_violation then
+            update public.shipment_pts sp
+            set
+              original_lane = v_member.original_lane,
+              removed_from_staging = false
+            where sp.shipment_id = v_stage_row.shipment_id
+              and sp.pt_id = v_member.pt_id;
+        end;
+      end if;
     end loop;
 
     if v_member_count > 0 then
