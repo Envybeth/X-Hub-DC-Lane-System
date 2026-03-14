@@ -23,13 +23,20 @@ import {
 } from '@/lib/setShipmentStagingLaneFeedback';
 import { stageLaneAssignmentIntoShipment } from '@/lib/stageShipmentExecution';
 import { touchShipmentUpdatedAtByLoad } from '@/lib/touchShipmentUpdatedAt';
+import { saveShipmentByLoadOwner } from '@/lib/shipmentLoadOwnerRows';
 import {
   buildCompiledMembersById,
   compareTextNumeric,
   getRangeLabel,
   normalizeDigits
 } from '@/lib/compiledPalletDisplay';
-import { type ShipmentDuplicateStagingLaneConflict } from '@/lib/shipmentLoadConflicts';
+import {
+  STALE_STAGE_CONFLICT_BADGE_LABEL,
+  STALE_STAGE_CONFLICT_PANEL_DESCRIPTION,
+  STALE_STAGE_CONFLICT_PANEL_TITLE,
+  buildStaleStageConflictBlockedMessage,
+  type ShipmentDuplicateStagingLaneConflict
+} from '@/lib/shipmentLoadConflicts';
 
 import OCRCamera from './OCRCamera';
 
@@ -293,7 +300,7 @@ export default function ShipmentCard({
     : hasShippedPT
     ? { label: 'Shipped', color: 'bg-blue-600 text-white' }
     : statusConfig[shipment.status];
-  const blockedByLoadChangeMessage = 'Resolve the stale PT load mismatch before staging or finalizing this load.';
+  const blockedByLoadChangeMessage = buildStaleStageConflictBlockedMessage(shipment.pu_number);
   const blockedByDuplicateStagingLaneMessage = 'Resolve the duplicate staging lane conflict before staging or finalizing this load.';
   const cardContainerClassName = hasBlockingShipmentConflict
     ? 'bg-red-950/25 rounded-lg border-2 border-red-500'
@@ -648,21 +655,17 @@ export default function ShipmentCard({
 
     setAdminSavingShipmentStatus(true);
     try {
-      const { error } = await supabase
-        .from('shipments')
-        .upsert({
-          pu_number: shipment.pu_number,
-          pu_date: shipment.pu_date,
+      await saveShipmentByLoadOwner({
+        puNumber: shipment.pu_number,
+        puDate: shipment.pu_date,
+        values: {
           carrier: shipment.carrier || null,
           staging_lane: shipment.staging_lane,
           status: adminShipmentStatus,
           archived: adminShipmentArchived,
           updated_at: new Date().toISOString()
-        }, {
-          onConflict: 'pu_number,pu_date'
-        });
-
-      if (error) throw error;
+        }
+      });
 
       showToast('Admin override saved for shipment', 'success');
       onUpdate();
@@ -1351,7 +1354,7 @@ export default function ShipmentCard({
             )}
             {hasLoadChangeConflict && (
               <div className="bg-red-700 px-2 md:px-4 py-1 md:py-2 rounded-lg font-bold text-l md:text-base text-white">
-                ⚠️ Stale PT in staging lane
+                {STALE_STAGE_CONFLICT_BADGE_LABEL}
               </div>
             )}
             {hasDuplicateStagingLaneConflict && (
@@ -1379,10 +1382,10 @@ export default function ShipmentCard({
             {hasLoadChangeConflict && (
               <div className="bg-red-950/70 border-2 border-red-500 p-3 md:p-4 rounded-lg">
                 <div className="font-bold text-base md:text-lg text-red-200">
-                  Action required: stale PT still sitting in this staging lane
+                  {STALE_STAGE_CONFLICT_PANEL_TITLE}
                 </div>
                 <div className="text-sm md:text-base text-red-100 mt-2">
-                  This load is blocked until the stale PT is moved out of the staging lane. You cannot stage more PTs into this load or finalize it yet.
+                  {STALE_STAGE_CONFLICT_PANEL_DESCRIPTION}
                 </div>
                 <div className="mt-3 space-y-2">
                   {loadChangeConflicts.map((conflict) => (

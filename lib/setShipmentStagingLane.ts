@@ -1,9 +1,13 @@
 import { supabase } from '@/lib/supabase';
-import { buildPuLoadKey, normalizePuDate, normalizePuNumber } from '@/lib/shipmentIdentity';
+import { normalizePuDate, normalizePuNumber } from '@/lib/shipmentIdentity';
+import {
+  saveShipmentByLoadOwner
+} from '@/lib/shipmentLoadOwnerRows';
 import {
   buildStagedLaneAssignmentUnits,
   normalizeStagedLaneAssignmentsBatch
 } from '@/lib/stagedLaneAssignments';
+import { buildNormalizedPuOwnerKey } from '@/lib/shipmentLoadConflicts';
 
 type PickticketLaneContextRow = {
   id: number;
@@ -17,11 +21,6 @@ type PickticketLaneContextRow = {
 
 type LaneAssignmentPtRow = {
   pt_id: number;
-};
-
-type ShipmentUpsertRow = {
-  id: number;
-  status: string | null;
 };
 
 type ActiveShipmentLaneConflictRow = {
@@ -99,10 +98,7 @@ export async function findActiveShipmentLaneConflicts(params: {
   const targetLane = toTrimmedText(params.targetLane);
   if (!targetLane) return [];
 
-  const excludedLoadKey = buildPuLoadKey(
-    normalizePuNumber(params.excludePuNumber),
-    normalizePuDate(params.excludePuDate)
-  );
+  const excludedLoadOwnerKey = buildNormalizedPuOwnerKey(params.excludePuNumber);
 
   const { data, error } = await supabase
     .from('shipments')
@@ -111,15 +107,15 @@ export async function findActiveShipmentLaneConflicts(params: {
     .eq('staging_lane', targetLane);
   if (error) throw error;
 
-  const seenLoadKeys = new Set<string>();
+  const seenLoadOwnerKeys = new Set<string>();
 
   return ((data || []) as ActiveShipmentLaneConflictRow[])
     .filter((row) => {
-      const rowLoadKey = buildPuLoadKey(normalizePuNumber(row.pu_number), normalizePuDate(row.pu_date));
-      if (!rowLoadKey) return false;
-      if (rowLoadKey === excludedLoadKey) return false;
-      if (seenLoadKeys.has(rowLoadKey)) return false;
-      seenLoadKeys.add(rowLoadKey);
+      const rowLoadOwnerKey = buildNormalizedPuOwnerKey(row.pu_number);
+      if (!rowLoadOwnerKey) return false;
+      if (rowLoadOwnerKey === excludedLoadOwnerKey) return false;
+      if (seenLoadOwnerKeys.has(rowLoadOwnerKey)) return false;
+      seenLoadOwnerKeys.add(rowLoadOwnerKey);
       return true;
     })
     .map((row) => ({
@@ -234,14 +230,11 @@ export async function setShipmentStagingLaneWithAutoLink(
     shipmentUpsertPayload.carrier = preferredCarrier || fallbackCarrier;
   }
 
-  const { data: shipmentDataRaw, error: shipmentError } = await supabase
-    .from('shipments')
-    .upsert(shipmentUpsertPayload, { onConflict: 'pu_number,pu_date' })
-    .select('id, status')
-    .single();
-  if (shipmentError) throw shipmentError;
-
-  const shipmentData = shipmentDataRaw as ShipmentUpsertRow | null;
+  const shipmentData = await saveShipmentByLoadOwner({
+    puNumber,
+    puDate,
+    values: shipmentUpsertPayload
+  });
   if (!shipmentData || !Number.isFinite(Number(shipmentData.id))) {
     throw new Error('Failed to resolve shipment row after setting staging lane.');
   }

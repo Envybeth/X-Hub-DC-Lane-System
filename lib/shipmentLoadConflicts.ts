@@ -23,6 +23,10 @@ export type DuplicateStagingLaneConflictMaps = {
   shipmentsByLane: Map<string, DuplicateStagingLaneShipmentRow[]>;
 };
 
+export const STALE_STAGE_CONFLICT_BADGE_LABEL = '⚠️ Staged PT belongs to another load';
+export const STALE_STAGE_CONFLICT_PANEL_TITLE = 'Action required: a staged PT in this lane belongs to a different PU load';
+export const STALE_STAGE_CONFLICT_PANEL_DESCRIPTION = 'This load is blocked until the staged PT is moved out of the staging lane or its load identity is corrected. You cannot stage more PTs into this load or finalize it yet.';
+
 function toTrimmedText(value: unknown): string {
   if (typeof value === 'string') return value.trim();
   if (value === null || value === undefined) return '';
@@ -34,6 +38,12 @@ export function buildNormalizedPuLoadKey(
   puDate: string | null | undefined
 ): string | null {
   return buildPuLoadKey(normalizePuNumber(puNumber), normalizePuDate(puDate));
+}
+
+export function buildNormalizedPuOwnerKey(
+  puNumber: string | null | undefined
+): string | null {
+  return normalizePuNumber(puNumber);
 }
 
 export function isActiveShipmentStageStatus(status: string | null | undefined): boolean {
@@ -51,11 +61,41 @@ export function isShipmentLoadMismatch(params: {
   ptPuNumber: string | null | undefined;
   ptPuDate: string | null | undefined;
 }): boolean {
-  const shipmentKey = buildNormalizedPuLoadKey(params.shipmentPuNumber, params.shipmentPuDate);
-  if (!shipmentKey) return false;
+  const shipmentPuNumber = normalizePuNumber(params.shipmentPuNumber);
+  const shipmentPuDate = normalizePuDate(params.shipmentPuDate);
+  if (!shipmentPuNumber || !shipmentPuDate) return false;
 
-  const ptKey = buildNormalizedPuLoadKey(params.ptPuNumber, params.ptPuDate);
-  return shipmentKey !== ptKey;
+  const ptPuNumber = normalizePuNumber(params.ptPuNumber);
+  const ptPuDate = normalizePuDate(params.ptPuDate);
+
+  // A date-only shift on the same PU number is treated as the same operational load.
+  // Sync should retarget/merge the shipment row, not force a stale staged-PT hazard.
+  if (ptPuNumber && ptPuDate && shipmentPuNumber === ptPuNumber) {
+    return false;
+  }
+
+  return true;
+}
+
+export function isSameShipmentLoadDateShift(params: {
+  shipmentPuNumber: string | null | undefined;
+  shipmentPuDate: string | null | undefined;
+  ptPuNumber: string | null | undefined;
+  ptPuDate: string | null | undefined;
+}): boolean {
+  const shipmentPuNumber = normalizePuNumber(params.shipmentPuNumber);
+  const shipmentPuDate = normalizePuDate(params.shipmentPuDate);
+  const ptPuNumber = normalizePuNumber(params.ptPuNumber);
+  const ptPuDate = normalizePuDate(params.ptPuDate);
+
+  return Boolean(
+    shipmentPuNumber
+    && shipmentPuDate
+    && ptPuNumber
+    && ptPuDate
+    && shipmentPuNumber === ptPuNumber
+    && shipmentPuDate !== ptPuDate
+  );
 }
 
 export function formatPuLoadLabel(
@@ -69,7 +109,21 @@ export function formatPuLoadLabel(
     return 'No current PU load';
   }
 
-  return `PU ${normalizedPuNumber} (${normalizedPuDate})`;
+  return `PU Load ${normalizedPuNumber} (${normalizedPuDate})`;
+}
+
+export function buildStaleStageConflictBlockedMessage(
+  puNumber: string | null | undefined
+): string {
+  const normalizedPuNumber = normalizePuNumber(puNumber) || 'N/A';
+  return `PU Load ${normalizedPuNumber} is blocked because a PT still staged in this lane now belongs to a different PU load. Resolve that staged PT conflict before staging more PTs or finalizing this load.`;
+}
+
+export function buildStaleStageLaneAlertMessage(
+  lane: string | null | undefined
+): string {
+  const normalizedLane = toTrimmedText(lane) || '?';
+  return `Lane ${normalizedLane} is blocked because a PT still staged there now belongs to a different PU load. Move that staged PT out before assigning more PTs to this staging lane.`;
 }
 
 function buildDuplicateStagingLaneConflictMessage(params: {
@@ -93,7 +147,7 @@ export function buildDuplicateStagingLaneConflictMaps(
     const lane = toTrimmedText(row.staging_lane);
     if (!lane) return;
 
-    const loadKey = buildNormalizedPuLoadKey(row.pu_number, row.pu_date);
+    const loadKey = buildNormalizedPuOwnerKey(row.pu_number);
     if (!loadKey) return;
 
     const seenLoadKeys = seenLoadKeysByLane.get(lane) || new Set<string>();
@@ -118,11 +172,13 @@ export function buildDuplicateStagingLaneConflictMaps(
 
     laneRows.forEach((shipmentRow) => {
       const shipmentKey = buildNormalizedPuLoadKey(shipmentRow.pu_number, shipmentRow.pu_date);
+      const shipmentOwnerKey = buildNormalizedPuOwnerKey(shipmentRow.pu_number);
       if (!shipmentKey) return;
+      if (!shipmentOwnerKey) return;
 
       const conflicts = laneRows
         .filter((candidate) => (
-          buildNormalizedPuLoadKey(candidate.pu_number, candidate.pu_date) !== shipmentKey
+          buildNormalizedPuOwnerKey(candidate.pu_number) !== shipmentOwnerKey
         ))
         .map((candidate) => ({
           lane,

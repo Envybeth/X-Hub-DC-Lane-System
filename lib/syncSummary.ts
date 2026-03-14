@@ -143,7 +143,7 @@ export function buildSyncNotificationDetails(summary: SyncSummaryData): string[]
     details.push(`New PU loads in sheet: ${summary.newLoadGroupCount}`);
   }
   if (summary.reconciliation.staleConflictShipments > 0) {
-    details.push(`Loads blocked by stale staged PTs: ${summary.reconciliation.staleConflictShipments}`);
+    details.push(`Loads blocked by staged PT load conflicts: ${summary.reconciliation.staleConflictShipments}`);
   }
   if (summary.reconciliation.finalizedReopened > 0) {
     details.push(`Finalized loads reopened: ${summary.reconciliation.finalizedReopened}`);
@@ -193,7 +193,7 @@ export function buildSyncDetailSections(summary: SyncSummaryData): SyncSummarySe
 
   const shipmentImpactLines = [
     summary.reconciliation.staleConflictShipments > 0
-      ? `Loads flagged with stale staged PT hazards: ${summary.reconciliation.staleConflictShipments}`
+      ? `Loads flagged with staged PT load conflicts: ${summary.reconciliation.staleConflictShipments}`
       : null,
     summary.reconciliation.staleStageConflicts > 0
       ? `PTs force-unstaged because their PU load changed: ${summary.reconciliation.staleStageConflicts}`

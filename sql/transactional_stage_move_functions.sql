@@ -63,10 +63,7 @@ begin
     from public.shipments s_conflict
     where coalesce(s_conflict.archived, false) = false
       and btrim(coalesce(s_conflict.staging_lane::text, '')) = v_staging_lane
-      and (
-        btrim(coalesce(s_conflict.pu_number, '')) <> btrim(p_pu_number)
-        or s_conflict.pu_date::text <> p_pu_date
-      )
+      and btrim(coalesce(s_conflict.pu_number, '')) <> btrim(p_pu_number)
   ) then
     raise exception 'Shipment staging lane % is shared by another active load; resolve the duplicate staging lane conflict first', v_staging_lane;
   end if;

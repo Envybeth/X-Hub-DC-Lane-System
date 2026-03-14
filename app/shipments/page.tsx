@@ -13,6 +13,7 @@ import { useRealtimeCoordinator } from '@/components/RealtimeProvider';
 import ActionToast from '@/components/ActionToast';
 import { buildPuLoadKey, normalizePuDate, normalizePuNumber } from '@/lib/shipmentIdentity';
 import {
+  buildStaleStageConflictBlockedMessage,
   buildDuplicateStagingLaneConflictMaps,
   formatPuLoadLabel,
   isShipmentLoadMismatch
@@ -20,6 +21,7 @@ import {
 import { setShipmentStagingLaneWithAutoLink } from '@/lib/setShipmentStagingLane';
 import { buildSetShipmentStagingLaneErrorMessage, buildSetShipmentStagingLaneSuccessMessage } from '@/lib/setShipmentStagingLaneFeedback';
 import { describeUnknownStageError, stageLaneAssignmentIntoShipment } from '@/lib/stageShipmentExecution';
+import { saveShipmentByLoadOwner } from '@/lib/shipmentLoadOwnerRows';
 import {
   buildCompiledMembersById,
   compareTextNumeric,
@@ -177,10 +179,10 @@ function buildLoadConflictMessage(params: {
   const poPart = poLabel ? ` | PO ${poLabel}` : '';
 
   if (destinationLabel === 'No current PU load') {
-    return `${ptLabel}${poPart} is still sitting in ${locationLabel}, but it no longer belongs to PU ${params.shipment.pu_number} (${params.shipment.pu_date}) and has no current PU load assigned. Move it out before staging more PTs or finalizing this load.`;
+    return `${ptLabel}${poPart} is still staged in ${locationLabel}, but it no longer has a complete PU load assigned. Move it out before staging more PTs or finalizing this load.`;
   }
 
-  return `${ptLabel}${poPart} is still sitting in ${locationLabel}, but it now belongs to ${destinationLabel}. Move it out before staging more PTs or finalizing this load.`;
+  return `${ptLabel}${poPart} is still staged in ${locationLabel}, but its current sheet load is ${destinationLabel}. Move it out before staging more PTs or finalizing this load.`;
 }
 
 function hasShipmentBlockingConflict(shipment: Shipment | null | undefined): boolean {
@@ -198,7 +200,7 @@ function getShipmentBlockingConflictMessage(shipment: Shipment | null | undefine
     return `PU ${puNumber} is blocked because its staging lane is shared by another active load. Resolve that duplicate staging lane conflict first.`;
   }
 
-  return `PU ${puNumber} is blocked by a stale PT load mismatch. Resolve that hazard before staging more PTs.`;
+  return buildStaleStageConflictBlockedMessage(puNumber);
 }
 
 function buildShipmentLoadConflictMaps(params: {
@@ -1924,21 +1926,23 @@ export default function ShipmentsPage() {
             console.warn(`Lane clear failed during auto-ship for PU ${staleReadyLoad.pu_number}: ${laneClearError.message}`);
           }
 
-          const { error: shipmentArchiveError } = await supabase
-            .from('shipments')
-            .upsert({
-              pu_number: staleReadyLoad.pu_number,
-              pu_date: staleReadyLoad.pu_date,
-              carrier: staleReadyLoad.carrier || null,
-              status: 'finalized',
-              archived: true,
-              staging_lane: null,
-              updated_at: preservedShippedAt
-            }, {
-              onConflict: 'pu_number,pu_date'
+          try {
+            await saveShipmentByLoadOwner({
+              puNumber: staleReadyLoad.pu_number,
+              puDate: staleReadyLoad.pu_date,
+              values: {
+                carrier: staleReadyLoad.carrier || null,
+                status: 'finalized',
+                archived: true,
+                staging_lane: null,
+                updated_at: preservedShippedAt
+              }
             });
-          if (shipmentArchiveError) {
-            console.warn(`Shipment archive failed during auto-ship for PU ${staleReadyLoad.pu_number}: ${shipmentArchiveError.message}`);
+          } catch (shipmentArchiveError) {
+            const archiveMessage = shipmentArchiveError instanceof Error
+              ? shipmentArchiveError.message
+              : String(shipmentArchiveError);
+            console.warn(`Shipment archive failed during auto-ship for PU ${staleReadyLoad.pu_number}: ${archiveMessage}`);
             continue;
           }
 

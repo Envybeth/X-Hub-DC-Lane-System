@@ -5,6 +5,7 @@ import { buildPuLoadKey, normalizePuDate, normalizePuNumber } from './shipmentId
 import {
   formatPuLoadLabel,
   isActiveShipmentStageStatus,
+  isSameShipmentLoadDateShift,
   isShipmentLoadMismatch
 } from './shipmentLoadConflicts';
 
@@ -79,6 +80,7 @@ type PickticketStateRow = {
   pu_date: string | null;
   status: string | null;
   carrier: string | null;
+  assigned_lane: string | null;
 };
 
 type ReconcileResult = {
@@ -138,6 +140,63 @@ function pickHigherShipmentStatus(a?: string | null, b?: string | null): string 
   return statusRank(a) >= statusRank(b) ? (a || 'not_started') : (b || 'not_started');
 }
 
+function shipmentRowTimestamp(row: ShipmentRow): number {
+  const updatedAt = row.updated_at ? new Date(row.updated_at).getTime() : Number.NaN;
+  if (Number.isFinite(updatedAt)) return updatedAt;
+
+  const createdAt = row.created_at ? new Date(row.created_at).getTime() : Number.NaN;
+  if (Number.isFinite(createdAt)) return createdAt;
+
+  return 0;
+}
+
+function buildLinksByShipmentId(rows: ShipmentPtRow[]): Map<number, ShipmentPtRow[]> {
+  const linksByShipmentId = new Map<number, ShipmentPtRow[]>();
+  rows.forEach((row) => {
+    const existing = linksByShipmentId.get(row.shipment_id) || [];
+    existing.push(row);
+    linksByShipmentId.set(row.shipment_id, existing);
+  });
+  return linksByShipmentId;
+}
+
+function pickCanonicalShipmentRowForLoadOwner(params: {
+  shipments: ShipmentRow[];
+  linksByShipmentId: Map<number, ShipmentPtRow[]>;
+  targetPuDate: string;
+}): ShipmentRow | null {
+  const targetPuDate = normalizePuDate(params.targetPuDate);
+  const rankedRows = [...params.shipments].sort((left, right) => {
+    const leftExactDate = normalizePuDate(left.pu_date) === targetPuDate ? 1 : 0;
+    const rightExactDate = normalizePuDate(right.pu_date) === targetPuDate ? 1 : 0;
+    if (leftExactDate !== rightExactDate) return rightExactDate - leftExactDate;
+
+    const leftActiveLinkCount = (params.linksByShipmentId.get(left.id) || [])
+      .filter((linkRow) => !Boolean(linkRow.removed_from_staging))
+      .length;
+    const rightActiveLinkCount = (params.linksByShipmentId.get(right.id) || [])
+      .filter((linkRow) => !Boolean(linkRow.removed_from_staging))
+      .length;
+    if (leftActiveLinkCount !== rightActiveLinkCount) {
+      return rightActiveLinkCount - leftActiveLinkCount;
+    }
+
+    const leftHasLane = trimToNull(left.staging_lane) ? 1 : 0;
+    const rightHasLane = trimToNull(right.staging_lane) ? 1 : 0;
+    if (leftHasLane !== rightHasLane) return rightHasLane - leftHasLane;
+
+    const statusDelta = statusRank(right.status) - statusRank(left.status);
+    if (statusDelta !== 0) return statusDelta;
+
+    const timestampDelta = shipmentRowTimestamp(right) - shipmentRowTimestamp(left);
+    if (timestampDelta !== 0) return timestampDelta;
+
+    return right.id - left.id;
+  });
+
+  return rankedRows[0] || null;
+}
+
 async function loadShipmentRows(supabaseAdmin: SupabaseAdminClient): Promise<ShipmentRow[]> {
   const { data, error } = await supabaseAdmin
     .from('shipments')
@@ -168,7 +227,7 @@ async function loadShipmentPtRows(
 async function loadPickticketStateRows(supabaseAdmin: SupabaseAdminClient): Promise<PickticketStateRow[]> {
   const { data, error } = await supabaseAdmin
     .from('picktickets')
-    .select('id, pu_number, pu_date, status, carrier')
+    .select('id, pu_number, pu_date, status, carrier, assigned_lane')
     .neq('customer', 'PAPER');
   if (error) throw error;
   return (data || []) as PickticketStateRow[];
@@ -252,6 +311,7 @@ async function reconcileShipmentIdentityAndStatus(
 
   const pickticketById = new Map<number, PickticketStateRow>();
   const nonShippedPtIdsByPuKey = new Map<string, number[]>();
+  const nonShippedPuDatesByPuNumber = new Map<string, Set<string>>();
   const readyToShipPtIdsByPuKey = new Map<string, number[]>();
   const carrierByPuKey = new Map<string, string>();
 
@@ -264,7 +324,8 @@ async function reconcileShipmentIdentityAndStatus(
       ...row,
       pu_number: normalizedPuNumber,
       pu_date: normalizedPuDate,
-      carrier: normalizedCarrier
+      carrier: normalizedCarrier,
+      assigned_lane: trimToNull(row.assigned_lane)
     });
 
     if (!normalizedPuNumber || !normalizedPuDate || !key) return;
@@ -278,6 +339,10 @@ async function reconcileShipmentIdentityAndStatus(
       const ids = nonShippedPtIdsByPuKey.get(key) || [];
       ids.push(row.id);
       nonShippedPtIdsByPuKey.set(key, ids);
+
+      const puDates = nonShippedPuDatesByPuNumber.get(normalizedPuNumber) || new Set<string>();
+      puDates.add(normalizedPuDate);
+      nonShippedPuDatesByPuNumber.set(normalizedPuNumber, puDates);
     }
     if (normalizedStatus === 'ready_to_ship') {
       const ids = readyToShipPtIdsByPuKey.get(key) || [];
@@ -286,16 +351,13 @@ async function reconcileShipmentIdentityAndStatus(
     }
   });
 
-  const linksByShipmentId = new Map<number, ShipmentPtRow[]>();
-  shipmentPtRows.forEach((row) => {
-    const existing = linksByShipmentId.get(row.shipment_id) || [];
-    existing.push(row);
-    linksByShipmentId.set(row.shipment_id, existing);
-  });
+  const linksByShipmentId = buildLinksByShipmentId(shipmentPtRows);
 
   const staleStagePtIds = new Set<number>();
   const staleShipmentIdsToTouch = new Set<number>();
   const finalizedShipmentIdsToReopen = new Set<number>();
+  const shipmentLinksToRestoreActive: Array<{ shipmentId: number; ptId: number }> = [];
+  const ptStatusRestores = new Map<number, 'staged' | 'ready_to_ship'>();
   const shipmentLinksToMarkRemoved: Array<{ shipmentId: number; ptId: number }> = [];
   const shipmentLinksToDelete: Array<{ shipmentId: number; ptId: number }> = [];
 
@@ -303,9 +365,37 @@ async function reconcileShipmentIdentityAndStatus(
     const shipmentLinks = linksByShipmentId.get(shipment.id) || [];
 
     shipmentLinks.forEach((linkRow) => {
+      const ptRow = pickticketById.get(linkRow.pt_id);
+      const shipmentStagingLane = trimToNull(shipment.staging_lane);
+      const ptAssignedLane = trimToNull(ptRow?.assigned_lane);
+
+      if (
+        isSameShipmentLoadDateShift({
+          shipmentPuNumber: shipment.pu_number,
+          shipmentPuDate: shipment.pu_date,
+          ptPuNumber: ptRow?.pu_number,
+          ptPuDate: ptRow?.pu_date
+        })
+        && shipmentStagingLane
+        && ptAssignedLane === shipmentStagingLane
+      ) {
+        if (Boolean(linkRow.removed_from_staging)) {
+          linkRow.removed_from_staging = false;
+          shipmentLinksToRestoreActive.push({ shipmentId: shipment.id, ptId: linkRow.pt_id });
+        }
+
+        if (ptRow && (ptRow.status || '').trim().toLowerCase() !== 'shipped') {
+          const restoredStatus = (shipment.status || '').trim().toLowerCase() === 'finalized'
+            ? 'ready_to_ship'
+            : 'staged';
+          ptRow.status = restoredStatus;
+          ptStatusRestores.set(linkRow.pt_id, restoredStatus);
+        }
+        return;
+      }
+
       if (Boolean(linkRow.removed_from_staging)) return;
 
-      const ptRow = pickticketById.get(linkRow.pt_id);
       if (!isShipmentLoadMismatch({
         shipmentPuNumber: shipment.pu_number,
         shipmentPuDate: shipment.pu_date,
@@ -354,6 +444,15 @@ async function reconcileShipmentIdentityAndStatus(
     result.shipmentLinksRemoved += 1;
   }
 
+  for (const link of shipmentLinksToRestoreActive) {
+    const { error } = await supabaseAdmin
+      .from('shipment_pts')
+      .update({ removed_from_staging: false })
+      .eq('shipment_id', link.shipmentId)
+      .eq('pt_id', link.ptId);
+    if (error) throw error;
+  }
+
   for (const link of shipmentLinksToMarkRemoved) {
     const { error } = await supabaseAdmin
       .from('shipment_pts')
@@ -370,6 +469,31 @@ async function reconcileShipmentIdentityAndStatus(
       .in('id', Array.from(staleStagePtIds))
       .in('status', ['staged', 'ready_to_ship']);
     if (demoteStalePtsError) throw demoteStalePtsError;
+  }
+
+  const stagedRestoreIds = Array.from(ptStatusRestores.entries())
+    .filter(([, status]) => status === 'staged')
+    .map(([ptId]) => ptId);
+  const readyToShipRestoreIds = Array.from(ptStatusRestores.entries())
+    .filter(([, status]) => status === 'ready_to_ship')
+    .map(([ptId]) => ptId);
+
+  if (stagedRestoreIds.length > 0) {
+    const { error: restoreStagedPtsError } = await supabaseAdmin
+      .from('picktickets')
+      .update({ status: 'staged' })
+      .in('id', stagedRestoreIds)
+      .neq('status', 'shipped');
+    if (restoreStagedPtsError) throw restoreStagedPtsError;
+  }
+
+  if (readyToShipRestoreIds.length > 0) {
+    const { error: restoreReadyToShipPtsError } = await supabaseAdmin
+      .from('picktickets')
+      .update({ status: 'ready_to_ship' })
+      .in('id', readyToShipRestoreIds)
+      .neq('status', 'shipped');
+    if (restoreReadyToShipPtsError) throw restoreReadyToShipPtsError;
   }
 
   for (const shipment of shipments) {
@@ -455,6 +579,84 @@ async function reconcileShipmentIdentityAndStatus(
     }
     if (puDateChanged || (canonicalLinkedKey && canonicalLinkedKey !== originalKey)) {
       result.shipmentDatesReconciled += 1;
+    }
+  }
+
+  const ownerNormalizedShipments = (await loadShipmentRows(supabaseAdmin))
+    .filter((row) => !Boolean(row.archived));
+
+  if (ownerNormalizedShipments.length > 0) {
+    const ownerNormalizedShipmentPtRows = await loadShipmentPtRows(
+      supabaseAdmin,
+      ownerNormalizedShipments.map((row) => row.id)
+    );
+    const ownerLinksByShipmentId = buildLinksByShipmentId(ownerNormalizedShipmentPtRows);
+    const shipmentsByPuOwner = new Map<string, ShipmentRow[]>();
+
+    ownerNormalizedShipments.forEach((row) => {
+      const puOwner = normalizePuNumber(row.pu_number);
+      if (!puOwner) return;
+      const existing = shipmentsByPuOwner.get(puOwner) || [];
+      existing.push(row);
+      shipmentsByPuOwner.set(puOwner, existing);
+    });
+
+    for (const [puOwner, ownerShipments] of shipmentsByPuOwner.entries()) {
+      const ownerPuDates = Array.from(nonShippedPuDatesByPuNumber.get(puOwner) || []);
+      if (ownerPuDates.length !== 1) continue;
+
+      const targetPuDate = ownerPuDates[0];
+      const canonicalShipmentRow = pickCanonicalShipmentRowForLoadOwner({
+        shipments: ownerShipments,
+        linksByShipmentId: ownerLinksByShipmentId,
+        targetPuDate
+      });
+      if (!canonicalShipmentRow) continue;
+
+      const duplicateOwnerRows = ownerShipments.filter((row) => row.id !== canonicalShipmentRow.id);
+      for (const duplicateRow of duplicateOwnerRows) {
+        await mergeShipmentRows(
+          supabaseAdmin,
+          duplicateRow,
+          canonicalShipmentRow,
+          ownerLinksByShipmentId.get(duplicateRow.id) || [],
+          nowIso
+        );
+
+        canonicalShipmentRow.status = pickHigherShipmentStatus(duplicateRow.status, canonicalShipmentRow.status);
+        canonicalShipmentRow.carrier = trimToNull(canonicalShipmentRow.carrier) || trimToNull(duplicateRow.carrier);
+        canonicalShipmentRow.staging_lane = trimToNull(canonicalShipmentRow.staging_lane) || trimToNull(duplicateRow.staging_lane);
+        canonicalShipmentRow.archived = Boolean(canonicalShipmentRow.archived) && Boolean(duplicateRow.archived);
+        canonicalShipmentRow.updated_at = nowIso;
+        result.mergedRows += 1;
+      }
+
+      const canonicalPuKey = buildPuLoadKey(puOwner, targetPuDate);
+      const targetCarrier = (canonicalPuKey && carrierByPuKey.get(canonicalPuKey))
+        || trimToNull(canonicalShipmentRow.carrier);
+      const normalizedCanonicalPuDate = normalizePuDate(canonicalShipmentRow.pu_date);
+      const normalizedCanonicalCarrier = trimToNull(canonicalShipmentRow.carrier);
+      if (normalizedCanonicalPuDate === targetPuDate && normalizedCanonicalCarrier === targetCarrier) {
+        continue;
+      }
+
+      const { error: updateCanonicalShipmentError } = await supabaseAdmin
+        .from('shipments')
+        .update({
+          pu_number: puOwner,
+          pu_date: targetPuDate,
+          carrier: targetCarrier,
+          updated_at: nowIso
+        })
+        .eq('id', canonicalShipmentRow.id);
+      if (updateCanonicalShipmentError) throw updateCanonicalShipmentError;
+
+      if (normalizedCanonicalCarrier !== targetCarrier) {
+        result.shipmentRowsNormalized += 1;
+      }
+      if (normalizedCanonicalPuDate !== targetPuDate) {
+        result.shipmentDatesReconciled += 1;
+      }
     }
   }
 

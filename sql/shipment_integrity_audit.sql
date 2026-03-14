@@ -157,11 +157,12 @@ where p.compiled_pallet_id is null
 order by p.id;
 
 -- ------------------------------------------------------------------
--- G) Duplicate active shipment staging lanes (must be zero rows)
+-- G) Active staging lanes shared by different PU load ids (must be zero rows)
 -- ------------------------------------------------------------------
 select
   btrim(s.staging_lane::text) as staging_lane,
-  count(*) as active_shipment_count,
+  count(*) as active_shipment_row_count,
+  count(distinct btrim(s.pu_number)) as distinct_load_id_count,
   array_agg(
     format(
       'shipment_id=%s | PU %s (%s) | status=%s',
@@ -176,5 +177,28 @@ from public.shipments s
 where coalesce(s.archived, false) = false
   and nullif(btrim(coalesce(s.staging_lane::text, '')), '') is not null
 group by btrim(s.staging_lane::text)
+having count(distinct btrim(s.pu_number)) > 1
+order by distinct_load_id_count desc, active_shipment_row_count desc, staging_lane;
+
+-- ------------------------------------------------------------------
+-- H) Active shipment rows duplicated for the same PU load id (must be zero rows)
+-- ------------------------------------------------------------------
+select
+  btrim(s.pu_number) as pu_number,
+  count(*) as active_shipment_row_count,
+  array_agg(
+    format(
+      'shipment_id=%s | date=%s | lane=%s | status=%s',
+      s.id,
+      coalesce(s.pu_date::text, 'N/A'),
+      coalesce(nullif(btrim(s.staging_lane::text), ''), 'N/A'),
+      coalesce(nullif(btrim(s.status), ''), 'unknown')
+    )
+    order by s.updated_at desc nulls last, s.id desc
+  ) as active_shipments
+from public.shipments s
+where coalesce(s.archived, false) = false
+  and nullif(btrim(coalesce(s.pu_number, '')), '') is not null
+group by btrim(s.pu_number)
 having count(*) > 1
-order by active_shipment_count desc, staging_lane;
+order by active_shipment_row_count desc, pu_number;

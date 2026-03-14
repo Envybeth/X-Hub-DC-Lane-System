@@ -10,6 +10,7 @@ import { StorageAssignment, StorageGroup } from '@/types/storage';
 import { useRealtimeCoordinator } from './RealtimeProvider';
 import { normalizePuNumber } from '@/lib/shipmentIdentity';
 import {
+  buildStaleStageLaneAlertMessage,
   buildDuplicateStagingLaneConflictMaps,
   formatPuLoadLabel,
   isShipmentLoadMismatch
@@ -579,7 +580,7 @@ export default function LaneGrid({ readOnly = false }: LaneGridProps) {
     }
 
     if (lane.hasLoadChangeConflict) {
-      window.alert(`Lane ${lane.lane_number} is blocked by a stale PT load mismatch. Move the stale PT out before assigning more PTs to this staging lane.`);
+      window.alert(buildStaleStageLaneAlertMessage(String(lane.lane_number)));
       return;
     }
 
